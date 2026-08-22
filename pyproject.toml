@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "poormans-code"
+version = "0.1.0"
+description = "Quota-aware, empirically learning control plane for coding agents"
+requires-python = ">=3.11"
+dependencies = [
+  "httpx>=0.27,<1",
+  "PyYAML>=6.0,<7",
+]
+
+[project.optional-dependencies]
+openhands = [
+  "openhands-sdk",
+  "openhands-tools",
+  "openhands-workspace",
+]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+pmc = "pmc.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["pmc*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools.package-data]
+pmc = ["templates/*"]

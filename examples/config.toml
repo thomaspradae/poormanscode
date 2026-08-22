@@ -1,0 +1,96 @@
+[pmc]
+db_path = "~/.local/share/poormans-code/pmc.db"
+runs_dir = "~/.local/share/poormans-code/runs"
+worktrees_dir = "~/.local/share/poormans-code/worktrees"
+exploration_rate = 0.20
+min_samples_per_candidate = 5
+max_attempts = 3
+same_candidate_retries = 1
+review_enabled = false
+lease_ttl_seconds = 300
+
+# Candidate examples. Enable only resources you actually have.
+
+[[candidates]]
+name = "groq-oss20-bash"
+enabled = true
+executor = "bash"
+role = "builder"
+model = "openai/gpt-oss-20b"
+base_url = "https://api.groq.com/openai/v1"
+api_key_env = "GROQ_API_KEY"
+quota_group = "groq"
+max_turns = 20
+sandbox = "bwrap"
+network = false
+
+[[candidates]]
+name = "gemini-flash-bash"
+enabled = false
+executor = "bash"
+role = "builder"
+model = "gemini-3-flash-preview"
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+api_key_env = "GEMINI_API_KEY"
+quota_group = "gemini"
+max_turns = 20
+sandbox = "bwrap"
+network = false
+
+[[candidates]]
+name = "local-qwen-bash"
+enabled = false
+executor = "bash"
+role = "builder"
+model = "qwen2.5-coder:7b"
+base_url = "http://127.0.0.1:11434/v1"
+api_key_env = ""
+quota_group = "local"
+resource_group = "local-cpu-1"
+resource_concurrency = 1
+max_turns = 25
+sandbox = "bwrap"
+network = false
+
+[[candidates]]
+name = "groq-oss20-openhands"
+enabled = false
+executor = "openhands"
+role = "builder"
+model = "openai/gpt-oss-20b"
+base_url = "https://api.groq.com/openai/v1"
+api_key_env = "GROQ_API_KEY"
+quota_group = "groq"
+resource_group = "openhands-host-1"
+resource_concurrency = 1
+# server_url = "http://100.x.y.z:8000"   # optional OpenHands Agent Server over Tailscale
+
+[[candidates]]
+name = "jules"
+enabled = false
+executor = "jules"
+role = "builder"
+api_key_env = "JULES_API_KEY"
+source = "sources/github/OWNER/REPO"
+quota_group = "jules"
+exploration = false
+first_attempt_only = true
+task_types = ["FEATURE", "ARCHITECTURAL", "DEPENDENCY_API"]
+quota_attempts = 15
+quota_window_seconds = 86400
+max_concurrency = 3
+
+# Optional independent reviewer. It is deliberately another candidate so
+# authors do not review themselves when alternatives exist.
+[[candidates]]
+name = "gemini-reviewer"
+enabled = false
+executor = "bash"
+role = "reviewer"
+model = "gemini-3-flash-preview"
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+api_key_env = "GEMINI_API_KEY"
+quota_group = "gemini"
+max_turns = 8
+sandbox = "bwrap"
+network = false

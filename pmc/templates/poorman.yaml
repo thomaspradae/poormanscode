@@ -1,0 +1,32 @@
+setup: null
+
+test: "pytest -q"
+lint: null
+typecheck: null
+build: null
+
+# Controller-only test. This command is never included in the builder prompt.
+hidden_test: null
+
+timeout_seconds: 600
+max_patch_lines: 500
+max_files_changed: 10
+no_new_dependencies: false
+
+protected:
+  - ".git/**"
+  - ".github/workflows/**"
+  - "secrets/**"
+  - ".env"
+
+# Optional dependency manifests to protect when no_new_dependencies=true.
+dependency_files:
+  - "pyproject.toml"
+  - "requirements.txt"
+  - "package.json"
+  - "package-lock.json"
+  - "pnpm-lock.yaml"
+  - "yarn.lock"
+
+# Additional untracked artifacts to exclude from acceptance diffs.
+verification_ignore: []

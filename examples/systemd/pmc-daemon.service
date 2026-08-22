@@ -1,0 +1,14 @@
+[Unit]
+Description=Poor Man's Code queue daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/pmc daemon
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=-%h/.config/poormans-code/secrets.env
+
+[Install]
+WantedBy=default.target
