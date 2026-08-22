@@ -258,6 +258,18 @@ def cmd_stats(args) -> int:
     return 0
 
 
+def cmd_efficiency(args) -> int:
+    rows = _controller(args).db.efficiency_stats()
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    print(f"{'CANDIDATE':<30} {'ATTEMPTS':>8} {'ACCEPTED':>8} {'SUCCESS':>9} {'MEDIAN S':>10}")
+    for row in rows:
+        median = "-" if row["median_wall_clock_to_accepted_seconds"] is None else f'{row["median_wall_clock_to_accepted_seconds"]:.1f}'
+        print(f'{row["candidate"]:<30} {row["attempts"]:>8} {row["accepted"]:>8} {row["success_rate"]:>8.1%} {median:>10}')
+    return 0
+
+
 def cmd_export(args) -> int:
     ctl = _controller(args)
     rows = ctl.db.export_attempts()
@@ -424,6 +436,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--mode", choices=["cold_start", "explore", "exploit", "forced"])
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_stats)
+
+    s = sub.add_parser("efficiency")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_efficiency)
 
     s = sub.add_parser("export")
     s.add_argument("output")

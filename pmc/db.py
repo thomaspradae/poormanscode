@@ -495,6 +495,35 @@ class Database:
             rows = conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
 
+    def efficiency_stats(self) -> list[dict[str, Any]]:
+        """Headline human-accepted success and wall-clock metrics by candidate."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT a.candidate, a.job_id, j.created_at, hf.created_at accepted_at,
+                CASE WHEN hf.id IS NULL THEN 0 ELSE 1 END accepted
+                FROM attempts a JOIN jobs j ON j.id=a.job_id
+                LEFT JOIN human_feedback hf ON hf.attempt_id=a.id AND hf.verdict='ACCEPT'
+                WHERE a.role='builder' AND a.finished_at IS NOT NULL"""
+            ).fetchall()
+        grouped: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            item = grouped.setdefault(row["candidate"], {"attempts": 0, "accepted": 0, "seconds": []})
+            item["attempts"] += 1
+            if row["accepted"]:
+                item["accepted"] += 1
+                start = datetime.fromisoformat(row["created_at"])
+                end = datetime.fromisoformat(row["accepted_at"])
+                item["seconds"].append((end - start).total_seconds())
+        result = []
+        for candidate, item in sorted(grouped.items()):
+            seconds = sorted(item.pop("seconds"))
+            n = len(seconds)
+            median = None if not n else (seconds[n // 2] if n % 2 else (seconds[n // 2 - 1] + seconds[n // 2]) / 2)
+            result.append({"candidate": candidate, **item,
+                           "success_rate": item["accepted"] / item["attempts"],
+                           "median_wall_clock_to_accepted_seconds": median})
+        return result
+
     def active_count_many(self, candidate_names: list[str]) -> int:
         if not candidate_names:
             return 0
