@@ -105,3 +105,14 @@ class UnityToolchain:
                 "-",
             )
         return commands
+
+    def sandbox_ipc_bindings(self) -> tuple[tuple[Path, Path], ...]:
+        sockets = []
+        for name in (
+            "Unity-LicenseClient-t.sock",
+            "Unity-LicenseClient-t-notifications.sock",
+        ):
+            path = Path("/tmp") / name
+            if path.exists():
+                sockets.append((path, path))
+        return tuple(sockets)

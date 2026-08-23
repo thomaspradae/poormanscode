@@ -34,8 +34,9 @@ class SandboxLimits:
     wall_seconds: int = 180
     cpu_seconds: int = 120
     memory_bytes: int = 2 * 1024**3
+    address_space_bytes: int | None = None
     processes: int = 128
-    file_bytes: int = 512 * 1024**2
+    file_bytes: int | None = 512 * 1024**2
     workspace_bytes: int = 2 * 1024**3
     workspace_files: int = 50_000
     artifact_bytes: int = 512 * 1024**2
@@ -90,6 +91,8 @@ class Sandbox:
         command: str,
         network: bool,
         readonly_paths: tuple[Path, ...] = (),
+        readonly_bindings: tuple[tuple[Path, Path], ...] = (),
+        writable_bindings: tuple[tuple[Path, Path], ...] = (),
     ) -> list[str]:
         raise NotImplementedError
 
@@ -102,6 +105,8 @@ class Sandbox:
         network: bool,
         limits: SandboxLimits,
         readonly_paths: tuple[Path, ...] = (),
+        readonly_bindings: tuple[tuple[Path, Path], ...] = (),
+        writable_bindings: tuple[tuple[Path, Path], ...] = (),
     ) -> subprocess.CompletedProcess[str]:
         requested_policy = "full" if network else "none"
         if not self.supports_network_policy(requested_policy):
@@ -120,14 +125,25 @@ class Sandbox:
             return subprocess.CompletedProcess(
                 [], 75, "", "PMC_RESOURCE_LIMIT:WORKSPACE_LIMIT\n"
             )
-        args = self.command(worktree, command, network, readonly_paths)
+        args = self.command(
+            worktree,
+            command,
+            network,
+            readonly_paths,
+            readonly_bindings,
+            writable_bindings,
+        )
         if shutil.which("prlimit"):
-            limit_args = [
-                "prlimit",
-                f"--cpu={limits.cpu_seconds}",
-                f"--as={limits.memory_bytes}",
-                f"--fsize={limits.file_bytes}",
-            ]
+            limit_args = ["prlimit", f"--cpu={limits.cpu_seconds}"]
+            address_space = (
+                limits.memory_bytes
+                if limits.address_space_bytes is None
+                else limits.address_space_bytes
+            )
+            if address_space:
+                limit_args.append(f"--as={address_space}")
+            if limits.file_bytes is not None:
+                limit_args.append(f"--fsize={limits.file_bytes}")
             if self.name == "restricted-user":
                 limit_args.append(f"--nproc={limits.processes}")
             args = [*limit_args, "--", *args]
@@ -224,7 +240,13 @@ class RestrictedUserSandbox(Sandbox):
     network_policies = frozenset({"full"})
 
     def command(
-        self, worktree: Path, command: str, network: bool, readonly_paths=()
+        self,
+        worktree: Path,
+        command: str,
+        network: bool,
+        readonly_paths=(),
+        readonly_bindings=(),
+        writable_bindings=(),
     ) -> list[str]:
         return ["sudo", "-n", "-u", "pmc-worker", "/bin/bash", "-lc", command]
 
@@ -234,7 +256,13 @@ class ContainerSandbox(Sandbox):
     network_policies = frozenset({"none", "full"})
 
     def command(
-        self, worktree: Path, command: str, network: bool, readonly_paths=()
+        self,
+        worktree: Path,
+        command: str,
+        network: bool,
+        readonly_paths=(),
+        readonly_bindings=(),
+        writable_bindings=(),
     ) -> list[str]:
         if not shutil.which("bwrap"):
             raise RuntimeError("bubblewrap is not installed")
@@ -275,6 +303,8 @@ class ContainerSandbox(Sandbox):
             "/proc",
             "--tmpfs",
             "/tmp",
+            "--dir",
+            "/tmp/pmc-home",
             "--chdir",
             "/workspace",
         ]
@@ -284,6 +314,9 @@ class ContainerSandbox(Sandbox):
             "/etc/nsswitch.conf",
             "/etc/hosts",
             "/etc/ssl",
+            "/etc/machine-id",
+            "/etc/os-release",
+            "/sys",
         ):
             if Path(path).exists():
                 args.extend(["--ro-bind", path, path])
@@ -292,6 +325,29 @@ class ContainerSandbox(Sandbox):
             if not resolved.exists():
                 raise RuntimeError(f"sandbox readonly path does not exist: {resolved}")
             args.extend(["--ro-bind", str(resolved), str(resolved)])
+        made: set[Path] = set()
+        for source, target in readonly_bindings:
+            source = source.resolve()
+            if not source.exists():
+                continue
+            target = Path(target)
+            chain = [p for p in target.parents if str(p).startswith("/tmp/pmc-home")]
+            for parent in reversed(chain):
+                if parent not in made and parent != Path("/tmp/pmc-home"):
+                    args.extend(["--dir", str(parent)])
+                    made.add(parent)
+            args.extend(["--ro-bind", str(source), str(target)])
+        for source, target in writable_bindings:
+            source = source.resolve()
+            if not source.exists():
+                continue
+            target = Path(target)
+            chain = [p for p in target.parents if str(p).startswith("/tmp/pmc-home")]
+            for parent in reversed(chain):
+                if parent not in made and parent != Path("/tmp/pmc-home"):
+                    args.extend(["--dir", str(parent)])
+                    made.add(parent)
+            args.extend(["--bind", str(source), str(target)])
         if not network:
             args.append("--unshare-net")
         return [*args, "/bin/bash", "-lc", command]
@@ -301,7 +357,13 @@ class RemoteSandbox(Sandbox):
     name = "remote"
 
     def command(
-        self, worktree: Path, command: str, network: bool, readonly_paths=()
+        self,
+        worktree: Path,
+        command: str,
+        network: bool,
+        readonly_paths=(),
+        readonly_bindings=(),
+        writable_bindings=(),
     ) -> list[str]:
         raise RuntimeError("remote sandboxes are executor-managed")
 
@@ -311,7 +373,13 @@ class GuardedSandbox(Sandbox):
     network_policies = frozenset({"full"})
 
     def command(
-        self, worktree: Path, command: str, network: bool, readonly_paths=()
+        self,
+        worktree: Path,
+        command: str,
+        network: bool,
+        readonly_paths=(),
+        readonly_bindings=(),
+        writable_bindings=(),
     ) -> list[str]:
         return ["/bin/bash", "-lc", command]
 

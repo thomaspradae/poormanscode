@@ -30,20 +30,36 @@ def _run(
     timeout: int,
     sandbox_name: str = "guarded",
     readonly_paths: tuple[Path, ...] = (),
+    memory_bytes: int = 2 * 1024**3,
+    readonly_bindings: tuple[tuple[Path, Path], ...] = (),
+    force_network: bool = False,
+    writable_bindings: tuple[tuple[Path, Path], ...] = (),
+    file_bytes: int | None = 512 * 1024**2,
+    address_space_bytes: int | None = None,
+    processes: int = 128,
 ) -> CommandResult:
     started = time.monotonic()
     try:
         sandbox = build_sandbox(sandbox_name)
         # Verifiers do not receive secrets. Use no-network when enforceable;
         # otherwise explicitly run with full network rather than overclaiming.
-        network = not sandbox.supports_network_policy("none")
+        network = force_network or not sandbox.supports_network_policy("none")
         p = sandbox.run(
             cwd,
             command,
             env=scrubbed_environment(),
             network=network,
-            limits=SandboxLimits(wall_seconds=timeout, cpu_seconds=max(1, timeout - 5)),
+            limits=SandboxLimits(
+                wall_seconds=timeout,
+                cpu_seconds=max(1, timeout - 5),
+                memory_bytes=memory_bytes,
+                file_bytes=file_bytes,
+                address_space_bytes=address_space_bytes,
+                processes=processes,
+            ),
             readonly_paths=readonly_paths,
+            readonly_bindings=readonly_bindings,
+            writable_bindings=writable_bindings,
         )
         return CommandResult(
             name, command, p.returncode, time.monotonic() - started, p.stdout, p.stderr
@@ -111,6 +127,13 @@ def verify(
     commands: list[CommandResult] = []
     profile_commands: dict[str, str] = {}
     readonly_paths: tuple[Path, ...] = ()
+    verifier_memory = 2 * 1024**3
+    readonly_bindings: tuple[tuple[Path, Path], ...] = ()
+    writable_bindings: tuple[tuple[Path, Path], ...] = ()
+    profile_network = False
+    profile_file_bytes: int | None = 512 * 1024**2
+    profile_address_space: int | None = None
+    profile_processes = 128
     if repo_cfg.get("toolchain") == "unity":
         from .toolchains import UnityToolchain
 
@@ -118,15 +141,39 @@ def verify(
         unity = UnityToolchain.from_config(toolchain_cfg)
         profile_commands = unity.verification_commands(repo_cfg)
         readonly_paths = (unity.editor.parent,)
+        verifier_memory = (
+            int(repo_cfg.get("unity", {}).get("memory_mb", 6144)) * 1024**2
+        )
+        readonly_bindings = unity.sandbox_ipc_bindings()
+        profile_network = bool(
+            repo_cfg.get("unity", {}).get("network_for_license", False)
+        )
+        max_single = int(repo_cfg.get("unity", {}).get("max_single_file_mb", 0))
+        profile_file_bytes = max_single * 1024**2 if max_single else None
+        profile_address_space = 0
+        profile_processes = int(repo_cfg.get("unity", {}).get("process_limit", 512))
     for name in ("test", "lint", "typecheck", "build", "hidden_test"):
         command = repo_cfg.get(name)
         if command:
             commands.append(_run(name, str(command), worktree, timeout, sandbox_name))
     for name, command in profile_commands.items():
         commands.append(
-            _run(name, command, worktree, timeout, sandbox_name, readonly_paths)
+            _run(
+                name,
+                command,
+                worktree,
+                timeout,
+                sandbox_name,
+                readonly_paths,
+                verifier_memory,
+                readonly_bindings,
+                profile_network,
+                writable_bindings,
+                profile_file_bytes,
+                profile_address_space,
+                profile_processes,
+            )
         )
-
     changed = [
         x
         for x in git(

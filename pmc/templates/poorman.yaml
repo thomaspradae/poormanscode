@@ -5,7 +5,17 @@ toolchain: null
 
 # Unity profile gates. The Editor path/version live in global config.toml.
 unity:
-  editmode_tests: true
+  # Resident-memory control. Unity/CoreCLR needs unlimited virtual reservations.
+  memory_mb: 6144
+  # Unity's build pipeline preallocates sparse files; 0 disables RLIMIT_FSIZE.
+  # Aggregate workspace bytes/files remain continuously enforced by PMC.
+  max_single_file_mb: 0
+  process_limit: 512
+  # Licensing runs in a trusted controller service exposed through IPC only.
+  # Keep project-code verification network-isolated.
+  network_for_license: false
+  # Enable after adding com.unity.test-framework and an EditMode test assembly.
+  editmode_tests: false
   playmode_tests: false
 
 test: "pytest -q"
