@@ -90,7 +90,7 @@ class UnityToolchain:
                 "-testPlatform",
                 "EditMode",
                 "-testResults",
-                "Temp/pmc-editmode-results.xml",
+                "Logs/pmc-editmode-results.xml",
                 "-logFile",
                 "-",
             )
@@ -100,7 +100,7 @@ class UnityToolchain:
                 "-testPlatform",
                 "PlayMode",
                 "-testResults",
-                "Temp/pmc-playmode-results.xml",
+                "Logs/pmc-playmode-results.xml",
                 "-logFile",
                 "-",
             )

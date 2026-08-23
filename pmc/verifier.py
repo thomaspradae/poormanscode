@@ -4,6 +4,7 @@ import fnmatch
 import re
 import subprocess
 import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
@@ -116,6 +117,41 @@ def _secret_scan(diff: str) -> list[str]:
     return findings
 
 
+def _unity_report_path(worktree: Path, mode: str) -> Path:
+    return worktree / "Logs" / f"pmc-{mode.lower()}-results.xml"
+
+
+def _unity_report_result(worktree: Path, mode: str) -> CommandResult:
+    path = _unity_report_path(worktree, mode)
+    started = time.monotonic()
+    try:
+        root = ET.parse(path).getroot()
+        total = int(root.attrib.get("total", root.attrib.get("testcasecount", "0")))
+        failed = int(root.attrib.get("failed", "0"))
+        result = root.attrib.get("result", "Unknown")
+        ok = total > 0 and failed == 0 and result == "Passed"
+        summary = f"Unity {mode}: result={result} total={total} failed={failed}"
+        if total == 0:
+            summary += "; no tests were discovered"
+        return CommandResult(
+            f"unity_{mode.lower()}_report",
+            f"validate {path.relative_to(worktree)}",
+            0 if ok else 1,
+            time.monotonic() - started,
+            summary,
+            "",
+        )
+    except (OSError, ET.ParseError, ValueError) as exc:
+        return CommandResult(
+            f"unity_{mode.lower()}_report",
+            f"validate {path.relative_to(worktree)}",
+            1,
+            time.monotonic() - started,
+            "",
+            f"invalid or missing Unity test report: {exc}",
+        )
+
+
 def verify(
     job: Job, worktree: Path, repo_cfg: dict[str, Any], sandbox_name: str = "guarded"
 ) -> VerificationResult:
@@ -157,6 +193,12 @@ def verify(
         if command:
             commands.append(_run(name, str(command), worktree, timeout, sandbox_name))
     for name, command in profile_commands.items():
+        report_mode = {
+            "unity_editmode": "editmode",
+            "unity_playmode": "playmode",
+        }.get(name)
+        if report_mode:
+            _unity_report_path(worktree, report_mode).unlink(missing_ok=True)
         commands.append(
             _run(
                 name,
@@ -174,6 +216,8 @@ def verify(
                 profile_processes,
             )
         )
+        if report_mode:
+            commands.append(_unity_report_result(worktree, report_mode))
     changed = [
         x
         for x in git(

@@ -4,6 +4,7 @@ import pytest
 
 from pmc.capabilities import probe_local_capabilities
 from pmc.toolchains import UnityToolchain, UnityToolchainError
+from pmc.verifier import _unity_report_result
 
 
 def executable(tmp_path: Path) -> Path:
@@ -47,3 +48,22 @@ def test_bootstrap_refuses_established_repository(tmp_path: Path):
     unity = UnityToolchain.from_config({"editor_path": str(executable(tmp_path))})
     with pytest.raises(UnityToolchainError, match="not skeletal"):
         unity.bootstrap(tmp_path)
+
+
+def test_unity_report_requires_discovered_passing_tests(tmp_path: Path):
+    logs = tmp_path / "Logs"
+    logs.mkdir()
+    report = logs / "pmc-editmode-results.xml"
+    report.write_text(
+        '<test-run testcasecount="2" total="2" passed="2" failed="0" '
+        'result="Passed" />'
+    )
+    assert _unity_report_result(tmp_path, "editmode").ok
+
+    report.write_text(
+        '<test-run testcasecount="0" total="0" passed="0" failed="0" '
+        'result="Passed" />'
+    )
+    result = _unity_report_result(tmp_path, "editmode")
+    assert not result.ok
+    assert "no tests were discovered" in result.stdout
