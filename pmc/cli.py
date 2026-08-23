@@ -5,6 +5,7 @@ import csv
 import json
 import os
 import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -313,6 +314,17 @@ def cmd_doctor(args) -> int:
     needs_bwrap = any(c.enabled and c.sandbox == "bwrap" for c in ctl.cfg.candidates)
     if bwrap:
         print(f"bubblewrap: OK {bwrap}")
+        if needs_bwrap:
+            probe = subprocess.run(
+                [bwrap, "--die-with-parent", "--new-session", "--ro-bind", "/", "/",
+                 "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "/usr/bin/true"],
+                text=True, capture_output=True,
+            )
+            if probe.returncode:
+                print(f"bubblewrap production probe: FAIL ({probe.stderr.strip()})")
+                ok = False
+            else:
+                print("bubblewrap production probe: OK")
     elif needs_bwrap:
         print("bubblewrap: MISSING (required by an enabled sandbox=bwrap candidate)")
         ok = False
@@ -337,13 +349,59 @@ def cmd_doctor(args) -> int:
         print(f"candidate {c.name}: {'MISSING ' + c.api_key_env if missing else 'configured'}")
         if missing:
             ok = False
+        if c.executor == "bash" and c.sandbox in {"none", "guarded"}:
+            print(f"candidate {c.name}: UNSAFE sandbox={c.sandbox}")
+            ok = False
+    if ctl.cfg.verifier_sandbox in {"none", "guarded"}:
+        print(f"verifier sandbox: UNSAFE ({ctl.cfg.verifier_sandbox})")
+        ok = False
+    elif ctl.cfg.verifier_sandbox == "restricted-user":
+        probe = subprocess.run(["sudo", "-n", "-u", "pmc-worker", "/usr/bin/true"],
+                               text=True, capture_output=True)
+        if probe.returncode:
+            print(f"verifier sandbox: FAIL restricted-user ({probe.stderr.strip()})")
+            ok = False
+        else:
+            print("verifier sandbox: OK restricted-user")
+    elif ctl.cfg.verifier_sandbox == "bwrap":
+        verifier_probe = subprocess.run(
+            [bwrap, "--die-with-parent", "--new-session", "--ro-bind", "/", "/",
+             "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "/usr/bin/true"],
+            text=True, capture_output=True,
+        ) if bwrap else None
+        if verifier_probe is None or verifier_probe.returncode:
+            detail = verifier_probe.stderr.strip() if verifier_probe else "bubblewrap missing"
+            print(f"verifier sandbox: FAIL bwrap ({detail})")
+            ok = False
+        else:
+            print("verifier sandbox: OK bwrap")
+    else:
+        print(f"verifier sandbox: OK {ctl.cfg.verifier_sandbox}")
     return 0 if ok else 2
+
+
+def cmd_version(args) -> int:
+    from .versioning import SCHEMA_VERSION, pmc_git_sha
+    print(f"poormans-code 0.1.0 schema={SCHEMA_VERSION} git={pmc_git_sha()}")
+    return 0
+
+
+def cmd_canary(args) -> int:
+    from .canary import run_canary
+    print(json.dumps(run_canary(), indent=2))
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="pmc")
     p.add_argument("--config", help="path to config.toml")
     sub = p.add_subparsers(dest="command", required=True)
+
+    s = sub.add_parser("version")
+    s.set_defaults(func=cmd_version)
+
+    s = sub.add_parser("canary")
+    s.set_defaults(func=cmd_canary)
 
     s = sub.add_parser("init-config")
     s.add_argument("--path")

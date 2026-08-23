@@ -1,3 +1,3 @@
-from .openai_compat import OpenAICompatibleClient, ChatReply
+from .openai_compat import ChatReply, OpenAICompatibleClient, ProviderError
 
-__all__ = ["OpenAICompatibleClient", "ChatReply"]
+__all__ = ["ChatReply", "OpenAICompatibleClient", "ProviderError"]

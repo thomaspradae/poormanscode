@@ -5,14 +5,17 @@ worktrees_dir = "~/.local/share/poormans-code/worktrees"
 exploration_rate = 0.20
 min_samples_per_candidate = 5
 max_attempts = 3
-same_candidate_retries = 1
+same_candidate_retries = 2
 review_enabled = false
 lease_ttl_seconds = 300
+verifier_sandbox = "restricted-user"
 
 # Candidate examples. Enable only resources you actually have.
 
 [[candidates]]
 name = "groq-oss20-bash"
+version = "1"
+provider = "groq"
 enabled = true
 executor = "bash"
 role = "builder"
@@ -67,6 +70,8 @@ resource_concurrency = 1
 
 [[candidates]]
 name = "jules"
+version = "1"
+provider = "jules"
 enabled = false
 executor = "jules"
 role = "builder"

@@ -15,6 +15,13 @@ def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _header_int(payload: dict[str, Any], name: str) -> int | None:
+    try:
+        return int(payload[name]) if name in payload else None
+    except (TypeError, ValueError):
+        return None
+
+
 SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
@@ -106,10 +113,58 @@ CREATE TABLE IF NOT EXISTS scheduler_decisions (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS events (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL UNIQUE,
+    job_id TEXT,
+    attempt_id INTEGER,
+    event_type TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    occurred_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS schema_metadata (
+    singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL,
+    migrated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS candidate_versions (
+    candidate TEXT NOT NULL, version TEXT NOT NULL, fingerprint TEXT NOT NULL,
+    registered_at TEXT NOT NULL, PRIMARY KEY(candidate, version)
+);
+
+CREATE TABLE IF NOT EXISTS quota_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider TEXT NOT NULL, candidate TEXT NOT NULL, event_type TEXT NOT NULL,
+    requests INTEGER, tokens INTEGER, cost_usd REAL, reset_at TEXT,
+    payload_json TEXT NOT NULL, occurred_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS quota_reservations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    candidate TEXT NOT NULL, job_id TEXT NOT NULL, estimated_tokens INTEGER NOT NULL,
+    state TEXT NOT NULL, actual_tokens INTEGER, created_at TEXT NOT NULL, reconciled_at TEXT
+);
+CREATE TABLE IF NOT EXISTS quota_state (
+    candidate TEXT PRIMARY KEY, blocked_until REAL, remaining_requests INTEGER,
+    remaining_tokens INTEGER, reset_at TEXT, updated_at TEXT NOT NULL,
+    snapshot_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS resource_leases (
+    resource_key TEXT NOT NULL, job_id TEXT NOT NULL, attempt_id INTEGER,
+    owner TEXT NOT NULL, expires_at REAL NOT NULL, snapshot_json TEXT NOT NULL,
+    PRIMARY KEY(resource_key, job_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_attempts_candidate ON attempts(candidate);
 CREATE INDEX IF NOT EXISTS idx_attempts_job ON attempts(job_id);
 CREATE INDEX IF NOT EXISTS idx_feedback_job ON human_feedback(job_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state);
+CREATE INDEX IF NOT EXISTS idx_events_job ON events(job_id, seq);
+CREATE INDEX IF NOT EXISTS idx_quota_candidate ON quota_events(candidate, occurred_at);
+CREATE TRIGGER IF NOT EXISTS events_no_update BEFORE UPDATE ON events
+BEGIN SELECT RAISE(ABORT, 'events are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS events_no_delete BEFORE DELETE ON events
+BEGIN SELECT RAISE(ABORT, 'events are append-only'); END;
 
 CREATE TABLE IF NOT EXISTS leases (
     job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
@@ -141,6 +196,164 @@ class Database:
         path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+            self._migrate(conn)
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        from .versioning import SCHEMA_VERSION
+        additions = {
+            "attempts": {
+                "outcome": "TEXT",
+                "version_snapshot_json": "TEXT",
+                "context_hash": "TEXT",
+                "context_manifest_json": "TEXT",
+            },
+            "scheduler_decisions": {
+                "eligible_json": "TEXT",
+                "unavailable_json": "TEXT",
+                "selection_probability": "REAL",
+                "policy_version": "TEXT",
+                "snapshot_json": "TEXT",
+            },
+        }
+        for table, columns in additions.items():
+            existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+            for name, kind in columns.items():
+                if name not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
+        conn.execute(
+            "INSERT INTO schema_metadata(singleton,schema_version,migrated_at) VALUES(1,?,?) "
+            "ON CONFLICT(singleton) DO UPDATE SET schema_version=excluded.schema_version,migrated_at=excluded.migrated_at",
+            (SCHEMA_VERSION, utcnow()),
+        )
+
+    def event(self, event_type: str, *, job_id: str | None = None,
+              attempt_id: int | None = None, payload: dict[str, Any] | None = None) -> str:
+        import uuid
+        event_id = f"evt-{uuid.uuid4().hex}"
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO events(event_id,job_id,attempt_id,event_type,payload_json,occurred_at) VALUES(?,?,?,?,?,?)",
+                (event_id, job_id, attempt_id, event_type, json.dumps(payload or {}, default=str), utcnow()),
+            )
+        return event_id
+
+    def reserve_quota(self, candidate: str, job_id: str, estimated_tokens: int) -> int:
+        with self.connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO quota_reservations(candidate,job_id,estimated_tokens,state,created_at) VALUES(?,?,?,'RESERVED',?)",
+                (candidate, job_id, estimated_tokens, utcnow()),
+            )
+            reservation_id = int(cur.lastrowid)
+        self.event("QUOTA_RESERVED", job_id=job_id,
+                   payload={"candidate": candidate, "estimated_tokens": estimated_tokens})
+        return reservation_id
+
+    def register_candidate(self, candidate: Any) -> None:
+        from .versioning import stable_hash
+        fingerprint = stable_hash(candidate)
+        with self.connect() as conn:
+            row = conn.execute("SELECT fingerprint FROM candidate_versions WHERE candidate=? AND version=?",
+                               (candidate.name, candidate.version)).fetchone()
+            if row and row["fingerprint"] != fingerprint:
+                raise RuntimeError(
+                    f"candidate {candidate.name} version {candidate.version} changed; increment its version"
+                )
+            conn.execute(
+                "INSERT OR IGNORE INTO candidate_versions(candidate,version,fingerprint,registered_at) VALUES(?,?,?,?)",
+                (candidate.name, candidate.version, fingerprint, utcnow()),
+            )
+
+    def reconcile_quota(self, reservation_id: int, *, provider: str, candidate: str,
+                        actual_tokens: int, cost_usd: float | None, payload: dict[str, Any]) -> None:
+        with self.connect() as conn:
+            conn.execute("UPDATE quota_reservations SET state='RECONCILED',actual_tokens=?,reconciled_at=? WHERE id=?",
+                         (actual_tokens, utcnow(), reservation_id))
+            conn.execute(
+                "INSERT INTO quota_events(provider,candidate,event_type,requests,tokens,cost_usd,payload_json,occurred_at) VALUES(?,?,'RECONCILED',1,?,?,?,?)",
+                (provider, candidate, actual_tokens, cost_usd, json.dumps(payload, default=str), utcnow()),
+            )
+
+    def record_quota_event(self, provider: str, candidate: str, event_type: str,
+                           payload: dict[str, Any]) -> None:
+        import time
+        retry_after = payload.get("retry-after")
+        try:
+            blocked_until = time.time() + float(retry_after) if retry_after is not None else None
+        except (TypeError, ValueError):
+            blocked_until = None
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO quota_events(provider,candidate,event_type,payload_json,occurred_at,reset_at) VALUES(?,?,?,?,?,?)",
+                (provider, candidate, event_type, json.dumps(payload, default=str), utcnow(),
+                 payload.get("x-ratelimit-reset") or payload.get("retry-after")),
+            )
+            conn.execute(
+                """INSERT INTO quota_state(candidate,blocked_until,remaining_requests,remaining_tokens,reset_at,updated_at,snapshot_json)
+                VALUES(?,?,?,?,?,?,?) ON CONFLICT(candidate) DO UPDATE SET
+                blocked_until=excluded.blocked_until, remaining_requests=excluded.remaining_requests,
+                remaining_tokens=excluded.remaining_tokens, reset_at=excluded.reset_at,
+                updated_at=excluded.updated_at, snapshot_json=excluded.snapshot_json""",
+                (candidate, blocked_until, _header_int(payload, "x-ratelimit-remaining-requests"),
+                 _header_int(payload, "x-ratelimit-remaining-tokens"),
+                 payload.get("x-ratelimit-reset") or retry_after, utcnow(),
+                 json.dumps(payload, default=str)),
+            )
+
+    def quota_availability(self, candidate: str) -> tuple[bool, str]:
+        import time
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM quota_state WHERE candidate=?", (candidate,)).fetchone()
+        if not row:
+            return True, ""
+        if row["blocked_until"] and float(row["blocked_until"]) > time.time():
+            return False, f"provider cooldown until {row['blocked_until']}"
+        if row["remaining_requests"] == 0 or row["remaining_tokens"] == 0:
+            return False, f"provider quota exhausted; reset={row['reset_at']}"
+        return True, ""
+
+    def job_events(self, job_id: str) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            return [dict(r) for r in conn.execute("SELECT * FROM events WHERE job_id=? ORDER BY seq", (job_id,))]
+
+    def reserved_tokens(self, candidate_names: list[str]) -> int:
+        if not candidate_names:
+            return 0
+        marks = ",".join("?" for _ in candidate_names)
+        with self.connect() as conn:
+            row = conn.execute(
+                f"SELECT COALESCE(SUM(estimated_tokens),0) n FROM quota_reservations WHERE state='RESERVED' AND candidate IN ({marks})",
+                candidate_names,
+            ).fetchone()
+        return int(row["n"])
+
+    def reserve_resource(self, resource_key: str, job_id: str, attempt_id: int,
+                         owner: str, ttl_seconds: int, snapshot: dict[str, Any]) -> bool:
+        import time
+        with self.connect() as conn:
+            conn.execute("DELETE FROM resource_leases WHERE expires_at < ?", (time.time(),))
+            existing = conn.execute("SELECT 1 FROM resource_leases WHERE resource_key=?", (resource_key,)).fetchone()
+            if existing:
+                return False
+            conn.execute(
+                "INSERT INTO resource_leases(resource_key,job_id,attempt_id,owner,expires_at,snapshot_json) VALUES(?,?,?,?,?,?)",
+                (resource_key, job_id, attempt_id, owner, time.time() + ttl_seconds,
+                 json.dumps(snapshot, default=str)),
+            )
+        self.event("RESOURCE_RESERVED", job_id=job_id, attempt_id=attempt_id,
+                   payload={"resource_key": resource_key, **snapshot})
+        return True
+
+    def release_resource(self, resource_key: str, job_id: str) -> None:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM resource_leases WHERE resource_key=? AND job_id=?",
+                         (resource_key, job_id))
+
+    def resource_busy(self, resource_key: str) -> bool:
+        import time
+        with self.connect() as conn:
+            row = conn.execute("SELECT 1 FROM resource_leases WHERE resource_key=? AND expires_at>=?",
+                               (resource_key, time.time())).fetchone()
+        return bool(row)
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -205,7 +418,8 @@ class Database:
                 state = "FAILED" if int(count) >= max_attempts else "RETRY"
                 conn.execute(
                     """UPDATE attempts SET status='EXECUTOR_FAILED', finished_at=?,
-                    error=COALESCE(error,'controller lease expired; recovered after restart')
+                    error=COALESCE(error,'controller lease expired; recovered after restart'),
+                    outcome='RESOURCE_FAILURE'
                     WHERE job_id=? AND status='RUNNING'""",
                     (utcnow(), job_id),
                 )
@@ -213,6 +427,18 @@ class Database:
                 conn.execute("DELETE FROM leases WHERE job_id=?", (job_id,))
                 recovered.append(job_id)
         return recovered
+
+    def cancel_running_attempts(self, job_id: str) -> list[int]:
+        with self.connect() as conn:
+            ids = [int(r[0]) for r in conn.execute(
+                "SELECT id FROM attempts WHERE job_id=? AND status='RUNNING'", (job_id,))]
+            conn.execute(
+                "UPDATE attempts SET status='CANCELLED',outcome='CANCELLED',finished_at=? WHERE job_id=? AND status='RUNNING'",
+                (utcnow(), job_id),
+            )
+        for attempt_id in ids:
+            self.event("ATTEMPT_CANCELLED", job_id=job_id, attempt_id=attempt_id)
+        return ids
 
     def next_job_id(self) -> str:
         with self.connect() as conn:
@@ -247,6 +473,7 @@ class Database:
                     now,
                 ),
             )
+        self.event("JOB_CREATED", job_id=job.id, payload={"repo": str(job.repo), "request": job.request})
 
     def get_job(self, job_id: str) -> Job:
         with self.connect() as conn:
@@ -326,13 +553,16 @@ class Database:
         candidate: Any,
         selection_mode: str,
         selection_score: float,
+        *, version_snapshot: dict[str, Any] | None = None,
+        context_hash: str | None = None, context_manifest: dict[str, Any] | None = None,
     ) -> int:
         with self.connect() as conn:
             cur = conn.execute(
                 """INSERT INTO attempts
                 (job_id, attempt_no, candidate, executor, model, role,
-                 selection_mode, selection_score, status, started_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'RUNNING', ?)""",
+                 selection_mode, selection_score, status, started_at,
+                 version_snapshot_json, context_hash, context_manifest_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'RUNNING', ?, ?, ?, ?)""",
                 (
                     job_id,
                     attempt_no,
@@ -343,16 +573,22 @@ class Database:
                     selection_mode,
                     selection_score,
                     utcnow(),
+                    json.dumps(version_snapshot or {}, sort_keys=True), context_hash,
+                    json.dumps(context_manifest or {}, sort_keys=True),
                 ),
             )
-            return int(cur.lastrowid)
+            attempt_id = int(cur.lastrowid)
+        self.event("ATTEMPT_STARTED", job_id=job_id, attempt_id=attempt_id,
+                   payload={"attempt_number": attempt_no, "candidate": candidate.name})
+        return attempt_id
 
-    def finish_attempt(self, attempt_id: int, status: str, result: Any, duration: float) -> None:
+    def finish_attempt(self, attempt_id: int, status: str, result: Any, duration: float,
+                       outcome: str | None = None) -> None:
         with self.connect() as conn:
             conn.execute(
                 """UPDATE attempts SET status=?, finished_at=?, duration_seconds=?,
                 input_tokens=?, output_tokens=?, cost_usd=?, provider_request_id=?,
-                summary=?, error=?, raw_metrics_json=? WHERE id=?""",
+                summary=?, error=?, raw_metrics_json=?, outcome=? WHERE id=?""",
                 (
                     status,
                     utcnow(),
@@ -364,9 +600,13 @@ class Database:
                     result.summary,
                     result.error,
                     json.dumps(result.raw_metrics, default=str),
+                    outcome or status,
                     attempt_id,
                 ),
             )
+            row = conn.execute("SELECT job_id FROM attempts WHERE id=?", (attempt_id,)).fetchone()
+        self.event("EXECUTOR_FINISHED", job_id=row["job_id"], attempt_id=attempt_id,
+                   payload={"status": status, "outcome": outcome or status, "duration_seconds": duration})
 
     def record_verification(self, attempt_id: int, v: VerificationResult) -> None:
         commands = [asdict(x) for x in v.commands]
@@ -442,16 +682,26 @@ class Database:
         with self.connect() as conn:
             conn.execute(
                 """INSERT INTO scheduler_decisions
-                (job_id, attempt_no, candidate, mode, score, reason, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (job_id, attempt_no, d.candidate.name, d.mode, d.score, d.reason, utcnow()),
+                (job_id, attempt_no, candidate, mode, score, reason, created_at,
+                 eligible_json, unavailable_json, selection_probability, policy_version, snapshot_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (job_id, attempt_no, d.candidate.name, d.mode, d.score, d.reason, utcnow(),
+                 json.dumps(d.eligible), json.dumps(d.unavailable), d.selection_probability,
+                 d.policy_version, json.dumps(d.snapshot, default=str)),
             )
+        self.event("SCHEDULER_DECISION", job_id=job_id, payload={
+            "attempt_number": attempt_no, "chosen": d.candidate.name, "mode": d.mode,
+            "score": d.score, "eligible": d.eligible, "unavailable": d.unavailable,
+            "selection_probability": d.selection_probability, "policy_version": d.policy_version,
+            "snapshot": d.snapshot,
+        })
 
     def candidate_stats(
         self, role: str = "builder", task_type: str | None = None, phase: str = "all",
         selection_mode: str | None = None,
     ) -> list[dict[str, Any]]:
-        where = ["a.role=?", "a.finished_at IS NOT NULL"]
+        where = ["a.role=?", "a.finished_at IS NOT NULL",
+                 "COALESCE(a.outcome,'') NOT IN ('PROVIDER_FAILURE','RESOURCE_FAILURE')"]
         params: list[Any] = [role]
         if task_type:
             where.append("j.task_type=?")

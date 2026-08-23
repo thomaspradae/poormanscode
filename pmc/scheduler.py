@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from .db import Database
 from .domain import Candidate, Job, SchedulerDecision
+from .versioning import SCHEDULER_POLICY_VERSION
 
 
 @dataclass(slots=True)
@@ -25,10 +26,15 @@ class Scheduler:
     def available(self, c: Candidate, universe: list[Candidate] | None = None) -> Availability:
         if not c.enabled:
             return Availability(False, "disabled")
+        quota_ok, quota_reason = self.db.quota_availability(c.name)
+        if not quota_ok:
+            return Availability(False, quota_reason)
         universe = universe or [c]
         if c.max_concurrency is not None and self.db.active_count(c.name) >= c.max_concurrency:
             return Availability(False, "candidate concurrency full")
         if c.resource_group and c.resource_concurrency is not None:
+            if c.resource_concurrency == 1 and self.db.resource_busy(c.resource_group):
+                return Availability(False, f"resource {c.resource_group} leased")
             group_names = [x.name for x in universe if x.resource_group == c.resource_group]
             if self.db.active_count_many(group_names) >= c.resource_concurrency:
                 return Availability(False, f"resource {c.resource_group} busy")
@@ -42,7 +48,8 @@ class Scheduler:
                 return Availability(False, "rolling attempt quota exhausted")
         quota_tokens = c.extra.get("quota_tokens")
         if quota_tokens is not None and c.quota_window_seconds is not None:
-            used_tokens = self.db.tokens_many_in_window(quota_names, c.quota_window_seconds)
+            used_tokens = (self.db.tokens_many_in_window(quota_names, c.quota_window_seconds)
+                           + self.db.reserved_tokens(quota_names))
             if used_tokens >= int(quota_tokens):
                 return Availability(False, "rolling token quota exhausted")
         return Availability(True)
@@ -76,10 +83,21 @@ class Scheduler:
             if c.extra.get("first_attempt_only", False) and attempt_no > 1:
                 return False
             return True
-        pool = [
-            c for c in candidates
-            if c.role == role and c.name not in exclude and self.available(c, candidates).ok and fits(c)
-        ]
+        unavailable: dict[str, str] = {}
+        pool = []
+        for c in candidates:
+            if c.role != role:
+                continue
+            if c.name in exclude:
+                unavailable[c.name] = "excluded by retry policy"
+                continue
+            availability = self.available(c, candidates)
+            if not availability.ok:
+                unavailable[c.name] = availability.reason
+            elif not fits(c):
+                unavailable[c.name] = "task/profile constraint"
+            else:
+                pool.append(c)
         if not pool:
             raise RuntimeError(f"No available {role} candidates")
 
@@ -92,7 +110,10 @@ class Scheduler:
         ]
         if under_sampled:
             c = min(under_sampled, key=lambda x: int(stats.get(x.name, {}).get("attempts", 0)))
-            return SchedulerDecision(c, "cold_start", 0.5, "candidate needs production observations")
+            return SchedulerDecision(c, "cold_start", 0.5, "candidate needs production observations",
+                                     [x.name for x in pool], unavailable, 1.0,
+                                     SCHEDULER_POLICY_VERSION,
+                                     {"exploration_rate": self.exploration_rate, "phase": phase})
 
         scored: list[tuple[float, Candidate, str]] = []
         for c in pool:
@@ -122,8 +143,15 @@ class Scheduler:
             if randomized:
                 score, c, detail = random.choice(randomized)
                 return SchedulerDecision(
-                    c, "explore", score, "randomized production exploration; " + detail
+                    c, "explore", score, "randomized production exploration; " + detail,
+                    [x.name for x in pool], unavailable,
+                    self.exploration_rate / len(randomized), SCHEDULER_POLICY_VERSION,
+                    {"exploration_rate": self.exploration_rate, "phase": phase},
                 )
 
         score, c, detail = scored[0]
-        return SchedulerDecision(c, "exploit", score, "best observed utility; " + detail)
+        probability = 1.0 if len(scored) == 1 else 1.0 - self.exploration_rate
+        return SchedulerDecision(c, "exploit", score, "best observed utility; " + detail,
+                                 [x.name for x in pool], unavailable, probability,
+                                 SCHEDULER_POLICY_VERSION,
+                                 {"exploration_rate": self.exploration_rate, "phase": phase})

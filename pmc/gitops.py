@@ -97,6 +97,10 @@ class WorktreeManager:
         # This also removes accidental `git add` of generated test artifacts.
         git(worktree, "reset", "--mixed", baseline)
 
+    def reset_attempt(self, worktree: Path, baseline: str) -> None:
+        git(worktree, "reset", "--hard", baseline)
+        git(worktree, "clean", "-fd")
+
     def diff(self, worktree: Path, baseline: str) -> str:
         intent_to_add_untracked(worktree)
         return git(worktree, "diff", "--binary", baseline, "--").stdout

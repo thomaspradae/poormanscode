@@ -22,9 +22,10 @@ class PMCConfig:
     exploration_rate: float = 0.20
     min_samples_per_candidate: int = 5
     max_attempts: int = 3
-    same_candidate_retries: int = 1
+    same_candidate_retries: int = 2
     review_enabled: bool = False
     lease_ttl_seconds: int = 300
+    verifier_sandbox: str = "guarded"
     candidates: list[Candidate] = None  # type: ignore[assignment]
 
 
@@ -48,9 +49,10 @@ def load_config(path: Path | None = None) -> PMCConfig:
         exploration_rate=float(core.get("exploration_rate", 0.20)),
         min_samples_per_candidate=int(core.get("min_samples_per_candidate", 5)),
         max_attempts=int(core.get("max_attempts", 3)),
-        same_candidate_retries=int(core.get("same_candidate_retries", 1)),
+        same_candidate_retries=int(core.get("same_candidate_retries", 2)),
         review_enabled=bool(core.get("review_enabled", False)),
         lease_ttl_seconds=int(core.get("lease_ttl_seconds", 300)),
+        verifier_sandbox=str(core.get("verifier_sandbox", "guarded")),
         candidates=candidates,
     )
     for p in (cfg.db_path.parent, cfg.runs_dir, cfg.worktrees_dir):
@@ -65,6 +67,21 @@ def load_repo_config(repo: Path) -> dict[str, Any]:
     data = yaml.safe_load(path.read_text()) or {}
     if not isinstance(data, dict):
         raise ValueError(f"{path} must contain a YAML mapping")
+    return data
+
+
+def load_repo_config_at(repo: Path, revision: str) -> dict[str, Any]:
+    """Load acceptance policy from PMC's immutable Git baseline."""
+    import subprocess
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "show", f"{revision}:poorman.yaml"],
+        text=True, capture_output=True,
+    )
+    if proc.returncode != 0:
+        return {}
+    data = yaml.safe_load(proc.stdout) or {}
+    if not isinstance(data, dict):
+        raise TypeError("baseline poorman.yaml must contain a YAML mapping")
     return data
 
 

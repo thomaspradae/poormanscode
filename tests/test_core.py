@@ -76,3 +76,14 @@ def test_feedback_attaches_to_ready_attempt(tmp_path: Path):
     db.add_feedback(job.id, "ACCEPT", attempt_id=aid)
     stats = db.candidate_stats()
     assert stats[0]["accepted_attempts"] == 1
+
+
+def test_verification_policy_is_loadable_from_immutable_baseline(tmp_path: Path):
+    from pmc.config import load_repo_config_at
+    repo = make_repo(tmp_path)
+    (repo / "poorman.yaml").write_text("test: pytest -q\nmax_patch_lines: 10\n")
+    sh(repo, "git add poorman.yaml && git commit -qm policy")
+    baseline = sh(repo, "git rev-parse HEAD").stdout.strip()
+    (repo / "poorman.yaml").write_text("test: 'true'\nmax_patch_lines: 99999\n")
+    policy = load_repo_config_at(repo, baseline)
+    assert policy == {"test": "pytest -q", "max_patch_lines": 10}

@@ -8,6 +8,13 @@ from typing import Any
 import httpx
 
 
+class ProviderError(RuntimeError):
+    def __init__(self, status_code: int, message: str, rate_headers: dict[str, str]):
+        super().__init__(message)
+        self.status_code = status_code
+        self.rate_headers = rate_headers
+
+
 @dataclass(slots=True)
 class ChatReply:
     content: str
@@ -65,7 +72,9 @@ class OpenAICompatibleClient:
                     break
                 transient = response.status_code in {408, 409, 425, 429, 500, 502, 503, 504}
                 if not transient or i == len(waits) - 1:
-                    response.raise_for_status()
+                    rate = {k.lower(): v for k, v in response.headers.items()
+                            if k.lower().startswith("x-ratelimit") or k.lower() == "retry-after"}
+                    raise ProviderError(response.status_code, f"provider HTTP {response.status_code}", rate)
                 retry_after = response.headers.get("retry-after")
                 if retry_after:
                     try:
@@ -74,7 +83,10 @@ class OpenAICompatibleClient:
                         pass
             assert last_response is not None
             response = last_response
-            response.raise_for_status()
+            if response.status_code >= 400:
+                rate = {k.lower(): v for k, v in response.headers.items()
+                        if k.lower().startswith("x-ratelimit") or k.lower() == "retry-after"}
+                raise ProviderError(response.status_code, f"provider HTTP {response.status_code}", rate)
             data = response.json()
         choice = data["choices"][0]
         content = choice.get("message", {}).get("content") or ""

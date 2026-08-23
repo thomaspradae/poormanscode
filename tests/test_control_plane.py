@@ -49,3 +49,28 @@ def test_manual_baseline_stats(tmp_path: Path):
     assert row["n"] == 2
     assert row["accepted"] == 1
     assert row["avg_seconds"] == 15
+
+
+def test_events_are_append_only_and_candidate_versions_are_immutable(tmp_path: Path):
+    import sqlite3
+    import pytest
+    db = Database(tmp_path / "db.sqlite")
+    job = Job("PMC-000001", tmp_path, "task")
+    db.create_job(job)
+    with pytest.raises(sqlite3.IntegrityError):
+        with db.connect() as conn:
+            conn.execute("DELETE FROM events")
+    candidate = Candidate(name="a", executor="bash", version="1", model="m1")
+    db.register_candidate(candidate)
+    changed = Candidate(name="a", executor="bash", version="1", model="m2")
+    with pytest.raises(RuntimeError, match="increment its version"):
+        db.register_candidate(changed)
+
+
+def test_rate_limit_state_blocks_routing(tmp_path: Path):
+    db = Database(tmp_path / "db.sqlite")
+    db.record_quota_event("provider", "a", "RATE_LIMIT", {"retry-after": "60"})
+    scheduler = Scheduler(db, 0.2, 1)
+    availability = scheduler.available(Candidate(name="a", executor="bash"))
+    assert not availability.ok
+    assert "cooldown" in availability.reason

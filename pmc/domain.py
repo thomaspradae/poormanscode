@@ -46,6 +46,11 @@ class Job:
 class Candidate:
     name: str
     executor: str
+    version: str = "1"
+    provider: str | None = None
+    prompt_profile: str = "builder-v2"
+    tool_profile: str = "default"
+    resource_class: str = "default"
     role: str = "builder"
     enabled: bool = True
     model: str | None = None
@@ -148,3 +153,8 @@ class SchedulerDecision:
     mode: str
     score: float
     reason: str
+    eligible: list[str] = field(default_factory=list)
+    unavailable: dict[str, str] = field(default_factory=dict)
+    selection_probability: float = 1.0
+    policy_version: str = "unknown"
+    snapshot: dict[str, Any] = field(default_factory=dict)

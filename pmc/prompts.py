@@ -8,8 +8,9 @@ from .context import build_context_packet
 from .domain import Job
 
 
-def builder_prompt(job: Job, worktree: Path, repo_cfg: dict[str, Any], feedback: str = "") -> str:
-    context = build_context_packet(worktree, job.request)
+def builder_prompt(job: Job, worktree: Path, repo_cfg: dict[str, Any], feedback: str = "",
+                   context: str | None = None) -> str:
+    context = context if context is not None else build_context_packet(worktree, job.request)
     visible_checks = {
         k: repo_cfg.get(k)
         for k in ("test", "lint", "typecheck", "build")

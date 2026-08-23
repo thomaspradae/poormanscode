@@ -9,6 +9,7 @@ from typing import Any
 
 from .domain import CommandResult, Job, VerificationResult
 from .gitops import git, intent_to_add_untracked
+from .sandbox import SandboxLimits, build_sandbox, scrubbed_environment
 
 
 SECRET_PATTERNS = [
@@ -20,15 +21,13 @@ SECRET_PATTERNS = [
 ]
 
 
-def _run(name: str, command: str, cwd: Path, timeout: int) -> CommandResult:
+def _run(name: str, command: str, cwd: Path, timeout: int,
+         sandbox_name: str = "guarded") -> CommandResult:
     started = time.monotonic()
     try:
-        p = subprocess.run(
-            ["/bin/bash", "-lc", command],
-            cwd=cwd,
-            text=True,
-            capture_output=True,
-            timeout=timeout,
+        p = build_sandbox(sandbox_name).run(
+            cwd, command, env=scrubbed_environment(), network=False,
+            limits=SandboxLimits(wall_seconds=timeout, cpu_seconds=max(1, timeout - 5)),
         )
         return CommandResult(name, command, p.returncode, time.monotonic() - started, p.stdout, p.stderr)
     except subprocess.TimeoutExpired as exc:
@@ -74,7 +73,8 @@ def _secret_scan(diff: str) -> list[str]:
     return findings
 
 
-def verify(job: Job, worktree: Path, repo_cfg: dict[str, Any]) -> VerificationResult:
+def verify(job: Job, worktree: Path, repo_cfg: dict[str, Any],
+           sandbox_name: str = "guarded") -> VerificationResult:
     baseline = job.baseline_commit
     if not baseline:
         raise RuntimeError("job has no baseline commit")
@@ -84,7 +84,7 @@ def verify(job: Job, worktree: Path, repo_cfg: dict[str, Any]) -> VerificationRe
     for name in ("test", "lint", "typecheck", "build", "hidden_test"):
         command = repo_cfg.get(name)
         if command:
-            commands.append(_run(name, str(command), worktree, timeout))
+            commands.append(_run(name, str(command), worktree, timeout, sandbox_name))
 
     changed = [x for x in git(worktree, "diff", "--name-only", baseline, "--").stdout.splitlines() if x]
     patch_lines = _patch_lines(worktree, baseline)

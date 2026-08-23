@@ -88,6 +88,18 @@ def test_controller_full_cycle(tmp_path: Path):
         stats = ctl.db.candidate_stats(phase="first")
         assert stats[0]["verified"] == 1
         assert stats[0]["accepted_attempts"] == 1
+        with ctl.db.connect() as conn:
+            attempt = conn.execute("SELECT * FROM attempts").fetchone()
+            assert attempt["outcome"] == "SUCCESS"
+            assert attempt["context_hash"]
+            versions = json.loads(attempt["version_snapshot_json"])
+            assert versions["base_repository_sha"]
+            decision = conn.execute("SELECT * FROM scheduler_decisions").fetchone()
+            assert decision["selection_probability"] == 1.0
+            event_types = [r[0] for r in conn.execute("SELECT event_type FROM events ORDER BY seq")]
+            assert event_types == sorted(event_types, key=lambda x: event_types.index(x))
+            assert {"JOB_CREATED", "SCHEDULER_DECISION", "ATTEMPT_STARTED",
+                    "RESOURCE_RESERVED", "VERIFICATION_STARTED", "HUMAN_ACCEPTED"} <= set(event_types)
     finally:
         server.shutdown()
         server.server_close()

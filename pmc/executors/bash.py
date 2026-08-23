@@ -1,16 +1,15 @@
 from __future__ import annotations
 
 import json
-import os
 import re
-import shutil
 import subprocess
 import time
 from pathlib import Path
 from typing import Any
 
 from ..domain import ExecutionRequest, ExecutionResult
-from ..providers import OpenAICompatibleClient
+from ..providers import OpenAICompatibleClient, ProviderError
+from ..sandbox import SandboxLimits, build_sandbox, scrubbed_environment
 
 
 SYSTEM = """You are a software engineering agent with one tool: shell.
@@ -27,13 +26,7 @@ class UnsafeCommand(RuntimeError):
 
 
 def _clean_child_env() -> dict[str, str]:
-    env = {}
-    for k, v in os.environ.items():
-        upper = k.upper()
-        if any(x in upper for x in ("TOKEN", "SECRET", "PASSWORD", "API_KEY", "PRIVATE_KEY")):
-            continue
-        env[k] = v
-    return env
+    return scrubbed_environment()
 
 
 def _guard(command: str) -> None:
@@ -71,36 +64,16 @@ class BashExecutor:
     def _command(self, request: ExecutionRequest, command: str) -> subprocess.CompletedProcess[str]:
         _guard(command)
         c = request.candidate
-        timeout = int(c.extra.get("command_timeout", 180))
         env = _clean_child_env()
-        if c.sandbox == "bwrap":
-            if not shutil.which("bwrap"):
-                raise RuntimeError("candidate requests sandbox=bwrap but bubblewrap is not installed")
-            args = [
-                "bwrap",
-                "--die-with-parent",
-                "--new-session",
-                "--ro-bind", "/", "/",
-                "--bind", str(request.worktree), str(request.worktree),
-                "--dev", "/dev",
-                "--proc", "/proc",
-                "--tmpfs", "/tmp",
-                "--chdir", str(request.worktree),
-            ]
-            if not c.network:
-                args.append("--unshare-net")
-            args += ["/bin/bash", "-lc", command]
-            return subprocess.run(args, text=True, capture_output=True, timeout=timeout, env=env)
-        if c.sandbox not in ("none", "guarded"):
-            raise RuntimeError(f"unknown bash sandbox mode: {c.sandbox}")
-        return subprocess.run(
-            ["/bin/bash", "-lc", command],
-            cwd=request.worktree,
-            text=True,
-            capture_output=True,
-            timeout=timeout,
-            env=env,
+        limits = SandboxLimits(
+            wall_seconds=int(c.extra.get("command_timeout", 180)),
+            cpu_seconds=int(c.extra.get("cpu_seconds", 120)),
+            memory_bytes=int(c.extra.get("memory_mb", 2048)) * 1024**2,
+            processes=int(c.extra.get("process_limit", 128)),
+            file_bytes=int(c.extra.get("file_mb", 512)) * 1024**2,
         )
+        return build_sandbox(c.sandbox).run(request.worktree, command, env=env,
+                                            network=c.network, limits=limits)
 
     def run(self, request: ExecutionRequest) -> ExecutionResult:
         c = request.candidate
@@ -124,6 +97,13 @@ class BashExecutor:
                     temperature=float(c.extra.get("temperature", 0.0)),
                     max_tokens=int(c.extra.get("max_tokens", 4096)),
                     extra_body=c.extra.get("request_extra"),
+                )
+            except ProviderError as exc:
+                return ExecutionResult(
+                    False, error=str(exc), input_tokens=in_tokens or None,
+                    output_tokens=out_tokens or None,
+                    raw_metrics={"turns": transcript, "provider_status": exc.status_code,
+                                 "rate_headers": exc.rate_headers},
                 )
             except Exception as exc:
                 return ExecutionResult(
