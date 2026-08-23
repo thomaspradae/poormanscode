@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 from .classifier import classify
@@ -15,6 +16,21 @@ from .config import DEFAULT_CONFIG, load_config
 from .controller import Controller, LeaseBusy
 from .db import Database
 from .domain import Job, JobState
+
+
+def _attempt_duration(attempt) -> float:
+    if attempt["duration_seconds"] is not None:
+        return float(attempt["duration_seconds"])
+    if attempt["status"] == "RUNNING" and attempt["started_at"]:
+        return max(
+            0.0,
+            (
+                datetime.now(UTC) - datetime.fromisoformat(attempt["started_at"])
+            ).total_seconds(),
+        )
+    return 0.0
+
+
 from .gitops import ensure_repo
 
 
@@ -160,10 +176,19 @@ def cmd_inspect(args) -> int:
     )
     print("\nATTEMPTS")
     for a in d["attempts"]:
+        duration = _attempt_duration(a)
+        input_tokens = a["input_tokens"] or 0
+        output_tokens = a["output_tokens"] or 0
+        cost_usd = a["cost_usd"]
+        if a["status"] == "RUNNING":
+            live = ctl.db.model_request_totals(a["id"])
+            input_tokens = live["input_tokens"]
+            output_tokens = live["output_tokens"]
+            cost_usd = live["cost_usd"]
         print(
             f"#{a['attempt_no']} {a['candidate']} [{a['executor']}] {a['status']} "
-            f"{(a['duration_seconds'] or 0):.1f}s tokens="
-            f"{(a['input_tokens'] or 0) + (a['output_tokens'] or 0)} cost=${(a['cost_usd'] or 0):.4f}"
+            f"{duration:.1f}s tokens="
+            f"{input_tokens + output_tokens} cost=${(cost_usd or 0):.4f}"
         )
         if a["error"]:
             print("  error:", a["error"][:1000])

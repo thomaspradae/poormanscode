@@ -14,11 +14,11 @@ from ..providers import OpenAICompatibleClient, ProviderError
 from ..sandbox import SandboxLimits, build_sandbox, scrubbed_environment
 
 
-SYSTEM = """You are a software engineering agent with one tool: shell.
-Respond with exactly one JSON object and no markdown.
+SYSTEM = """You are a software engineering agent. No native API tools or function calls are available.
+Respond with exactly one JSON object as ordinary text and no markdown.
 To run a command: {"action":"bash","command":"..."}
 When the ticket is fully implemented: {"action":"done","summary":"..."}
-Use shell commands to inspect and edit files. Prefer small, targeted changes. Never commit or push.
+Request shell commands through the JSON text protocol above. Prefer small, targeted changes. Never commit or push.
 Do not claim success until you have run the visible relevant tests yourself.
 """
 

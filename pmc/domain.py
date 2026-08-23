@@ -48,7 +48,7 @@ class Candidate:
     executor: str
     version: str = "1"
     provider: str | None = None
-    prompt_profile: str = "builder-v2"
+    prompt_profile: str = "builder-v3"
     tool_profile: str = "default"
     resource_class: str = "default"
     role: str = "builder"

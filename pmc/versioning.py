@@ -8,7 +8,7 @@ from typing import Any
 
 SCHEMA_VERSION = 3
 JOB_CONTRACT_VERSION = "1"
-PROMPT_PROFILE_VERSION = "builder-v2"
+PROMPT_PROFILE_VERSION = "builder-v3"
 CONTEXT_BUILDER_VERSION = "context-v2"
 SCHEDULER_POLICY_VERSION = "epsilon-greedy-v2"
 VERIFIER_VERSION = "deterministic-v2"

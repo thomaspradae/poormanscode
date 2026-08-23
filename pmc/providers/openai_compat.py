@@ -8,10 +8,20 @@ import httpx
 
 
 class ProviderError(RuntimeError):
-    def __init__(self, status_code: int, message: str, rate_headers: dict[str, str]):
+    def __init__(
+        self,
+        status_code: int,
+        message: str,
+        rate_headers: dict[str, str],
+        *,
+        error_type: str | None = None,
+        error_code: str | None = None,
+    ):
         super().__init__(message)
         self.status_code = status_code
         self.rate_headers = rate_headers
+        self.error_type = error_type
+        self.error_code = error_code
 
 
 @dataclass(slots=True)
@@ -70,8 +80,35 @@ class OpenAICompatibleClient:
                     for k, v in response.headers.items()
                     if k.lower().startswith("x-ratelimit") or k.lower() == "retry-after"
                 }
+                error_type = error_code = None
+                detail = ""
+                try:
+                    error = response.json().get("error", {})
+                    if isinstance(error, dict):
+                        error_type = (
+                            str(error.get("type")) if error.get("type") else None
+                        )
+                        error_code = (
+                            str(error.get("code")) if error.get("code") else None
+                        )
+                        detail = str(error.get("message") or "").replace("\n", " ")[
+                            :1000
+                        ]
+                except (ValueError, AttributeError):
+                    pass
+                message = f"provider HTTP {response.status_code}"
+                if error_type:
+                    message += f" type={error_type}"
+                if error_code:
+                    message += f" code={error_code}"
+                if detail:
+                    message += f": {detail}"
                 raise ProviderError(
-                    response.status_code, f"provider HTTP {response.status_code}", rate
+                    response.status_code,
+                    message,
+                    rate,
+                    error_type=error_type,
+                    error_code=error_code,
                 )
             data = response.json()
         choice = data["choices"][0]
