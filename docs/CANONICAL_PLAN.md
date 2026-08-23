@@ -39,7 +39,8 @@ affecting acceptance must remain outside worker authority.
 
 ## P2 — multi-agent/distributed capability
 
-- [ ] Foreman, dependency DAG, parallel worktrees, integration/rebase/conflicts
+- [x] Foreman proposal format, human approval, dependency DAG, and Kanban CLI
+- [ ] Automatic cross-worktree integration/rebase/conflict handling
 - [ ] Shadow/challenger execution
 - [ ] Post-acceptance regression, revert, reopen, and hotfix outcomes
 

@@ -200,6 +200,31 @@ CREATE TABLE IF NOT EXISTS manual_baselines (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_manual_tool ON manual_baselines(tool);
+
+CREATE TABLE IF NOT EXISTS features (
+    id TEXT PRIMARY KEY,
+    repo TEXT NOT NULL,
+    title TEXT NOT NULL,
+    request TEXT NOT NULL,
+    base_branch TEXT NOT NULL,
+    state TEXT NOT NULL,
+    plan_json TEXT,
+    plan_candidate TEXT,
+    integration_worktree TEXT,
+    integration_commit TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS feature_tasks (
+    feature_id TEXT NOT NULL REFERENCES features(id),
+    task_key TEXT NOT NULL,
+    job_id TEXT NOT NULL UNIQUE REFERENCES jobs(id),
+    position INTEGER NOT NULL,
+    depends_json TEXT NOT NULL,
+    PRIMARY KEY(feature_id, task_key)
+);
+CREATE INDEX IF NOT EXISTS idx_feature_tasks_job ON feature_tasks(job_id);
 """
 
 
@@ -846,6 +871,150 @@ class Database:
         n = int(row["id"].split("-")[-1]) + 1 if row else 1
         return f"PMC-{n:06d}"
 
+    def next_feature_id(self) -> str:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT id FROM features ORDER BY CAST(SUBSTR(id, 6) AS INTEGER) DESC LIMIT 1"
+            ).fetchone()
+        n = int(row["id"].split("-")[-1]) + 1 if row else 1
+        return f"PMCF-{n:06d}"
+
+    def create_feature(
+        self, feature_id: str, repo: Path, title: str, request: str, base_branch: str
+    ) -> None:
+        now = utcnow()
+        with self.connect() as conn:
+            conn.execute(
+                """INSERT INTO features(id,repo,title,request,base_branch,state,created_at,updated_at)
+                VALUES(?,?,?,?,?,'DRAFT',?,?)""",
+                (feature_id, str(repo), title, request, base_branch, now, now),
+            )
+        self.event("FEATURE_CREATED", payload={"feature_id": feature_id, "title": title})
+
+    def get_feature(self, feature_id: str) -> sqlite3.Row:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM features WHERE id=?", (feature_id,)).fetchone()
+        if not row:
+            raise KeyError(f"Unknown feature {feature_id}")
+        return row
+
+    def save_feature_plan(
+        self, feature_id: str, plan: dict[str, Any], candidate: str | None
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE features SET state='PLANNED',plan_json=?,plan_candidate=?,updated_at=? WHERE id=?",
+                (json.dumps(plan), candidate, utcnow(), feature_id),
+            )
+        self.event("FEATURE_PLANNED", payload={"feature_id": feature_id, "candidate": candidate})
+
+    def approve_feature_plan(self, feature_id: str, jobs: list[tuple[Job, str, int, list[str]]]) -> None:
+        now = utcnow()
+        with self.connect() as conn:
+            feature = conn.execute("SELECT state FROM features WHERE id=?", (feature_id,)).fetchone()
+            if not feature or feature["state"] != "PLANNED":
+                raise RuntimeError("feature must be PLANNED before approval")
+            for job, task_key, position, depends in jobs:
+                conn.execute(
+                    """INSERT INTO jobs
+                    (id,repo,request,base_branch,priority,task_type,acceptance_json,
+                     constraints_json,state,worktree,baseline_commit,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        job.id, str(job.repo), job.request, job.base_branch, job.priority,
+                        job.task_type, json.dumps(job.acceptance), json.dumps(job.constraints),
+                        job.state.value, None, None, now, now,
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO feature_tasks(feature_id,task_key,job_id,position,depends_json) VALUES(?,?,?,?,?)",
+                    (feature_id, task_key, job.id, position, json.dumps(depends)),
+                )
+            conn.execute(
+                "UPDATE features SET state='APPROVED',updated_at=? WHERE id=?",
+                (now, feature_id),
+            )
+        for job, task_key, _position, depends in jobs:
+            self.event("JOB_CREATED", job_id=job.id, payload={"repo": str(job.repo), "request": job.request})
+            self.event("FEATURE_TASK_CREATED", job_id=job.id, payload={"feature_id": feature_id, "task_key": task_key, "depends_on": depends})
+
+    def feature_tasks(self, feature_id: str) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return list(conn.execute(
+                """SELECT ft.*,j.state,j.request,j.accepted_commit,j.priority,j.task_type
+                FROM feature_tasks ft JOIN jobs j ON j.id=ft.job_id
+                WHERE ft.feature_id=? ORDER BY ft.position""",
+                (feature_id,),
+            ))
+
+    def dependency_commits(self, job_id: str) -> list[str]:
+        """Return accepted prerequisite commits in deterministic topological order."""
+        with self.connect() as conn:
+            current = conn.execute(
+                "SELECT feature_id,depends_json FROM feature_tasks WHERE job_id=?",
+                (job_id,),
+            ).fetchone()
+            if not current:
+                return []
+            rows = list(
+                conn.execute(
+                    """SELECT ft.task_key,ft.depends_json,j.accepted_commit,j.state
+                    FROM feature_tasks ft JOIN jobs j ON j.id=ft.job_id
+                    WHERE ft.feature_id=?""",
+                    (current["feature_id"],),
+                )
+            )
+        by_key = {row["task_key"]: row for row in rows}
+        ordered: list[str] = []
+        visited: set[str] = set()
+
+        def visit(key: str) -> None:
+            if key in visited:
+                return
+            row = by_key[key]
+            for dep in json.loads(row["depends_json"]):
+                visit(dep)
+            if row["state"] != JobState.ACCEPTED.value or not row["accepted_commit"]:
+                raise RuntimeError(f"dependency {key} is not accepted")
+            visited.add(key)
+            if row["accepted_commit"] not in ordered:
+                ordered.append(row["accepted_commit"])
+
+        for key in json.loads(current["depends_json"]):
+            visit(key)
+        return ordered
+
+    def list_features(self) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return list(conn.execute("SELECT * FROM features ORDER BY created_at DESC"))
+
+    def refresh_feature_state(self, feature_id: str) -> str:
+        feature = self.get_feature(feature_id)
+        tasks = self.feature_tasks(feature_id)
+        if not tasks:
+            return feature["state"]
+        states = {row["state"] for row in tasks}
+        active = {
+            JobState.RUNNING.value,
+            JobState.VERIFYING.value,
+            JobState.REVIEWING.value,
+            JobState.READY.value,
+        }
+        if states == {JobState.ACCEPTED.value}:
+            state = "ACCEPTED"
+        elif states & active:
+            state = "RUNNING"
+        elif states & {JobState.BLOCKED.value, JobState.FAILED.value}:
+            state = "BLOCKED"
+        else:
+            state = "APPROVED"
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE features SET state=?,updated_at=? WHERE id=?",
+                (state, utcnow(), feature_id),
+            )
+        return state
+
     def create_job(self, job: Job) -> None:
         now = utcnow()
         with self.connect() as conn:
@@ -941,6 +1110,24 @@ class Database:
                 "UPDATE jobs SET state=?,accepted_commit=?,updated_at=? WHERE id=?",
                 (JobState.ACCEPTED.value, commit, now, job_id),
             )
+            feature = conn.execute(
+                "SELECT feature_id FROM feature_tasks WHERE job_id=?", (job_id,)
+            ).fetchone()
+            if feature:
+                remaining = conn.execute(
+                    """SELECT COUNT(*) n FROM feature_tasks ft JOIN jobs j ON j.id=ft.job_id
+                    WHERE ft.feature_id=? AND j.state!='ACCEPTED'""",
+                    (feature["feature_id"],),
+                ).fetchone()["n"]
+                conn.execute(
+                    "UPDATE features SET state=?,integration_commit=?,updated_at=? WHERE id=?",
+                    (
+                        "ACCEPTED" if not remaining else "RUNNING",
+                        commit if not remaining else None,
+                        now,
+                        feature["feature_id"],
+                    ),
+                )
             for event_type, payload in (
                 ("HUMAN_ACCEPTED", {}),
                 ("COMMIT_CREATED", {"commit": commit}),
@@ -975,8 +1162,23 @@ class Database:
     def queued_jobs(self, limit: int = 20) -> list[str]:
         with self.connect() as conn:
             rows = conn.execute(
-                """SELECT id FROM jobs WHERE state IN (?, ?)
-                ORDER BY priority ASC, created_at ASC LIMIT ?""",
+                """SELECT j.id FROM jobs j
+                LEFT JOIN feature_tasks ft ON ft.job_id=j.id
+                LEFT JOIN features f ON f.id=ft.feature_id
+                WHERE j.state IN (?, ?)
+                AND (
+                    ft.job_id IS NULL OR (
+                        f.state IN ('APPROVED','RUNNING')
+                        AND NOT EXISTS (
+                            SELECT 1 FROM json_each(ft.depends_json) dep
+                            LEFT JOIN feature_tasks required
+                              ON required.feature_id=ft.feature_id AND required.task_key=dep.value
+                            LEFT JOIN jobs required_job ON required_job.id=required.job_id
+                            WHERE required_job.state IS NULL OR required_job.state != 'ACCEPTED'
+                        )
+                    )
+                )
+                ORDER BY j.priority ASC,j.created_at ASC LIMIT ?""",
                 (JobState.QUEUED.value, JobState.RETRY.value, limit),
             ).fetchall()
         return [r["id"] for r in rows]

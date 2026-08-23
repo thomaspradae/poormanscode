@@ -6,7 +6,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 JOB_CONTRACT_VERSION = "1"
 PROMPT_PROFILE_VERSION = "builder-v4"
 CONTEXT_BUILDER_VERSION = "context-v3"

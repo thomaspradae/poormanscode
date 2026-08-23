@@ -123,6 +123,23 @@ class Controller:
         if job.worktree and job.worktree.exists() and job.baseline_commit:
             return job
         wt, baseline = self.worktrees.create(job.repo, job.id, job.base_branch)
+        dependency_commits = self.db.dependency_commits(job.id)
+        if dependency_commits:
+            from .gitops import git, resolve_commit
+
+            for commit in dependency_commits:
+                result = git(wt, "cherry-pick", commit, check=False)
+                if result.returncode != 0:
+                    git(wt, "cherry-pick", "--abort", check=False)
+                    raise RuntimeError(
+                        f"dependency integration conflict at {commit}: {result.stderr.strip()}"
+                    )
+            baseline = resolve_commit(wt, "HEAD")
+            self.db.event(
+                "DEPENDENCIES_INTEGRATED",
+                job_id=job.id,
+                payload={"commits": dependency_commits, "baseline": baseline},
+            )
         if self.cfg.verifier_sandbox == "restricted-user":
             if not shutil.which("setfacl"):
                 raise RuntimeError("restricted-user verifier requires setfacl")

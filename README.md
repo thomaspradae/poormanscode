@@ -18,6 +18,7 @@ It deliberately does **not** implement one giant coding agent. Executors are rep
 - retry/escalation with verifier failures fed into the next attempt
 - optional independent reviewer candidate
 - CLI for submit/run/status/inspect/accept/reject/stats/export/doctor
+- reviewed Foreman plans, dependency-aware feature DAGs, and a Kanban-style board
 - repo contract: `AGENTS.md` + `poorman.yaml`
 
 ## Install
@@ -53,6 +54,18 @@ pmc submit . "Make injuries persist between matches" \
   --acceptance "old saves still load" \
   --run
 ```
+
+For a larger feature, propose and approve a dependency plan before dispatch:
+
+```bash
+pmc feature-create . "Playable prototype" "Build the first playable prototype"
+pmc feature-plan PMCF-000001 --candidate groq-oss20-bash
+pmc feature-approve PMCF-000001
+pmc board PMCF-000001
+pmc daemon
+```
+
+See `docs/FOREMAN.md` for the reviewed JSON plan format and dependency semantics.
 
 Inspect and accept only after PMC's verifier is green:
 

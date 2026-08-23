@@ -99,6 +99,8 @@ class Scheduler:
         exclude = exclude or set()
 
         def fits(c: Candidate) -> bool:
+            if c.executor == "jules" and job.constraints.get("_feature_dependencies"):
+                return False
             task_types = c.extra.get("task_types")
             if task_types and job.task_type not in task_types:
                 return False

@@ -16,6 +16,7 @@ from .config import DEFAULT_CONFIG, load_config
 from .controller import Controller, LeaseBusy
 from .db import Database
 from .domain import Job, JobState
+from .foreman import propose_plan, validate_plan
 
 
 def _attempt_duration(attempt) -> float:
@@ -154,6 +155,97 @@ def cmd_status(args) -> int:
         print(
             f"{r['id']:<12} {r['state']:<18} {r['task_type']:<18} {r['priority']:<2} {request}"
         )
+    return 0
+
+
+def cmd_feature_create(args) -> int:
+    ctl = _controller(args)
+    repo = Path(args.repo).resolve()
+    ensure_repo(repo)
+    feature_id = ctl.db.next_feature_id()
+    ctl.db.create_feature(feature_id, repo, args.title, args.request, args.base_branch)
+    print(feature_id)
+    return 0
+
+
+def cmd_feature_plan(args) -> int:
+    ctl = _controller(args)
+    feature = ctl.db.get_feature(args.feature_id)
+    if args.file:
+        plan = validate_plan(json.loads(Path(args.file).read_text()))
+        candidate_name = None
+    else:
+        matches = [
+            c for c in ctl.cfg.candidates if c.name == args.candidate and c.enabled
+        ]
+        if not matches:
+            raise RuntimeError(f"unknown or disabled Foreman candidate: {args.candidate}")
+        plan = propose_plan(
+            Path(feature["repo"]), feature["title"], feature["request"], matches[0]
+        )
+        candidate_name = matches[0].name
+    ctl.db.save_feature_plan(args.feature_id, plan, candidate_name)
+    print(json.dumps(plan, indent=2))
+    print(f"\nReview, then run: pmc feature-approve {args.feature_id}")
+    return 0
+
+
+def cmd_feature_approve(args) -> int:
+    ctl = _controller(args)
+    feature = ctl.db.get_feature(args.feature_id)
+    if not feature["plan_json"]:
+        raise RuntimeError("feature has no proposed plan")
+    plan = validate_plan(json.loads(feature["plan_json"]))
+    next_number = int(ctl.db.next_job_id().split("-")[-1])
+    jobs = []
+    for position, task in enumerate(plan["tasks"]):
+        job = Job(
+            id=f"PMC-{next_number + position:06d}",
+            repo=Path(feature["repo"]),
+            request=task["request"],
+            base_branch=feature["base_branch"],
+            priority=int(task.get("priority", 2)),
+            task_type=str(task.get("task_type") or classify(task["request"])),
+            acceptance=list(task.get("acceptance", [])),
+            constraints={
+                "_feature_dependencies": list(task.get("depends_on", []))
+            },
+        )
+        jobs.append(
+            (job, task["id"], position, list(task.get("depends_on", [])))
+        )
+    ctl.db.approve_feature_plan(args.feature_id, jobs)
+    for job, key, _position, depends in jobs:
+        suffix = f" depends={','.join(depends)}" if depends else " ready"
+        print(f"{job.id} {key}{suffix}")
+    return 0
+
+
+def cmd_board(args) -> int:
+    ctl = _controller(args)
+    features = (
+        [ctl.db.get_feature(args.feature_id)]
+        if args.feature_id
+        else ctl.db.list_features()
+    )
+    if not features:
+        print("no features")
+        return 0
+    for feature in features:
+        state = ctl.db.refresh_feature_state(feature["id"])
+        print(f"{feature['id']} [{state}] {feature['title']}")
+        tasks = ctl.db.feature_tasks(feature["id"])
+        if not tasks:
+            print("  (no approved tasks)")
+            continue
+        accepted = {row["task_key"] for row in tasks if row["state"] == "ACCEPTED"}
+        for row in tasks:
+            deps = json.loads(row["depends_json"])
+            waiting = [dep for dep in deps if dep not in accepted]
+            display_state = f"WAITING({','.join(waiting)})" if waiting and row["state"] == "QUEUED" else row["state"]
+            print(
+                f"  {row['job_id']:<12} {row['task_key']:<24} {display_state}"
+            )
     return 0
 
 
@@ -577,6 +669,28 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("status")
     s.add_argument("--limit", type=int, default=50)
     s.set_defaults(func=cmd_status)
+
+    s = sub.add_parser("feature-create")
+    s.add_argument("repo")
+    s.add_argument("title")
+    s.add_argument("request")
+    s.add_argument("--base-branch", default="main")
+    s.set_defaults(func=cmd_feature_create)
+
+    s = sub.add_parser("feature-plan")
+    s.add_argument("feature_id")
+    source = s.add_mutually_exclusive_group(required=True)
+    source.add_argument("--file", help="reviewed JSON plan file")
+    source.add_argument("--candidate", help="OpenAI-compatible Foreman candidate")
+    s.set_defaults(func=cmd_feature_plan)
+
+    s = sub.add_parser("feature-approve")
+    s.add_argument("feature_id")
+    s.set_defaults(func=cmd_feature_approve)
+
+    s = sub.add_parser("board")
+    s.add_argument("feature_id", nargs="?")
+    s.set_defaults(func=cmd_board)
 
     s = sub.add_parser("inspect")
     s.add_argument("job_id")
