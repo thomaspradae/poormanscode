@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -23,9 +24,16 @@ class ModelRequestAccounting:
         )
 
     def reserve(
-        self, turn: int, messages: list[dict[str, str]], max_output: int
+        self, turn: int, messages: list[dict[str, Any]], max_output: int
     ) -> RequestTicket:
-        estimated_input = max(1, sum(len(m.get("content", "")) for m in messages) // 4)
+        serialized_chars = 0
+        for message in messages:
+            serialized_chars += len(message.get("content") or "")
+            if message.get("tool_calls"):
+                serialized_chars += len(
+                    json.dumps(message["tool_calls"], separators=(",", ":"))
+                )
+        estimated_input = max(1, serialized_chars // 4)
         estimated_cost = self.candidate.monetary_cost_hint or None
         ids = self.db.reserve_model_request(
             request_key=f"mr-{uuid.uuid4().hex}",

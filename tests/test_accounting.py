@@ -36,3 +36,30 @@ def test_model_request_rate_limit_reconciles_and_blocks_routing(tmp_path: Path):
     events = [row["event_type"] for row in db.job_events(job.id)]
     assert "MODEL_REQUEST_RATE_LIMITED" in events
     assert "MODEL_REQUEST_RECONCILED" in events
+
+
+def test_accounting_accepts_native_tool_messages(tmp_path: Path):
+    db = Database(tmp_path / "db.sqlite")
+    job = Job("PMC-000001", tmp_path, "task")
+    candidate = Candidate(
+        name="provider-model-bash-v1",
+        executor="bash",
+        provider="provider",
+        model="model",
+    )
+    db.create_job(job)
+    attempt = db.begin_attempt(job.id, 1, candidate, "forced", 0)
+    accounting = ModelRequestAccounting(
+        db, job_id=job.id, attempt_id=attempt, candidate=candidate
+    )
+
+    ticket = accounting.reserve(
+        2,
+        [
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "x"}]},
+            {"role": "tool", "content": "output", "tool_call_id": "x"},
+        ],
+        256,
+    )
+
+    assert ticket.model_request_id > 0
