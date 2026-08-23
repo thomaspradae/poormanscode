@@ -27,6 +27,7 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(f"task {key} requires request")
         acceptance = task.get("acceptance", [])
         depends = task.get("depends_on", [])
+        candidate_order = task.get("candidate_order", [])
         if not isinstance(acceptance, list) or not all(
             isinstance(x, str) for x in acceptance
         ):
@@ -35,6 +36,10 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
             isinstance(x, str) for x in depends
         ):
             raise ValueError(f"task {key} depends_on must be strings")
+        if not isinstance(candidate_order, list) or not all(
+            isinstance(x, str) for x in candidate_order
+        ):
+            raise ValueError(f"task {key} candidate_order must be strings")
         keys.append(key)
     key_set = set(keys)
     graph = {task["id"]: list(task.get("depends_on", [])) for task in tasks}
@@ -87,7 +92,7 @@ def propose_plan(
     context = build_context_bundle(repo, request).content
     prompt = f"""Decompose this software feature into the smallest useful dependency DAG.
 Every task must be independently implementable and verifiable. Avoid needless decomposition.
-Return JSON only: {{"tasks":[{{"id":"short-id","request":"...","acceptance":["..."],"depends_on":[],"task_type":"FEATURE","priority":2}}]}}.
+Return JSON only: {{"tasks":[{{"id":"short-id","request":"...","acceptance":["..."],"depends_on":[],"task_type":"FEATURE","priority":2,"candidate_order":["groq-oss20-bash","jules","local-qwen25-coder-7b-bash"]}}]}}.
 Cover every part of the parent request. Bootstrap/setup must precede tasks that require it.
 
 FEATURE: {title}

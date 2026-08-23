@@ -208,7 +208,8 @@ def cmd_feature_approve(args) -> int:
             task_type=str(task.get("task_type") or classify(task["request"])),
             acceptance=list(task.get("acceptance", [])),
             constraints={
-                "_feature_dependencies": list(task.get("depends_on", []))
+                "_feature_dependencies": list(task.get("depends_on", [])),
+                "_candidate_order": list(task.get("candidate_order", [])),
             },
         )
         jobs.append(

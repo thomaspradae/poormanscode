@@ -3,8 +3,9 @@ from pathlib import Path
 import pytest
 
 from pmc.db import Database
-from pmc.domain import Job, JobState
+from pmc.domain import Candidate, Job, JobState
 from pmc.foreman import validate_plan
+from pmc.scheduler import Scheduler
 
 
 def _plan():
@@ -120,4 +121,30 @@ def test_dependency_commits_are_topological_and_unique(tmp_path: Path):
         "commit-bootstrap",
         "commit-pitch",
         "commit-camera",
+    ]
+
+
+def test_candidate_order_precedes_empirical_routing(tmp_path: Path):
+    db = Database(tmp_path / "pmc.db")
+    job = Job(
+        "PMC-000001",
+        tmp_path,
+        "task",
+        constraints={"_candidate_order": ["groq", "jules", "qwen"]},
+    )
+    candidates = [
+        Candidate(name="qwen", executor="bash"),
+        Candidate(name="jules", executor="jules"),
+        Candidate(name="groq", executor="bash"),
+    ]
+    scheduler = Scheduler(db, exploration_rate=1.0, min_samples=5)
+
+    first = scheduler.choose(job, candidates)
+    second = scheduler.choose(job, candidates, exclude={"groq"}, attempt_no=2)
+    third = scheduler.choose(job, candidates, exclude={"groq", "jules"}, attempt_no=3)
+
+    assert [first.candidate.name, second.candidate.name, third.candidate.name] == [
+        "groq",
+        "jules",
+        "qwen",
     ]

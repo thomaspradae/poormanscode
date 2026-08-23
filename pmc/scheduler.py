@@ -126,6 +126,24 @@ class Scheduler:
         if not pool:
             raise RuntimeError(f"No available {role} candidates")
 
+        ordered = job.constraints.get("_candidate_order") or []
+        if ordered:
+            by_name = {candidate.name: candidate for candidate in pool}
+            for name in ordered:
+                if name in by_name:
+                    candidate = by_name[name]
+                    return SchedulerDecision(
+                        candidate,
+                        "ordered",
+                        0.5,
+                        "first available candidate in job order",
+                        [c.name for c in pool],
+                        unavailable,
+                        1.0,
+                        SCHEDULER_POLICY_VERSION,
+                        {"candidate_order": ordered},
+                    )
+
         phase = "first" if attempt_no == 1 else "repair"
         stats = self._stats_map(role, job.task_type, phase)
         under_sampled = [

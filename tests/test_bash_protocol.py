@@ -132,3 +132,46 @@ def test_bash_honors_retry_after_within_attempt(tmp_path, monkeypatch):
 
     assert result.ok
     assert sleeps == [2.0]
+
+
+def test_bash_retries_malformed_provider_tool_call_within_attempt(
+    tmp_path, monkeypatch
+):
+    candidate = Candidate(
+        name="test",
+        executor="bash",
+        model="m",
+        base_url="http://unused",
+        max_turns=1,
+        sandbox="guarded",
+        network=True,
+        extra={"tool_protocol_retries": 1},
+    )
+    request = ExecutionRequest(
+        Job("PMC-1", tmp_path, "task"), candidate, tmp_path, "task", 1
+    )
+    replies = iter(
+        [
+            ProviderError(
+                400,
+                "bad tool JSON",
+                {},
+                error_code="tool_use_failed",
+                failed_generation={"reason": "invalid JSON"},
+            ),
+            ChatReply('{"action":"done","summary":"finished"}'),
+        ]
+    )
+
+    def chat(*args, **kwargs):
+        value = next(replies)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    monkeypatch.setattr("pmc.executors.bash.OpenAICompatibleClient.chat", chat)
+
+    result = BashExecutor().run(request)
+
+    assert result.ok
+    assert result.raw_metrics["turns"][0]["tool_protocol_retry"] == 1

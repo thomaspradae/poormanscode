@@ -14,7 +14,7 @@ verifier_sandbox = "restricted-user"
 
 [[candidates]]
 name = "groq-oss20-bash"
-version = "4"
+version = "5"
 provider = "groq"
 enabled = true
 executor = "bash"
@@ -26,6 +26,8 @@ quota_group = "groq"
 max_turns = 20
 sandbox = "bwrap"
 network = false
+request_extra = { parallel_tool_calls = false, reasoning_effort = "low" }
+tool_protocol_retries = 2
 
 [[candidates]]
 name = "gemini-flash-bash"

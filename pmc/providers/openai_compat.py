@@ -16,12 +16,14 @@ class ProviderError(RuntimeError):
         *,
         error_type: str | None = None,
         error_code: str | None = None,
+        failed_generation: dict[str, Any] | None = None,
     ):
         super().__init__(message)
         self.status_code = status_code
         self.rate_headers = rate_headers
         self.error_type = error_type
         self.error_code = error_code
+        self.failed_generation = failed_generation or {}
 
 
 @dataclass(slots=True)
@@ -86,6 +88,7 @@ class OpenAICompatibleClient:
                     if k.lower().startswith("x-ratelimit") or k.lower() == "retry-after"
                 }
                 error_type = error_code = None
+                failed_generation: dict[str, Any] = {}
                 detail = ""
                 try:
                     error = response.json().get("error", {})
@@ -96,6 +99,9 @@ class OpenAICompatibleClient:
                         error_code = (
                             str(error.get("code")) if error.get("code") else None
                         )
+                        raw_failed = error.get("failed_generation")
+                        if isinstance(raw_failed, dict):
+                            failed_generation = raw_failed
                         detail = str(error.get("message") or "").replace("\n", " ")[
                             :1000
                         ]
@@ -114,6 +120,7 @@ class OpenAICompatibleClient:
                     rate,
                     error_type=error_type,
                     error_code=error_code,
+                    failed_generation=failed_generation,
                 )
             data = response.json()
         choice = data["choices"][0]

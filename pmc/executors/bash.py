@@ -120,8 +120,11 @@ class BashExecutor:
         protocol_errors = 0
         format_errors = 0
         rate_retries = int(c.extra.get("rate_limit_retries", 3))
+        tool_protocol_retries = int(c.extra.get("tool_protocol_retries", 2))
         for turn in range(c.max_turns):
-            for rate_try in range(rate_retries + 1):
+            rate_try = 0
+            tool_protocol_try = 0
+            while True:
                 ticket = None
                 try:
                     if request.accounting:
@@ -144,6 +147,7 @@ class BashExecutor:
                         request.accounting.fail(ticket, exc)
                     retry_after = exc.rate_headers.get("retry-after")
                     if exc.status_code == 429 and rate_try < rate_retries:
+                        rate_try += 1
                         try:
                             delay = max(1.0, min(float(retry_after or 1), 120.0))
                         except ValueError:
@@ -152,6 +156,20 @@ class BashExecutor:
                             {"turn": turn + 1, "rate_limited": True, "wait": delay}
                         )
                         time.sleep(delay)
+                        continue
+                    if (
+                        exc.status_code == 400
+                        and exc.error_code == "tool_use_failed"
+                        and tool_protocol_try < tool_protocol_retries
+                    ):
+                        tool_protocol_try += 1
+                        transcript.append(
+                            {
+                                "turn": turn + 1,
+                                "tool_protocol_retry": tool_protocol_try,
+                                "reason": exc.failed_generation.get("reason"),
+                            }
+                        )
                         continue
                     return ExecutionResult(
                         False,
@@ -164,9 +182,15 @@ class BashExecutor:
                             "provider_status": exc.status_code,
                             "rate_headers": exc.rate_headers,
                         },
-                        outcome=Outcome.RATE_LIMIT
-                        if exc.status_code == 429
-                        else Outcome.PROVIDER_FAILURE,
+                        outcome=(
+                            Outcome.RATE_LIMIT
+                            if exc.status_code == 429
+                            else (
+                                Outcome.PROTOCOL_FAILURE
+                                if exc.error_code == "tool_use_failed"
+                                else Outcome.PROVIDER_FAILURE
+                            )
+                        ),
                     )
                 except httpx.TimeoutException as exc:
                     if ticket:
