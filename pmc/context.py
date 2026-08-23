@@ -25,6 +25,16 @@ def build_context_bundle(
 ) -> ContextBundle:
     """Build bounded, reproducible repository context without sending the whole repo."""
     files = [p for p in git(repo, "ls-files").stdout.splitlines() if p]
+    control_files = {
+        "AGENTS.md",
+        "poorman.yaml",
+        "README.md",
+        "LICENSE",
+        ".gitignore",
+        ".gitattributes",
+    }
+    substantive_files = [name for name in files if name not in control_files]
+    repo_state = "SKELETAL" if not substantive_files else "ESTABLISHED"
     terms = _terms(request)
     ranked: list[tuple[int, str]] = []
     for name in files:
@@ -36,6 +46,15 @@ def build_context_bundle(
     ranked.sort(key=lambda item: (-item[0], item[1]))
 
     sections = ["REPOSITORY MAP:\n" + "\n".join(files[:400])]
+    if repo_state == "SKELETAL":
+        sections.append(
+            "BOOTSTRAP PREFLIGHT:\n"
+            "This repository contains only project-control or documentation files. "
+            "If the ticket requests the first implementation, create the required "
+            "project structure and source files from scratch. Missing starting files "
+            "are expected and are not a blocker. Do not stop merely because the "
+            "requested framework or application has not been initialized yet."
+        )
     agents = read_agents(repo)
     if agents:
         sections.append("REPOSITORY INSTRUCTIONS:\n" + agents)
@@ -79,6 +98,8 @@ def build_context_bundle(
     manifest = {
         "version": CONTEXT_BUILDER_VERSION,
         "tracked_files": files[:400],
+        "repository_state": repo_state,
+        "substantive_files": substantive_files[:400],
         "excerpt_files": [name for score, name in ranked[:8] if score > 0],
         "dependency_files": dependencies,
         "previous_diff_hash": stable_hash(previous_diff) if previous_diff else None,

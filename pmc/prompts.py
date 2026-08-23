@@ -27,6 +27,7 @@ def builder_prompt(
     parts = [
         "You are a coding worker inside an isolated task worktree.",
         "Implement the ticket completely. Inspect the repository before changing code.",
+        "If the ticket requests a new project or first implementation, create the missing directories and files; an empty or skeletal repository is not a reason to stop.",
         "Do not commit, push, rewrite Git history, weaken tests, delete tests just to pass, or expose secrets.",
         "Keep the patch narrowly scoped. The controller, not you, decides whether the work is accepted.",
         f"TICKET:\n{job.request}",

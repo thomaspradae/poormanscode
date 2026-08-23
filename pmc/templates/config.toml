@@ -14,7 +14,7 @@ verifier_sandbox = "restricted-user"
 
 [[candidates]]
 name = "groq-oss20-bash"
-version = "3"
+version = "4"
 provider = "groq"
 enabled = true
 executor = "bash"
@@ -70,7 +70,7 @@ resource_concurrency = 1
 
 [[candidates]]
 name = "jules"
-version = "1"
+version = "2"
 provider = "jules"
 enabled = false
 executor = "jules"

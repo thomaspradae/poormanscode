@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -48,7 +48,7 @@ class Candidate:
     executor: str
     version: str = "1"
     provider: str | None = None
-    prompt_profile: str = "builder-v3"
+    prompt_profile: str = "builder-v4"
     tool_profile: str = "default"
     resource_class: str = "default"
     role: str = "builder"
@@ -76,7 +76,7 @@ class Candidate:
         return self.network_policy or ("full" if self.network else "none")
 
     @classmethod
-    def from_mapping(cls, raw: dict[str, Any]) -> "Candidate":
+    def from_mapping(cls, raw: dict[str, Any]) -> Candidate:
         known = {f.name for f in cls.__dataclass_fields__.values()} - {"extra"}
         base = {k: raw[k] for k in raw if k in known}
         extra = {k: raw[k] for k in raw if k not in known}
