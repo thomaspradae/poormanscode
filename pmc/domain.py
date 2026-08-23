@@ -65,10 +65,15 @@ class Candidate:
     max_turns: int = 20
     sandbox: str = "none"
     network: bool = False
+    network_policy: str | None = None
     source: str | None = None
     server_url: str | None = None
     monetary_cost_hint: float = 0.0
     extra: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def effective_network_policy(self) -> str:
+        return self.network_policy or ("full" if self.network else "none")
 
     @classmethod
     def from_mapping(cls, raw: dict[str, Any]) -> "Candidate":
@@ -87,6 +92,29 @@ class ExecutionRequest:
     prompt: str
     attempt_no: int
     feedback: str | None = None
+    accounting: Any | None = None
+
+
+class Outcome(StrEnum):
+    SUCCESS = "SUCCESS"
+    PROVIDER_FAILURE = "PROVIDER_FAILURE"
+    RATE_LIMIT = "RATE_LIMIT"
+    RESOURCE_FAILURE = "RESOURCE_FAILURE"
+    EXECUTOR_FAILURE = "EXECUTOR_FAILURE"
+    EXECUTOR_CRASH = "EXECUTOR_CRASH"
+    TIMEOUT = "TIMEOUT"
+    PROTOCOL_FAILURE = "PROTOCOL_FAILURE"
+    FORMAT_FAILURE = "FORMAT_FAILURE"
+    TEST_FAILURE = "TEST_FAILURE"
+    LINT_FAILURE = "LINT_FAILURE"
+    BUILD_FAILURE = "BUILD_FAILURE"
+    TYPECHECK_FAILURE = "TYPECHECK_FAILURE"
+    SCOPE_FAILURE = "SCOPE_FAILURE"
+    SECURITY_FAILURE = "SECURITY_FAILURE"
+    POLICY_FAILURE = "POLICY_FAILURE"
+    REVIEW_FAILURE = "REVIEW_FAILURE"
+    HUMAN_REJECT = "HUMAN_REJECT"
+    CANCELLED = "CANCELLED"
 
 
 @dataclass(slots=True)
@@ -99,6 +127,7 @@ class ExecutionResult:
     cost_usd: float | None = None
     provider_request_id: str | None = None
     raw_metrics: dict[str, Any] = field(default_factory=dict)
+    outcome: Outcome | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)

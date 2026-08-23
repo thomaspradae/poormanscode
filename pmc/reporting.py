@@ -35,8 +35,9 @@ def _atomic_write(path: Path, text: str) -> None:
 
 
 class Reporter:
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, max_job_bytes: int = 512 * 1024**2):
         self.root = root
+        self.max_job_bytes = max_job_bytes
         root.mkdir(parents=True, exist_ok=True)
 
     def job_dir(self, job_id: str) -> Path:
@@ -46,25 +47,43 @@ class Reporter:
 
     def json(self, job_id: str, name: str, data: Any) -> Path:
         path = self.job_dir(job_id) / name
-        _atomic_write(path, json.dumps(data, indent=2, default=_default, sort_keys=True) + "\n")
+        self._write_limited(
+            path, json.dumps(data, indent=2, default=_default, sort_keys=True) + "\n"
+        )
         return path
 
     def text(self, job_id: str, name: str, text: str) -> Path:
         path = self.job_dir(job_id) / name
-        _atomic_write(path, text)
+        self._write_limited(path, text)
         return path
+
+    def _write_limited(self, path: Path, content: str) -> None:
+        existing = sum(
+            p.stat().st_size for p in path.parent.glob("**/*") if p.is_file()
+        )
+        replaced = path.stat().st_size if path.exists() else 0
+        projected = existing - replaced + len(content.encode())
+        if projected > self.max_job_bytes:
+            raise RuntimeError(
+                f"PMC_RESOURCE_LIMIT:ARTIFACT_LIMIT bytes={projected} max={self.max_job_bytes}"
+            )
+        _atomic_write(path, content)
 
     def record_job(self, job: Job) -> None:
         self.json(job.id, "job.json", job)
 
-    def record_attempt(self, job_id: str, attempt_no: int, candidate: Any, decision: Any, result: Any) -> None:
+    def record_attempt(
+        self, job_id: str, attempt_no: int, candidate: Any, decision: Any, result: Any
+    ) -> None:
         self.json(
             job_id,
             f"attempt-{attempt_no:02d}.json",
             {"candidate": candidate, "decision": decision, "result": result},
         )
 
-    def record_verification(self, job_id: str, attempt_no: int, verification: Any) -> None:
+    def record_verification(
+        self, job_id: str, attempt_no: int, verification: Any
+    ) -> None:
         self.json(job_id, f"verification-{attempt_no:02d}.json", verification)
 
     def record_review(self, job_id: str, attempt_no: int, review: Any) -> None:

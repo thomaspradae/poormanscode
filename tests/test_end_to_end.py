@@ -19,19 +19,22 @@ class Handler(BaseHTTPRequestHandler):
         json.loads(self.rfile.read(length) or b"{}")
         Handler.calls += 1
         if Handler.calls == 1:
-            content = json.dumps({
-                "action": "bash",
-                "command": "sed -i 's/a - b/a + b/' app.py"
-            })
+            content = json.dumps(
+                {"action": "bash", "command": "sed -i 's/a - b/a + b/' app.py"}
+            )
         elif Handler.calls == 2:
             content = json.dumps({"action": "bash", "command": "pytest -q"})
         else:
-            content = json.dumps({"action": "done", "summary": "fixed subtraction bug and tests pass"})
-        body = json.dumps({
-            "id": f"mock-{Handler.calls}",
-            "choices": [{"message": {"content": content}}],
-            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
-        }).encode()
+            content = json.dumps(
+                {"action": "done", "summary": "fixed subtraction bug and tests pass"}
+            )
+        body = json.dumps(
+            {
+                "id": f"mock-{Handler.calls}",
+                "choices": [{"message": {"content": content}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+            }
+        ).encode()
         self.send_response(200)
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(body)))
@@ -43,7 +46,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def sh(cwd: Path, command: str):
-    return subprocess.run(["bash", "-lc", command], cwd=cwd, check=True, text=True, capture_output=True)
+    return subprocess.run(
+        ["bash", "-lc", command], cwd=cwd, check=True, text=True, capture_output=True
+    )
 
 
 def test_controller_full_cycle(tmp_path: Path):
@@ -54,10 +59,19 @@ def test_controller_full_cycle(tmp_path: Path):
     try:
         repo = tmp_path / "repo"
         repo.mkdir()
-        sh(repo, "git init -q -b main && git config user.email test@example.com && git config user.name Test")
+        sh(
+            repo,
+            "git init -q -b main && git config user.email test@example.com && git config user.name Test",
+        )
         (repo / "app.py").write_text("def add(a, b):\n    return a - b\n")
-        (repo / "test_app.py").write_text("from app import add\n\ndef test_add():\n    assert add(2, 3) == 5\n")
-        (repo / "poorman.yaml").write_text("test: pytest -q\nmax_patch_lines: 20\nmax_files_changed: 2\n")
+        (repo / "test_app.py").write_text(
+            "from app import add\n\ndef test_add():\n    assert add(2, 3) == 5\n"
+        )
+        import sys
+
+        (repo / "poorman.yaml").write_text(
+            f"test: {sys.executable} -m pytest -q\nmax_patch_lines: 20\nmax_files_changed: 2\n"
+        )
         sh(repo, "git add -A && git commit -qm init")
 
         c = Candidate(
@@ -67,6 +81,7 @@ def test_controller_full_cycle(tmp_path: Path):
             base_url=f"http://127.0.0.1:{server.server_port}/v1",
             max_turns=5,
             sandbox="guarded",
+            network=True,
         )
         cfg = PMCConfig(
             db_path=tmp_path / "pmc.db",
@@ -78,9 +93,35 @@ def test_controller_full_cycle(tmp_path: Path):
             candidates=[c],
         )
         ctl = Controller(cfg)
-        job = Job("PMC-000001", repo, "Fix add so it adds", task_type="BUG_FIX", acceptance=["tests pass"])
+        job = Job(
+            "PMC-000001",
+            repo,
+            "Fix add so it adds",
+            task_type="BUG_FIX",
+            acceptance=["tests pass"],
+        )
         ctl.db.create_job(job)
         assert ctl.run_job(job.id) == JobState.READY
+        with ctl.db.connect() as conn:
+            requests = conn.execute(
+                "SELECT * FROM model_requests ORDER BY turn_number"
+            ).fetchall()
+            assert len(requests) == 3
+            assert all(r["state"] == "SUCCEEDED" for r in requests)
+            attempt = conn.execute(
+                "SELECT * FROM attempts WHERE job_id=?", (job.id,)
+            ).fetchone()
+            assert (
+                sum(r["actual_input_tokens"] for r in requests)
+                == attempt["input_tokens"]
+            )
+            assert (
+                sum(r["actual_output_tokens"] for r in requests)
+                == attempt["output_tokens"]
+            )
+        event_types = [e["event_type"] for e in ctl.db.job_events(job.id)]
+        assert event_types.count("MODEL_REQUEST_RESERVED") == 3
+        assert event_types.count("MODEL_REQUEST_RECONCILED") == 3
         commit = ctl.accept(job.id)
         assert len(commit) >= 7
         detail = ctl.db.job_detail(job.id)
@@ -96,10 +137,19 @@ def test_controller_full_cycle(tmp_path: Path):
             assert versions["base_repository_sha"]
             decision = conn.execute("SELECT * FROM scheduler_decisions").fetchone()
             assert decision["selection_probability"] == 1.0
-            event_types = [r[0] for r in conn.execute("SELECT event_type FROM events ORDER BY seq")]
-            assert event_types == sorted(event_types, key=lambda x: event_types.index(x))
-            assert {"JOB_CREATED", "SCHEDULER_DECISION", "ATTEMPT_STARTED",
-                    "RESOURCE_RESERVED", "VERIFICATION_STARTED", "HUMAN_ACCEPTED"} <= set(event_types)
+            events = conn.execute(
+                "SELECT seq,event_type FROM events ORDER BY seq"
+            ).fetchall()
+            assert [r["seq"] for r in events] == list(range(1, len(events) + 1))
+            event_types = [r["event_type"] for r in events]
+            assert {
+                "JOB_CREATED",
+                "SCHEDULER_DECISION",
+                "ATTEMPT_STARTED",
+                "RESOURCE_RESERVED",
+                "VERIFICATION_STARTED",
+                "HUMAN_ACCEPTED",
+            } <= set(event_types)
     finally:
         server.shutdown()
         server.server_close()

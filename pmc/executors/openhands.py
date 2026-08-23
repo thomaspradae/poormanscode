@@ -6,7 +6,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from ..domain import ExecutionRequest, ExecutionResult
+from ..domain import ExecutionRequest, ExecutionResult, Outcome
 
 
 class OpenHandsExecutor:
@@ -17,18 +17,26 @@ class OpenHandsExecutor:
             from pydantic import SecretStr
             from openhands.sdk import LLM, Conversation, Workspace
             from openhands.tools.preset.default import get_default_agent
+
             return SecretStr, LLM, Conversation, Workspace, get_default_agent
         except ImportError as exc:
             raise RuntimeError(
                 "OpenHands executor is not installed. Run: pip install -e '.[openhands]'"
             ) from exc
 
-    def _metrics(self, llm: Any) -> tuple[int | None, int | None, float | None, dict[str, Any]]:
+    def _metrics(
+        self, llm: Any
+    ) -> tuple[int | None, int | None, float | None, dict[str, Any]]:
         metrics = getattr(llm, "metrics", None)
         if metrics is None:
             return None, None, None, {}
         raw: dict[str, Any] = {}
-        for name in ("accumulated_cost", "accumulated_token_usage", "token_usage", "latency"):
+        for name in (
+            "accumulated_cost",
+            "accumulated_token_usage",
+            "token_usage",
+            "latency",
+        ):
             try:
                 value = getattr(metrics, name)
                 raw[name] = str(value)
@@ -41,9 +49,16 @@ class OpenHandsExecutor:
             pass
         # SDK metric structures evolve; retain raw metrics and best-effort common fields.
         input_tokens = output_tokens = None
-        usage = getattr(metrics, "accumulated_token_usage", None) or getattr(metrics, "token_usage", None)
-        for obj in ([usage] if usage is not None else []):
-            for attr, target in (("prompt_tokens", "in"), ("input_tokens", "in"), ("completion_tokens", "out"), ("output_tokens", "out")):
+        usage = getattr(metrics, "accumulated_token_usage", None) or getattr(
+            metrics, "token_usage", None
+        )
+        for obj in [usage] if usage is not None else []:
+            for attr, target in (
+                ("prompt_tokens", "in"),
+                ("input_tokens", "in"),
+                ("completion_tokens", "out"),
+                ("output_tokens", "out"),
+            ):
                 try:
                     val = int(getattr(obj, attr))
                 except Exception:
@@ -77,7 +92,9 @@ class OpenHandsExecutor:
                             "Configure server_url or set allow_local_unsandboxed=true explicitly."
                         ),
                     )
-                conversation = Conversation(agent=agent, workspace=str(request.worktree))
+                conversation = Conversation(
+                    agent=agent, workspace=str(request.worktree)
+                )
                 conversation.send_message(request.prompt)
                 conversation.run()
             else:
@@ -91,15 +108,27 @@ class OpenHandsExecutor:
                     # attempt. Exclude Git metadata; the remote copy gets its own baseline.
                     with tarfile.open(archive, "w") as tf:
                         import subprocess
+
                         listed = subprocess.run(
-                            ["git", "-C", str(request.worktree), "ls-files", "-co", "--exclude-standard"],
-                            text=True, capture_output=True, check=True,
+                            [
+                                "git",
+                                "-C",
+                                str(request.worktree),
+                                "ls-files",
+                                "-co",
+                                "--exclude-standard",
+                            ],
+                            text=True,
+                            capture_output=True,
+                            check=True,
                         ).stdout.splitlines()
                         for rel_text in listed:
                             path = request.worktree / rel_text
                             if path.exists() or path.is_symlink():
                                 tf.add(path, arcname=rel_text, recursive=False)
-                    remote_tar = f"/tmp/{request.job.id.lower()}-{request.attempt_no}.tar"
+                    remote_tar = (
+                        f"/tmp/{request.job.id.lower()}-{request.attempt_no}.tar"
+                    )
                     workspace.file_upload(str(archive), remote_tar)
                     workspace.execute_command(
                         f"rm -rf {remote_dir} && mkdir -p {remote_dir} && "
@@ -114,10 +143,15 @@ class OpenHandsExecutor:
                     conversation = Conversation(agent=agent, workspace=workspace)
                     conversation.send_message(remote_prompt)
                     conversation.run()
-                    diff = workspace.execute_command(f"cd {remote_dir} && git diff --binary HEAD --").stdout
+                    diff = workspace.execute_command(
+                        f"cd {remote_dir} && git diff --binary HEAD --"
+                    ).stdout
                     if diff.strip():
                         from ..gitops import WorktreeManager
-                        WorktreeManager(request.worktree.parent).apply_patch(request.worktree, diff)
+
+                        WorktreeManager(request.worktree.parent).apply_patch(
+                            request.worktree, diff
+                        )
             in_tok, out_tok, cost, raw = self._metrics(llm)
             return ExecutionResult(
                 True,
@@ -125,7 +159,7 @@ class OpenHandsExecutor:
                 input_tokens=in_tok,
                 output_tokens=out_tok,
                 cost_usd=cost,
-                raw_metrics=raw,
+                raw_metrics={**raw, "accounting": "sdk-aggregate"},
             )
         except Exception as exc:
             in_tok, out_tok, cost, raw = self._metrics(llm)
@@ -135,5 +169,6 @@ class OpenHandsExecutor:
                 input_tokens=in_tok,
                 output_tokens=out_tok,
                 cost_usd=cost,
-                raw_metrics=raw,
+                raw_metrics={**raw, "accounting": "sdk-aggregate"},
+                outcome=Outcome.EXECUTOR_FAILURE,
             )

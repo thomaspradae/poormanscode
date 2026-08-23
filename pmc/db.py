@@ -148,6 +148,19 @@ CREATE TABLE IF NOT EXISTS quota_state (
     remaining_tokens INTEGER, reset_at TEXT, updated_at TEXT NOT NULL,
     snapshot_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS model_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_key TEXT NOT NULL UNIQUE,
+    job_id TEXT NOT NULL, attempt_id INTEGER NOT NULL REFERENCES attempts(id),
+    candidate TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL,
+    turn_number INTEGER NOT NULL, state TEXT NOT NULL,
+    estimated_input_tokens INTEGER, estimated_output_tokens INTEGER,
+    actual_input_tokens INTEGER, actual_output_tokens INTEGER,
+    estimated_cost_usd REAL, actual_cost_usd REAL, provider_request_id TEXT,
+    rate_headers_json TEXT NOT NULL DEFAULT '{}', error TEXT,
+    started_at TEXT, finished_at TEXT, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_model_requests_attempt ON model_requests(attempt_id, turn_number);
 
 CREATE TABLE IF NOT EXISTS resource_leases (
     resource_key TEXT NOT NULL, job_id TEXT NOT NULL, attempt_id INTEGER,
@@ -200,6 +213,7 @@ class Database:
 
     def _migrate(self, conn: sqlite3.Connection) -> None:
         from .versioning import SCHEMA_VERSION
+
         additions = {
             "attempts": {
                 "outcome": "TEXT",
@@ -226,14 +240,28 @@ class Database:
             (SCHEMA_VERSION, utcnow()),
         )
 
-    def event(self, event_type: str, *, job_id: str | None = None,
-              attempt_id: int | None = None, payload: dict[str, Any] | None = None) -> str:
+    def event(
+        self,
+        event_type: str,
+        *,
+        job_id: str | None = None,
+        attempt_id: int | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> str:
         import uuid
+
         event_id = f"evt-{uuid.uuid4().hex}"
         with self.connect() as conn:
             conn.execute(
                 "INSERT INTO events(event_id,job_id,attempt_id,event_type,payload_json,occurred_at) VALUES(?,?,?,?,?,?)",
-                (event_id, job_id, attempt_id, event_type, json.dumps(payload or {}, default=str), utcnow()),
+                (
+                    event_id,
+                    job_id,
+                    attempt_id,
+                    event_type,
+                    json.dumps(payload or {}, default=str),
+                    utcnow(),
+                ),
             )
         return event_id
 
@@ -244,16 +272,188 @@ class Database:
                 (candidate, job_id, estimated_tokens, utcnow()),
             )
             reservation_id = int(cur.lastrowid)
-        self.event("QUOTA_RESERVED", job_id=job_id,
-                   payload={"candidate": candidate, "estimated_tokens": estimated_tokens})
+        self.event(
+            "QUOTA_RESERVED",
+            job_id=job_id,
+            payload={"candidate": candidate, "estimated_tokens": estimated_tokens},
+        )
         return reservation_id
+
+    def reserve_model_request(
+        self,
+        *,
+        request_key: str,
+        job_id: str,
+        attempt_id: int,
+        candidate: Any,
+        turn_number: int,
+        estimated_input: int,
+        estimated_output: int,
+        estimated_cost: float | None,
+    ) -> tuple[int, int]:
+        reservation_id = self.reserve_quota(
+            candidate.name, job_id, estimated_input + estimated_output
+        )
+        with self.connect() as conn:
+            cur = conn.execute(
+                """INSERT INTO model_requests(request_key,job_id,attempt_id,candidate,provider,model,
+                turn_number,state,estimated_input_tokens,estimated_output_tokens,estimated_cost_usd,created_at)
+                VALUES(?,?,?,?,?,?,?,'RESERVED',?,?,?,?)""",
+                (
+                    request_key,
+                    job_id,
+                    attempt_id,
+                    candidate.name,
+                    candidate.provider or candidate.quota_group or candidate.executor,
+                    candidate.model or "unknown",
+                    turn_number,
+                    estimated_input,
+                    estimated_output,
+                    estimated_cost,
+                    utcnow(),
+                ),
+            )
+            model_request_id = int(cur.lastrowid)
+        self.event(
+            "MODEL_REQUEST_RESERVED",
+            job_id=job_id,
+            attempt_id=attempt_id,
+            payload={
+                "model_request_id": model_request_id,
+                "request_key": request_key,
+                "provider": candidate.provider or candidate.quota_group,
+                "model": candidate.model,
+                "estimated_input_tokens": estimated_input,
+                "estimated_output_tokens": estimated_output,
+            },
+        )
+        return model_request_id, reservation_id
+
+    def start_model_request(
+        self, model_request_id: int, job_id: str, attempt_id: int
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE model_requests SET state='STARTED',started_at=? WHERE id=?",
+                (utcnow(), model_request_id),
+            )
+        self.event(
+            "MODEL_REQUEST_STARTED",
+            job_id=job_id,
+            attempt_id=attempt_id,
+            payload={"model_request_id": model_request_id},
+        )
+
+    def finish_model_request(
+        self,
+        *,
+        model_request_id: int,
+        reservation_id: int,
+        job_id: str,
+        attempt_id: int,
+        candidate: Any,
+        reply: Any | None = None,
+        error: Any | None = None,
+    ) -> None:
+        headers = dict(
+            getattr(reply, "rate_headers", {})
+            or getattr(error, "rate_headers", {})
+            or {}
+        )
+        input_tokens = getattr(reply, "input_tokens", None)
+        output_tokens = getattr(reply, "output_tokens", None)
+        cost = getattr(reply, "cost_usd", None)
+        request_id = getattr(reply, "request_id", None)
+        status = getattr(error, "status_code", None)
+        state = (
+            "SUCCEEDED"
+            if error is None
+            else ("RATE_LIMITED" if status == 429 else "FAILED")
+        )
+        with self.connect() as conn:
+            conn.execute(
+                """UPDATE model_requests SET state=?,actual_input_tokens=?,actual_output_tokens=?,
+                actual_cost_usd=?,provider_request_id=?,rate_headers_json=?,error=?,finished_at=? WHERE id=?""",
+                (
+                    state,
+                    input_tokens,
+                    output_tokens,
+                    cost,
+                    request_id,
+                    json.dumps(headers),
+                    str(error) if error else None,
+                    utcnow(),
+                    model_request_id,
+                ),
+            )
+        provider = candidate.provider or candidate.quota_group or candidate.executor
+        self.reconcile_quota(
+            reservation_id,
+            provider=provider,
+            candidate=candidate.name,
+            actual_tokens=(input_tokens or 0) + (output_tokens or 0),
+            cost_usd=cost,
+            payload=headers,
+        )
+        if headers or error is not None:
+            self.record_quota_event(
+                provider,
+                candidate.name,
+                "RATE_LIMIT" if status == 429 else "MODEL_REQUEST",
+                headers,
+            )
+        event = (
+            "MODEL_REQUEST_SUCCEEDED"
+            if error is None
+            else (
+                "MODEL_REQUEST_RATE_LIMITED"
+                if status == 429
+                else "MODEL_REQUEST_FAILED"
+            )
+        )
+        self.event(
+            event,
+            job_id=job_id,
+            attempt_id=attempt_id,
+            payload={
+                "model_request_id": model_request_id,
+                "request_id": request_id,
+                "actual_input_tokens": input_tokens,
+                "actual_output_tokens": output_tokens,
+                "actual_cost_usd": cost,
+                "rate_headers": headers,
+                "error": str(error) if error else None,
+            },
+        )
+        self.event(
+            "MODEL_REQUEST_RECONCILED",
+            job_id=job_id,
+            attempt_id=attempt_id,
+            payload={
+                "model_request_id": model_request_id,
+                "reservation_id": reservation_id,
+            },
+        )
+
+    def model_request_totals(self, attempt_id: int) -> dict[str, Any]:
+        with self.connect() as conn:
+            row = conn.execute(
+                """SELECT COUNT(*) requests,SUM(actual_input_tokens) input_tokens,
+                SUM(actual_output_tokens) output_tokens,SUM(actual_cost_usd) cost_usd
+                FROM model_requests WHERE attempt_id=?""",
+                (attempt_id,),
+            ).fetchone()
+        return dict(row)
 
     def register_candidate(self, candidate: Any) -> None:
         from .versioning import stable_hash
+
         fingerprint = stable_hash(candidate)
         with self.connect() as conn:
-            row = conn.execute("SELECT fingerprint FROM candidate_versions WHERE candidate=? AND version=?",
-                               (candidate.name, candidate.version)).fetchone()
+            row = conn.execute(
+                "SELECT fingerprint FROM candidate_versions WHERE candidate=? AND version=?",
+                (candidate.name, candidate.version),
+            ).fetchone()
             if row and row["fingerprint"] != fingerprint:
                 raise RuntimeError(
                     f"candidate {candidate.name} version {candidate.version} changed; increment its version"
@@ -263,29 +463,56 @@ class Database:
                 (candidate.name, candidate.version, fingerprint, utcnow()),
             )
 
-    def reconcile_quota(self, reservation_id: int, *, provider: str, candidate: str,
-                        actual_tokens: int, cost_usd: float | None, payload: dict[str, Any]) -> None:
+    def reconcile_quota(
+        self,
+        reservation_id: int,
+        *,
+        provider: str,
+        candidate: str,
+        actual_tokens: int,
+        cost_usd: float | None,
+        payload: dict[str, Any],
+    ) -> None:
         with self.connect() as conn:
-            conn.execute("UPDATE quota_reservations SET state='RECONCILED',actual_tokens=?,reconciled_at=? WHERE id=?",
-                         (actual_tokens, utcnow(), reservation_id))
+            conn.execute(
+                "UPDATE quota_reservations SET state='RECONCILED',actual_tokens=?,reconciled_at=? WHERE id=?",
+                (actual_tokens, utcnow(), reservation_id),
+            )
             conn.execute(
                 "INSERT INTO quota_events(provider,candidate,event_type,requests,tokens,cost_usd,payload_json,occurred_at) VALUES(?,?,'RECONCILED',1,?,?,?,?)",
-                (provider, candidate, actual_tokens, cost_usd, json.dumps(payload, default=str), utcnow()),
+                (
+                    provider,
+                    candidate,
+                    actual_tokens,
+                    cost_usd,
+                    json.dumps(payload, default=str),
+                    utcnow(),
+                ),
             )
 
-    def record_quota_event(self, provider: str, candidate: str, event_type: str,
-                           payload: dict[str, Any]) -> None:
+    def record_quota_event(
+        self, provider: str, candidate: str, event_type: str, payload: dict[str, Any]
+    ) -> None:
         import time
+
         retry_after = payload.get("retry-after")
         try:
-            blocked_until = time.time() + float(retry_after) if retry_after is not None else None
+            blocked_until = (
+                time.time() + float(retry_after) if retry_after is not None else None
+            )
         except (TypeError, ValueError):
             blocked_until = None
         with self.connect() as conn:
             conn.execute(
                 "INSERT INTO quota_events(provider,candidate,event_type,payload_json,occurred_at,reset_at) VALUES(?,?,?,?,?,?)",
-                (provider, candidate, event_type, json.dumps(payload, default=str), utcnow(),
-                 payload.get("x-ratelimit-reset") or payload.get("retry-after")),
+                (
+                    provider,
+                    candidate,
+                    event_type,
+                    json.dumps(payload, default=str),
+                    utcnow(),
+                    payload.get("x-ratelimit-reset") or payload.get("retry-after"),
+                ),
             )
             conn.execute(
                 """INSERT INTO quota_state(candidate,blocked_until,remaining_requests,remaining_tokens,reset_at,updated_at,snapshot_json)
@@ -293,16 +520,24 @@ class Database:
                 blocked_until=excluded.blocked_until, remaining_requests=excluded.remaining_requests,
                 remaining_tokens=excluded.remaining_tokens, reset_at=excluded.reset_at,
                 updated_at=excluded.updated_at, snapshot_json=excluded.snapshot_json""",
-                (candidate, blocked_until, _header_int(payload, "x-ratelimit-remaining-requests"),
-                 _header_int(payload, "x-ratelimit-remaining-tokens"),
-                 payload.get("x-ratelimit-reset") or retry_after, utcnow(),
-                 json.dumps(payload, default=str)),
+                (
+                    candidate,
+                    blocked_until,
+                    _header_int(payload, "x-ratelimit-remaining-requests"),
+                    _header_int(payload, "x-ratelimit-remaining-tokens"),
+                    payload.get("x-ratelimit-reset") or retry_after,
+                    utcnow(),
+                    json.dumps(payload, default=str),
+                ),
             )
 
     def quota_availability(self, candidate: str) -> tuple[bool, str]:
         import time
+
         with self.connect() as conn:
-            row = conn.execute("SELECT * FROM quota_state WHERE candidate=?", (candidate,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM quota_state WHERE candidate=?", (candidate,)
+            ).fetchone()
         if not row:
             return True, ""
         if row["blocked_until"] and float(row["blocked_until"]) > time.time():
@@ -313,7 +548,12 @@ class Database:
 
     def job_events(self, job_id: str) -> list[dict[str, Any]]:
         with self.connect() as conn:
-            return [dict(r) for r in conn.execute("SELECT * FROM events WHERE job_id=? ORDER BY seq", (job_id,))]
+            return [
+                dict(r)
+                for r in conn.execute(
+                    "SELECT * FROM events WHERE job_id=? ORDER BY seq", (job_id,)
+                )
+            ]
 
     def reserved_tokens(self, candidate_names: list[str]) -> int:
         if not candidate_names:
@@ -326,33 +566,93 @@ class Database:
             ).fetchone()
         return int(row["n"])
 
-    def reserve_resource(self, resource_key: str, job_id: str, attempt_id: int,
-                         owner: str, ttl_seconds: int, snapshot: dict[str, Any]) -> bool:
+    def reserve_resource(
+        self,
+        resource_key: str,
+        job_id: str,
+        attempt_id: int,
+        owner: str,
+        ttl_seconds: int,
+        snapshot: dict[str, Any],
+    ) -> bool:
         import time
+
         with self.connect() as conn:
-            conn.execute("DELETE FROM resource_leases WHERE expires_at < ?", (time.time(),))
-            existing = conn.execute("SELECT 1 FROM resource_leases WHERE resource_key=?", (resource_key,)).fetchone()
-            if existing:
+            conn.execute(
+                "DELETE FROM resource_leases WHERE expires_at < ?", (time.time(),)
+            )
+            rows = conn.execute(
+                "SELECT snapshot_json FROM resource_leases WHERE resource_key=?",
+                (resource_key,),
+            ).fetchall()
+            requested = snapshot.get("requested") or {}
+            capacity = snapshot.get("capacity") or {}
+            if requested and capacity:
+                used: dict[str, float] = {}
+                for row in rows:
+                    prior = json.loads(row[0]).get("requested", {})
+                    for name, amount in prior.items():
+                        used[name] = used.get(name, 0) + float(amount)
+                if any(
+                    used.get(name, 0) + float(amount) > float(capacity.get(name, 0))
+                    for name, amount in requested.items()
+                ):
+                    return False
+            elif rows:
                 return False
             conn.execute(
                 "INSERT INTO resource_leases(resource_key,job_id,attempt_id,owner,expires_at,snapshot_json) VALUES(?,?,?,?,?,?)",
-                (resource_key, job_id, attempt_id, owner, time.time() + ttl_seconds,
-                 json.dumps(snapshot, default=str)),
+                (
+                    resource_key,
+                    job_id,
+                    attempt_id,
+                    owner,
+                    time.time() + ttl_seconds,
+                    json.dumps(snapshot, default=str),
+                ),
             )
-        self.event("RESOURCE_RESERVED", job_id=job_id, attempt_id=attempt_id,
-                   payload={"resource_key": resource_key, **snapshot})
+        self.event(
+            "RESOURCE_RESERVED",
+            job_id=job_id,
+            attempt_id=attempt_id,
+            payload={"resource_key": resource_key, **snapshot},
+        )
         return True
+
+    def quantitative_resource_available(
+        self, resource_key: str, requested: dict[str, float], capacity: dict[str, float]
+    ) -> tuple[bool, str]:
+        import time
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT snapshot_json FROM resource_leases WHERE resource_key=? AND expires_at>=?",
+                (resource_key, time.time()),
+            ).fetchall()
+        used: dict[str, float] = {}
+        for row in rows:
+            for name, amount in json.loads(row[0]).get("requested", {}).items():
+                used[name] = used.get(name, 0) + float(amount)
+        for name, amount in requested.items():
+            if used.get(name, 0) + float(amount) > float(capacity.get(name, 0)):
+                return False, f"resource {resource_key} insufficient {name}"
+        return True, ""
 
     def release_resource(self, resource_key: str, job_id: str) -> None:
         with self.connect() as conn:
-            conn.execute("DELETE FROM resource_leases WHERE resource_key=? AND job_id=?",
-                         (resource_key, job_id))
+            conn.execute(
+                "DELETE FROM resource_leases WHERE resource_key=? AND job_id=?",
+                (resource_key, job_id),
+            )
 
     def resource_busy(self, resource_key: str) -> bool:
         import time
+
         with self.connect() as conn:
-            row = conn.execute("SELECT 1 FROM resource_leases WHERE resource_key=? AND expires_at>=?",
-                               (resource_key, time.time())).fetchone()
+            row = conn.execute(
+                "SELECT 1 FROM resource_leases WHERE resource_key=? AND expires_at>=?",
+                (resource_key, time.time()),
+            ).fetchone()
         return bool(row)
 
     @contextmanager
@@ -368,13 +668,16 @@ class Database:
 
     def acquire_lease(self, job_id: str, owner: str, ttl_seconds: int) -> bool:
         import time
+
         now_epoch = time.time()
         expires = now_epoch + ttl_seconds
         conn = sqlite3.connect(self.path, timeout=30)
         try:
             conn.execute("PRAGMA foreign_keys=ON")
             conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute("SELECT owner, expires_at FROM leases WHERE job_id=?", (job_id,)).fetchone()
+            row = conn.execute(
+                "SELECT owner, expires_at FROM leases WHERE job_id=?", (job_id,)
+            ).fetchone()
             if row and float(row[1]) > now_epoch and row[0] != owner:
                 conn.rollback()
                 return False
@@ -390,6 +693,7 @@ class Database:
 
     def renew_lease(self, job_id: str, owner: str, ttl_seconds: int) -> bool:
         import time
+
         with self.connect() as conn:
             cur = conn.execute(
                 "UPDATE leases SET expires_at=?, updated_at=? WHERE job_id=? AND owner=?",
@@ -399,10 +703,13 @@ class Database:
 
     def release_lease(self, job_id: str, owner: str) -> None:
         with self.connect() as conn:
-            conn.execute("DELETE FROM leases WHERE job_id=? AND owner=?", (job_id, owner))
+            conn.execute(
+                "DELETE FROM leases WHERE job_id=? AND owner=?", (job_id, owner)
+            )
 
     def recover_expired_leases(self, max_attempts: int) -> list[str]:
         import time
+
         recovered: list[str] = []
         now_epoch = time.time()
         with self.connect() as conn:
@@ -414,7 +721,16 @@ class Database:
             ).fetchall()
             for row in rows:
                 job_id = row["id"]
-                count = conn.execute("SELECT COUNT(*) n FROM attempts WHERE job_id=?", (job_id,)).fetchone()["n"]
+                attempt_ids = [
+                    int(r[0])
+                    for r in conn.execute(
+                        "SELECT id FROM attempts WHERE job_id=? AND status='RUNNING'",
+                        (job_id,),
+                    )
+                ]
+                count = conn.execute(
+                    "SELECT COUNT(*) n FROM attempts WHERE job_id=?", (job_id,)
+                ).fetchone()["n"]
                 state = "FAILED" if int(count) >= max_attempts else "RETRY"
                 conn.execute(
                     """UPDATE attempts SET status='EXECUTOR_FAILED', finished_at=?,
@@ -423,15 +739,43 @@ class Database:
                     WHERE job_id=? AND status='RUNNING'""",
                     (utcnow(), job_id),
                 )
-                conn.execute("UPDATE jobs SET state=?, updated_at=? WHERE id=?", (state, utcnow(), job_id))
+                conn.execute(
+                    "UPDATE jobs SET state=?, updated_at=? WHERE id=?",
+                    (state, utcnow(), job_id),
+                )
+                conn.execute("DELETE FROM resource_leases WHERE job_id=?", (job_id,))
+                conn.execute(
+                    """UPDATE quota_reservations SET state='RECONCILED',actual_tokens=0,reconciled_at=?
+                    WHERE job_id=? AND state='RESERVED'""",
+                    (utcnow(), job_id),
+                )
+                if attempt_ids:
+                    marks = ",".join("?" for _ in attempt_ids)
+                    conn.execute(
+                        f"""UPDATE model_requests SET state='FAILED',error=COALESCE(error,
+                        'controller lease expired'),finished_at=? WHERE attempt_id IN ({marks})
+                        AND state IN ('RESERVED','STARTED')""",
+                        (utcnow(), *attempt_ids),
+                    )
                 conn.execute("DELETE FROM leases WHERE job_id=?", (job_id,))
                 recovered.append(job_id)
+        for job_id in recovered:
+            self.event(
+                "JOB_RECOVERED",
+                job_id=job_id,
+                payload={"reason": "controller lease expired"},
+            )
         return recovered
 
     def cancel_running_attempts(self, job_id: str) -> list[int]:
         with self.connect() as conn:
-            ids = [int(r[0]) for r in conn.execute(
-                "SELECT id FROM attempts WHERE job_id=? AND status='RUNNING'", (job_id,))]
+            ids = [
+                int(r[0])
+                for r in conn.execute(
+                    "SELECT id FROM attempts WHERE job_id=? AND status='RUNNING'",
+                    (job_id,),
+                )
+            ]
             conn.execute(
                 "UPDATE attempts SET status='CANCELLED',outcome='CANCELLED',finished_at=? WHERE job_id=? AND status='RUNNING'",
                 (utcnow(), job_id),
@@ -473,7 +817,11 @@ class Database:
                     now,
                 ),
             )
-        self.event("JOB_CREATED", job_id=job.id, payload={"repo": str(job.repo), "request": job.request})
+        self.event(
+            "JOB_CREATED",
+            job_id=job.id,
+            payload={"repo": str(job.repo), "request": job.request},
+        )
 
     def get_job(self, job_id: str) -> Job:
         with self.connect() as conn:
@@ -553,8 +901,10 @@ class Database:
         candidate: Any,
         selection_mode: str,
         selection_score: float,
-        *, version_snapshot: dict[str, Any] | None = None,
-        context_hash: str | None = None, context_manifest: dict[str, Any] | None = None,
+        *,
+        version_snapshot: dict[str, Any] | None = None,
+        context_hash: str | None = None,
+        context_manifest: dict[str, Any] | None = None,
     ) -> int:
         with self.connect() as conn:
             cur = conn.execute(
@@ -573,17 +923,28 @@ class Database:
                     selection_mode,
                     selection_score,
                     utcnow(),
-                    json.dumps(version_snapshot or {}, sort_keys=True), context_hash,
+                    json.dumps(version_snapshot or {}, sort_keys=True),
+                    context_hash,
                     json.dumps(context_manifest or {}, sort_keys=True),
                 ),
             )
             attempt_id = int(cur.lastrowid)
-        self.event("ATTEMPT_STARTED", job_id=job_id, attempt_id=attempt_id,
-                   payload={"attempt_number": attempt_no, "candidate": candidate.name})
+        self.event(
+            "ATTEMPT_STARTED",
+            job_id=job_id,
+            attempt_id=attempt_id,
+            payload={"attempt_number": attempt_no, "candidate": candidate.name},
+        )
         return attempt_id
 
-    def finish_attempt(self, attempt_id: int, status: str, result: Any, duration: float,
-                       outcome: str | None = None) -> None:
+    def finish_attempt(
+        self,
+        attempt_id: int,
+        status: str,
+        result: Any,
+        duration: float,
+        outcome: str | None = None,
+    ) -> None:
         with self.connect() as conn:
             conn.execute(
                 """UPDATE attempts SET status=?, finished_at=?, duration_seconds=?,
@@ -604,9 +965,19 @@ class Database:
                     attempt_id,
                 ),
             )
-            row = conn.execute("SELECT job_id FROM attempts WHERE id=?", (attempt_id,)).fetchone()
-        self.event("EXECUTOR_FINISHED", job_id=row["job_id"], attempt_id=attempt_id,
-                   payload={"status": status, "outcome": outcome or status, "duration_seconds": duration})
+            row = conn.execute(
+                "SELECT job_id FROM attempts WHERE id=?", (attempt_id,)
+            ).fetchone()
+        self.event(
+            "EXECUTOR_FINISHED",
+            job_id=row["job_id"],
+            attempt_id=attempt_id,
+            payload={
+                "status": status,
+                "outcome": outcome or status,
+                "duration_seconds": duration,
+            },
+        )
 
     def record_verification(self, attempt_id: int, v: VerificationResult) -> None:
         commands = [asdict(x) for x in v.commands]
@@ -658,7 +1029,11 @@ class Database:
         return int(row["id"]) if row else None
 
     def add_feedback(
-        self, job_id: str, verdict: str, feedback: str | None = None, attempt_id: int | None = None
+        self,
+        job_id: str,
+        verdict: str,
+        feedback: str | None = None,
+        attempt_id: int | None = None,
     ) -> None:
         with self.connect() as conn:
             conn.execute(
@@ -675,7 +1050,7 @@ class Database:
         parts = []
         for r in rows:
             if r["feedback"]:
-                parts.append(f'{r["verdict"]}: {r["feedback"]}')
+                parts.append(f"{r['verdict']}: {r['feedback']}")
         return "\n".join(parts)
 
     def record_decision(self, job_id: str, attempt_no: int, d: Any) -> None:
@@ -685,23 +1060,51 @@ class Database:
                 (job_id, attempt_no, candidate, mode, score, reason, created_at,
                  eligible_json, unavailable_json, selection_probability, policy_version, snapshot_json)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (job_id, attempt_no, d.candidate.name, d.mode, d.score, d.reason, utcnow(),
-                 json.dumps(d.eligible), json.dumps(d.unavailable), d.selection_probability,
-                 d.policy_version, json.dumps(d.snapshot, default=str)),
+                (
+                    job_id,
+                    attempt_no,
+                    d.candidate.name,
+                    d.mode,
+                    d.score,
+                    d.reason,
+                    utcnow(),
+                    json.dumps(d.eligible),
+                    json.dumps(d.unavailable),
+                    d.selection_probability,
+                    d.policy_version,
+                    json.dumps(d.snapshot, default=str),
+                ),
             )
-        self.event("SCHEDULER_DECISION", job_id=job_id, payload={
-            "attempt_number": attempt_no, "chosen": d.candidate.name, "mode": d.mode,
-            "score": d.score, "eligible": d.eligible, "unavailable": d.unavailable,
-            "selection_probability": d.selection_probability, "policy_version": d.policy_version,
-            "snapshot": d.snapshot,
-        })
+        self.event(
+            "SCHEDULER_DECISION",
+            job_id=job_id,
+            payload={
+                "attempt_number": attempt_no,
+                "chosen": d.candidate.name,
+                "mode": d.mode,
+                "score": d.score,
+                "eligible": d.eligible,
+                "unavailable": d.unavailable,
+                "selection_probability": d.selection_probability,
+                "policy_version": d.policy_version,
+                "snapshot": d.snapshot,
+            },
+        )
 
     def candidate_stats(
-        self, role: str = "builder", task_type: str | None = None, phase: str = "all",
+        self,
+        role: str = "builder",
+        task_type: str | None = None,
+        phase: str = "all",
         selection_mode: str | None = None,
     ) -> list[dict[str, Any]]:
-        where = ["a.role=?", "a.finished_at IS NOT NULL",
-                 "COALESCE(a.outcome,'') NOT IN ('PROVIDER_FAILURE','RESOURCE_FAILURE')"]
+        where = [
+            "a.role=?",
+            "a.finished_at IS NOT NULL",
+            "COALESCE(a.outcome,'') NOT IN "
+            "('PROVIDER_FAILURE','RATE_LIMIT','RESOURCE_FAILURE','EXECUTOR_FAILURE',"
+            "'EXECUTOR_CRASH','TIMEOUT','CANCELLED')",
+        ]
         params: list[Any] = [role]
         if task_type:
             where.append("j.task_type=?")
@@ -737,7 +1140,7 @@ class Database:
         FROM attempts a
         JOIN jobs j ON j.id=a.job_id
         LEFT JOIN verifications v ON v.attempt_id=a.id
-        WHERE {' AND '.join(where)}
+        WHERE {" AND ".join(where)}
         GROUP BY a.candidate
         ORDER BY verified * 1.0 / attempts DESC, attempts DESC
         """
@@ -757,7 +1160,9 @@ class Database:
             ).fetchall()
         grouped: dict[str, dict[str, Any]] = {}
         for row in rows:
-            item = grouped.setdefault(row["candidate"], {"attempts": 0, "accepted": 0, "seconds": []})
+            item = grouped.setdefault(
+                row["candidate"], {"attempts": 0, "accepted": 0, "seconds": []}
+            )
             item["attempts"] += 1
             if row["accepted"]:
                 item["accepted"] += 1
@@ -768,10 +1173,23 @@ class Database:
         for candidate, item in sorted(grouped.items()):
             seconds = sorted(item.pop("seconds"))
             n = len(seconds)
-            median = None if not n else (seconds[n // 2] if n % 2 else (seconds[n // 2 - 1] + seconds[n // 2]) / 2)
-            result.append({"candidate": candidate, **item,
-                           "success_rate": item["accepted"] / item["attempts"],
-                           "median_wall_clock_to_accepted_seconds": median})
+            median = (
+                None
+                if not n
+                else (
+                    seconds[n // 2]
+                    if n % 2
+                    else (seconds[n // 2 - 1] + seconds[n // 2]) / 2
+                )
+            )
+            result.append(
+                {
+                    "candidate": candidate,
+                    **item,
+                    "success_rate": item["accepted"] / item["attempts"],
+                    "median_wall_clock_to_accepted_seconds": median,
+                }
+            )
         return result
 
     def active_count_many(self, candidate_names: list[str]) -> int:
@@ -851,12 +1269,14 @@ class Database:
             verifications = conn.execute(
                 """SELECT v.*, a.attempt_no, a.candidate FROM verifications v
                 JOIN attempts a ON a.id=v.attempt_id
-                WHERE a.job_id=? ORDER BY a.attempt_no""", (job_id,)
+                WHERE a.job_id=? ORDER BY a.attempt_no""",
+                (job_id,),
             ).fetchall()
             reviews = conn.execute(
                 """SELECT r.*, a.attempt_no, a.candidate AS author_candidate FROM reviews r
                 JOIN attempts a ON a.id=r.attempt_id
-                WHERE a.job_id=? ORDER BY a.attempt_no""", (job_id,)
+                WHERE a.job_id=? ORDER BY a.attempt_no""",
+                (job_id,),
             ).fetchall()
         if not job:
             raise KeyError(job_id)
@@ -869,16 +1289,35 @@ class Database:
         }
 
     def record_manual_baseline(
-        self, *, request: str, task_type: str, tool: str, duration_seconds: float,
-        accepted: bool, cost_usd: float = 0.0, repo: str | None = None,
-        job_id: str | None = None, notes: str | None = None,
+        self,
+        *,
+        request: str,
+        task_type: str,
+        tool: str,
+        duration_seconds: float,
+        accepted: bool,
+        cost_usd: float = 0.0,
+        repo: str | None = None,
+        job_id: str | None = None,
+        notes: str | None = None,
     ) -> int:
         with self.connect() as conn:
             cur = conn.execute(
                 """INSERT INTO manual_baselines
                 (job_id, repo, request, task_type, tool, duration_seconds, cost_usd, accepted, notes, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (job_id, repo, request, task_type, tool, duration_seconds, cost_usd, int(accepted), notes, utcnow()),
+                (
+                    job_id,
+                    repo,
+                    request,
+                    task_type,
+                    tool,
+                    duration_seconds,
+                    cost_usd,
+                    int(accepted),
+                    notes,
+                    utcnow(),
+                ),
             )
             return int(cur.lastrowid)
 

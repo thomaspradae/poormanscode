@@ -19,7 +19,9 @@ from .gitops import ensure_repo
 
 
 def _controller(args) -> Controller:
-    cfg = load_config(Path(args.config).expanduser() if getattr(args, "config", None) else None)
+    cfg = load_config(
+        Path(args.config).expanduser() if getattr(args, "config", None) else None
+    )
     return Controller(cfg)
 
 
@@ -42,7 +44,10 @@ def cmd_init_repo(args) -> int:
     repo = Path(args.repo).resolve()
     ensure_repo(repo)
     templates = _templates_dir()
-    for src_name, dest_name in (("AGENTS.md", "AGENTS.md"), ("poorman.yaml", "poorman.yaml")):
+    for src_name, dest_name in (
+        ("AGENTS.md", "AGENTS.md"),
+        ("poorman.yaml", "poorman.yaml"),
+    ):
         dest = repo / dest_name
         if dest.exists() and not args.force:
             print(f"exists: {dest}")
@@ -112,7 +117,11 @@ def cmd_daemon(args) -> int:
                 time.sleep(args.poll_seconds)
         except Exception as exc:
             ctl.db.set_state(job_id, JobState.BLOCKED)
-            print(f"{job_id}: BLOCKED: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+            print(
+                f"{job_id}: BLOCKED: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
         if args.once:
             return 0
 
@@ -126,7 +135,9 @@ def cmd_status(args) -> int:
     print(f"{'JOB':<12} {'STATE':<18} {'TYPE':<18} {'P':<2} REQUEST")
     for r in rows:
         request = r["request"].replace("\n", " ")[:80]
-        print(f"{r['id']:<12} {r['state']:<18} {r['task_type']:<18} {r['priority']:<2} {request}")
+        print(
+            f"{r['id']:<12} {r['state']:<18} {r['task_type']:<18} {r['priority']:<2} {request}"
+        )
     return 0
 
 
@@ -134,17 +145,25 @@ def cmd_inspect(args) -> int:
     ctl = _controller(args)
     d = ctl.db.job_detail(args.job_id)
     job = d["job"]
-    print(json.dumps({
-        "id": job["id"], "state": job["state"], "repo": job["repo"],
-        "worktree": job["worktree"], "request": job["request"],
-        "accepted_commit": job["accepted_commit"],
-    }, indent=2))
+    print(
+        json.dumps(
+            {
+                "id": job["id"],
+                "state": job["state"],
+                "repo": job["repo"],
+                "worktree": job["worktree"],
+                "request": job["request"],
+                "accepted_commit": job["accepted_commit"],
+            },
+            indent=2,
+        )
+    )
     print("\nATTEMPTS")
     for a in d["attempts"]:
         print(
             f"#{a['attempt_no']} {a['candidate']} [{a['executor']}] {a['status']} "
             f"{(a['duration_seconds'] or 0):.1f}s tokens="
-            f"{(a['input_tokens'] or 0)+(a['output_tokens'] or 0)} cost=${(a['cost_usd'] or 0):.4f}"
+            f"{(a['input_tokens'] or 0) + (a['output_tokens'] or 0)} cost=${(a['cost_usd'] or 0):.4f}"
         )
         if a["error"]:
             print("  error:", a["error"][:1000])
@@ -152,13 +171,17 @@ def cmd_inspect(args) -> int:
         print("\nVERIFICATION")
         for v in d["verifications"]:
             findings = json.loads(v["findings_json"])
-            print(f"#{v['attempt_no']} {v['candidate']}: {'PASS' if v['ok'] else 'FAIL'} patch_lines={v['patch_lines']}")
+            print(
+                f"#{v['attempt_no']} {v['candidate']}: {'PASS' if v['ok'] else 'FAIL'} patch_lines={v['patch_lines']}"
+            )
             for finding in findings:
                 print("  -", finding)
     if d["reviews"]:
         print("\nREVIEWS")
         for r in d["reviews"]:
-            print(f"#{r['attempt_no']} {r['reviewer_candidate']}: {r['verdict']} {r['summary'] or ''}")
+            print(
+                f"#{r['attempt_no']} {r['reviewer_candidate']}: {r['verdict']} {r['summary'] or ''}"
+            )
     if d["feedback"]:
         print("\nHUMAN FEEDBACK")
         for f in d["feedback"]:
@@ -231,14 +254,19 @@ def cmd_baseline_stats(args) -> int:
     for r in rows:
         n = r["n"] or 0
         ar = 100 * (r["accepted"] or 0) / n if n else 0
-        print(f"{r['tool']:<24} {n:>4} {ar:>7.1f}% {(r['avg_seconds'] or 0):>10.1f} {(r['avg_cost'] or 0):>10.4f}")
+        print(
+            f"{r['tool']:<24} {n:>4} {ar:>7.1f}% {(r['avg_seconds'] or 0):>10.1f} {(r['avg_cost'] or 0):>10.4f}"
+        )
     return 0
 
 
 def cmd_stats(args) -> int:
     ctl = _controller(args)
     rows = ctl.db.candidate_stats(
-        role=args.role, task_type=args.task_type, phase=args.phase, selection_mode=args.mode
+        role=args.role,
+        task_type=args.task_type,
+        phase=args.phase,
+        selection_mode=args.mode,
     )
     if args.json:
         print(json.dumps(rows, indent=2))
@@ -246,7 +274,9 @@ def cmd_stats(args) -> int:
     if not rows:
         print("no observations yet")
         return 0
-    print(f"{'CANDIDATE':<30} {'N':>4} {'VERIFY':>8} {'HUMAN+':>8} {'HUM N':>6} {'AVG S':>9} {'AVG TOK':>9} {'AVG $':>9}")
+    print(
+        f"{'CANDIDATE':<30} {'N':>4} {'VERIFY':>8} {'HUMAN+':>8} {'HUM N':>6} {'AVG S':>9} {'AVG TOK':>9} {'AVG $':>9}"
+    )
     for r in rows:
         n = r["attempts"] or 0
         vr = 100 * (r["verified"] or 0) / n if n else 0
@@ -264,10 +294,18 @@ def cmd_efficiency(args) -> int:
     if args.json:
         print(json.dumps(rows, indent=2))
         return 0
-    print(f"{'CANDIDATE':<30} {'ATTEMPTS':>8} {'ACCEPTED':>8} {'SUCCESS':>9} {'MEDIAN S':>10}")
+    print(
+        f"{'CANDIDATE':<30} {'ATTEMPTS':>8} {'ACCEPTED':>8} {'SUCCESS':>9} {'MEDIAN S':>10}"
+    )
     for row in rows:
-        median = "-" if row["median_wall_clock_to_accepted_seconds"] is None else f'{row["median_wall_clock_to_accepted_seconds"]:.1f}'
-        print(f'{row["candidate"]:<30} {row["attempts"]:>8} {row["accepted"]:>8} {row["success_rate"]:>8.1%} {median:>10}')
+        median = (
+            "-"
+            if row["median_wall_clock_to_accepted_seconds"] is None
+            else f"{row['median_wall_clock_to_accepted_seconds']:.1f}"
+        )
+        print(
+            f"{row['candidate']:<30} {row['attempts']:>8} {row['accepted']:>8} {row['success_rate']:>8.1%} {median:>10}"
+        )
     return 0
 
 
@@ -293,13 +331,17 @@ def cmd_candidates(args) -> int:
     print(f"{'NAME':<30} {'ROLE':<10} {'EXECUTOR':<12} {'MODEL':<35} STATUS")
     for c in ctl.cfg.candidates:
         av = ctl.scheduler.available(c, ctl.cfg.candidates)
-        print(f"{c.name:<30} {c.role:<10} {c.executor:<12} {(c.model or '-'): <35} {'READY' if av.ok else av.reason}")
+        print(
+            f"{c.name:<30} {c.role:<10} {c.executor:<12} {(c.model or '-'): <35} {'READY' if av.ok else av.reason}"
+        )
     return 0
 
 
 def cmd_doctor(args) -> int:
     ok = True
-    print(f"config: {Path(args.config).expanduser() if args.config else DEFAULT_CONFIG}")
+    print(
+        f"config: {Path(args.config).expanduser() if args.config else DEFAULT_CONFIG}"
+    )
     try:
         ctl = _controller(args)
         print(f"database: OK ({ctl.cfg.db_path})")
@@ -316,9 +358,23 @@ def cmd_doctor(args) -> int:
         print(f"bubblewrap: OK {bwrap}")
         if needs_bwrap:
             probe = subprocess.run(
-                [bwrap, "--die-with-parent", "--new-session", "--ro-bind", "/", "/",
-                 "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "/usr/bin/true"],
-                text=True, capture_output=True,
+                [
+                    bwrap,
+                    "--die-with-parent",
+                    "--new-session",
+                    "--ro-bind",
+                    "/",
+                    "/",
+                    "--dev",
+                    "/dev",
+                    "--proc",
+                    "/proc",
+                    "--tmpfs",
+                    "/tmp",
+                    "/usr/bin/true",
+                ],
+                text=True,
+                capture_output=True,
             )
             if probe.returncode:
                 print(f"bubblewrap production probe: FAIL ({probe.stderr.strip()})")
@@ -331,9 +387,12 @@ def cmd_doctor(args) -> int:
     else:
         print("bubblewrap: not installed (no enabled candidate requires it)")
 
-    needs_openhands = any(c.enabled and c.executor == "openhands" for c in ctl.cfg.candidates)
+    needs_openhands = any(
+        c.enabled and c.executor == "openhands" for c in ctl.cfg.candidates
+    )
     try:
         import openhands.sdk  # type: ignore
+
         print("OpenHands SDK: OK")
     except Exception:
         if needs_openhands:
@@ -346,31 +405,71 @@ def cmd_doctor(args) -> int:
         if not c.enabled:
             continue
         missing = bool(c.api_key_env and not os.getenv(c.api_key_env))
-        print(f"candidate {c.name}: {'MISSING ' + c.api_key_env if missing else 'configured'}")
+        print(
+            f"candidate {c.name}: {'MISSING ' + c.api_key_env if missing else 'configured'}"
+        )
         if missing:
             ok = False
         if c.executor == "bash" and c.sandbox in {"none", "guarded"}:
             print(f"candidate {c.name}: UNSAFE sandbox={c.sandbox}")
             ok = False
+        if c.executor == "bash":
+            from .sandbox import build_sandbox
+
+            sandbox = build_sandbox(c.sandbox)
+            policy = c.effective_network_policy
+            if not sandbox.supports_network_policy(policy):
+                print(
+                    f"candidate {c.name}: FAIL network_policy={policy} "
+                    f"cannot be enforced by {sandbox.name}"
+                )
+                ok = False
+            else:
+                print(f"candidate {c.name}: network_policy={policy} enforceable")
     if ctl.cfg.verifier_sandbox in {"none", "guarded"}:
         print(f"verifier sandbox: UNSAFE ({ctl.cfg.verifier_sandbox})")
         ok = False
     elif ctl.cfg.verifier_sandbox == "restricted-user":
-        probe = subprocess.run(["sudo", "-n", "-u", "pmc-worker", "/usr/bin/true"],
-                               text=True, capture_output=True)
+        probe = subprocess.run(
+            ["sudo", "-n", "-u", "pmc-worker", "/usr/bin/true"],
+            text=True,
+            capture_output=True,
+        )
         if probe.returncode:
             print(f"verifier sandbox: FAIL restricted-user ({probe.stderr.strip()})")
             ok = False
         else:
             print("verifier sandbox: OK restricted-user")
     elif ctl.cfg.verifier_sandbox == "bwrap":
-        verifier_probe = subprocess.run(
-            [bwrap, "--die-with-parent", "--new-session", "--ro-bind", "/", "/",
-             "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "/usr/bin/true"],
-            text=True, capture_output=True,
-        ) if bwrap else None
+        verifier_probe = (
+            subprocess.run(
+                [
+                    bwrap,
+                    "--die-with-parent",
+                    "--new-session",
+                    "--ro-bind",
+                    "/",
+                    "/",
+                    "--dev",
+                    "/dev",
+                    "--proc",
+                    "/proc",
+                    "--tmpfs",
+                    "/tmp",
+                    "/usr/bin/true",
+                ],
+                text=True,
+                capture_output=True,
+            )
+            if bwrap
+            else None
+        )
         if verifier_probe is None or verifier_probe.returncode:
-            detail = verifier_probe.stderr.strip() if verifier_probe else "bubblewrap missing"
+            detail = (
+                verifier_probe.stderr.strip()
+                if verifier_probe
+                else "bubblewrap missing"
+            )
             print(f"verifier sandbox: FAIL bwrap ({detail})")
             ok = False
         else:
@@ -382,12 +481,14 @@ def cmd_doctor(args) -> int:
 
 def cmd_version(args) -> int:
     from .versioning import SCHEMA_VERSION, pmc_git_sha
+
     print(f"poormans-code 0.1.0 schema={SCHEMA_VERSION} git={pmc_git_sha()}")
     return 0
 
 
 def cmd_canary(args) -> int:
     from .canary import run_canary
+
     print(json.dumps(run_canary(args.verifier_sandbox), indent=2))
     return 0
 
@@ -401,8 +502,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_version)
 
     s = sub.add_parser("canary")
-    s.add_argument("--verifier-sandbox", default="guarded",
-                   choices=["guarded", "restricted-user", "bwrap"])
+    s.add_argument(
+        "--verifier-sandbox",
+        default="guarded",
+        choices=["guarded", "restricted-user", "bwrap"],
+    )
     s.set_defaults(func=cmd_canary)
 
     s = sub.add_parser("init-config")

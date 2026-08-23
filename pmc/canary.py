@@ -23,8 +23,13 @@ class _Handler(BaseHTTPRequestHandler):
             {"action": "done", "summary": "canary patch complete"},
         ]
         content = actions[min(self.calls - 1, len(actions) - 1)]
-        body = json.dumps({"id": f"canary-{self.calls}", "choices": [{"message": {"content": json.dumps(content)}}],
-                           "usage": {"prompt_tokens": 10, "completion_tokens": 5}}).encode()
+        body = json.dumps(
+            {
+                "id": f"canary-{self.calls}",
+                "choices": [{"message": {"content": json.dumps(content)}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+            }
+        ).encode()
         self.send_response(200)
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(body)))
@@ -41,23 +46,43 @@ def run_canary(verifier_sandbox: str = "guarded") -> dict[str, object]:
         repo = root / "repo"
         repo.mkdir()
         subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
-        subprocess.run(["git", "config", "user.email", "canary@localhost"], cwd=repo, check=True)
-        subprocess.run(["git", "config", "user.name", "PMC Canary"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "config", "user.email", "canary@localhost"], cwd=repo, check=True
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "PMC Canary"], cwd=repo, check=True
+        )
         (repo / "app.py").write_text("def add(a, b):\n    return a - b\n")
-        (repo / "poorman.yaml").write_text("test: python -m py_compile app.py\nmax_patch_lines: 20\n")
+        (repo / "poorman.yaml").write_text(
+            "test: python -m py_compile app.py\nmax_patch_lines: 20\n"
+        )
         subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
         subprocess.run(["git", "commit", "-qm", "baseline"], cwd=repo, check=True)
         server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            candidate = Candidate("canary-bash-v1", "bash", model="canary-model",
-                                  provider="local-canary", base_url=f"http://127.0.0.1:{server.server_port}/v1",
-                                  sandbox="guarded", max_turns=3)
-            cfg = PMCConfig(root / "pmc.db", root / "runs", root / "worktrees",
-                            verifier_sandbox=verifier_sandbox, candidates=[candidate])
+            candidate = Candidate(
+                "canary-bash-v1",
+                "bash",
+                model="canary-model",
+                provider="local-canary",
+                base_url=f"http://127.0.0.1:{server.server_port}/v1",
+                sandbox="guarded",
+                network=True,
+                max_turns=3,
+            )
+            cfg = PMCConfig(
+                root / "pmc.db",
+                root / "runs",
+                root / "worktrees",
+                verifier_sandbox=verifier_sandbox,
+                candidates=[candidate],
+            )
             ctl = Controller(cfg)
-            job = Job("PMC-CANARY", repo, "Fix add", acceptance=["syntax verification passes"])
+            job = Job(
+                "PMC-CANARY", repo, "Fix add", acceptance=["syntax verification passes"]
+            )
             ctl.db.create_job(job)
             state = ctl.run_job(job.id)
             if state != JobState.READY:
@@ -65,11 +90,18 @@ def run_canary(verifier_sandbox: str = "guarded") -> dict[str, object]:
             commit = ctl.accept(job.id)
             with ctl.db.connect() as conn:
                 events = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
-                attempts = conn.execute("SELECT COUNT(*) FROM attempts WHERE outcome='SUCCESS'").fetchone()[0]
+                attempts = conn.execute(
+                    "SELECT COUNT(*) FROM attempts WHERE outcome='SUCCESS'"
+                ).fetchone()[0]
             artifacts = len(list((root / "runs" / job.id).iterdir()))
-            return {"state": "ACCEPTED", "commit": commit, "events": events,
-                    "successful_attempts": attempts, "audit_artifacts": artifacts,
-                    "verifier_sandbox": verifier_sandbox}
+            return {
+                "state": "ACCEPTED",
+                "commit": commit,
+                "events": events,
+                "successful_attempts": attempts,
+                "audit_artifacts": artifacts,
+                "verifier_sandbox": verifier_sandbox,
+            }
         finally:
             server.shutdown()
             server.server_close()

@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from ..domain import ExecutionRequest, ExecutionResult
+from ..domain import ExecutionRequest, ExecutionResult, Outcome
 from ..providers import OpenAICompatibleClient, ProviderError
 from ..sandbox import SandboxLimits, build_sandbox, scrubbed_environment
 
@@ -61,7 +61,9 @@ def _extract_json(text: str) -> dict[str, Any]:
 class BashExecutor:
     name = "bash"
 
-    def _command(self, request: ExecutionRequest, command: str) -> subprocess.CompletedProcess[str]:
+    def _command(
+        self, request: ExecutionRequest, command: str
+    ) -> subprocess.CompletedProcess[str]:
         _guard(command)
         c = request.candidate
         env = _clean_child_env()
@@ -71,14 +73,26 @@ class BashExecutor:
             memory_bytes=int(c.extra.get("memory_mb", 2048)) * 1024**2,
             processes=int(c.extra.get("process_limit", 128)),
             file_bytes=int(c.extra.get("file_mb", 512)) * 1024**2,
+            workspace_bytes=int(c.extra.get("workspace_mb", 2048)) * 1024**2,
+            workspace_files=int(c.extra.get("workspace_files", 50_000)),
+            artifact_bytes=int(c.extra.get("artifact_mb", 512)) * 1024**2,
         )
-        return build_sandbox(c.sandbox).run(request.worktree, command, env=env,
-                                            network=c.network, limits=limits)
+        sandbox = build_sandbox(c.sandbox)
+        policy = c.effective_network_policy
+        if not sandbox.supports_network_policy(policy):
+            raise RuntimeError(
+                f"sandbox {sandbox.name} cannot enforce network_policy={policy}"
+            )
+        return sandbox.run(
+            request.worktree, command, env=env, network=policy == "full", limits=limits
+        )
 
     def run(self, request: ExecutionRequest) -> ExecutionResult:
         c = request.candidate
         if not c.model or not c.base_url:
-            return ExecutionResult(False, error="bash executor requires model and base_url")
+            return ExecutionResult(
+                False, error="bash executor requires model and base_url"
+            )
         client = OpenAICompatibleClient(c.base_url, c.api_key_env)
         messages: list[dict[str, str]] = [
             {"role": "system", "content": SYSTEM},
@@ -89,8 +103,14 @@ class BashExecutor:
         request_id = None
         rate_headers: dict[str, str] = {}
         transcript: list[dict[str, Any]] = []
+        protocol_errors = 0
         for turn in range(c.max_turns):
+            ticket = None
             try:
+                if request.accounting:
+                    ticket = request.accounting.reserve(
+                        turn + 1, messages, int(c.extra.get("max_tokens", 4096))
+                    )
                 reply = client.chat(
                     model=c.model,
                     messages=messages,
@@ -98,20 +118,35 @@ class BashExecutor:
                     max_tokens=int(c.extra.get("max_tokens", 4096)),
                     extra_body=c.extra.get("request_extra"),
                 )
+                if ticket:
+                    request.accounting.succeed(ticket, reply)
             except ProviderError as exc:
+                if ticket:
+                    request.accounting.fail(ticket, exc)
                 return ExecutionResult(
-                    False, error=str(exc), input_tokens=in_tokens or None,
+                    False,
+                    error=str(exc),
+                    input_tokens=in_tokens or None,
                     output_tokens=out_tokens or None,
-                    raw_metrics={"turns": transcript, "provider_status": exc.status_code,
-                                 "rate_headers": exc.rate_headers},
+                    raw_metrics={
+                        "turns": transcript,
+                        "provider_status": exc.status_code,
+                        "rate_headers": exc.rate_headers,
+                    },
+                    outcome=Outcome.RATE_LIMIT
+                    if exc.status_code == 429
+                    else Outcome.PROVIDER_FAILURE,
                 )
             except Exception as exc:
+                if ticket:
+                    request.accounting.fail(ticket, exc)
                 return ExecutionResult(
                     False,
                     error=f"LLM request failed: {type(exc).__name__}: {exc}",
                     input_tokens=in_tokens or None,
                     output_tokens=out_tokens or None,
                     raw_metrics={"turns": transcript},
+                    outcome=Outcome.PROVIDER_FAILURE,
                 )
             in_tokens += reply.input_tokens or 0
             out_tokens += reply.output_tokens or 0
@@ -121,9 +156,12 @@ class BashExecutor:
             try:
                 action = _extract_json(reply.content)
             except Exception as exc:
+                protocol_errors += 1
                 obs = f"Protocol error: return exactly one JSON action. Parser error: {exc}"
                 messages.append({"role": "user", "content": obs})
-                transcript.append({"turn": turn + 1, "protocol_error": reply.content[:1000]})
+                transcript.append(
+                    {"turn": turn + 1, "protocol_error": reply.content[:1000]}
+                )
                 continue
             kind = action.get("action")
             if kind == "done":
@@ -133,26 +171,61 @@ class BashExecutor:
                     input_tokens=in_tokens or None,
                     output_tokens=out_tokens or None,
                     provider_request_id=request_id,
-                    raw_metrics={"turns": transcript, "turn_count": turn + 1, "rate_headers": rate_headers},
+                    raw_metrics={
+                        "turns": transcript,
+                        "turn_count": turn + 1,
+                        "rate_headers": rate_headers,
+                    },
                 )
             if kind != "bash" or not isinstance(action.get("command"), str):
-                messages.append({"role": "user", "content": "Invalid action. Use action=bash or action=done."})
+                protocol_errors += 1
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": "Invalid action. Use action=bash or action=done.",
+                    }
+                )
                 continue
             command = action["command"]
             try:
                 started = time.monotonic()
                 p = self._command(request, command)
                 elapsed = time.monotonic() - started
+                if "PMC_RESOURCE_LIMIT:TIMEOUT" in p.stderr:
+                    return ExecutionResult(
+                        False,
+                        error="worker command timed out",
+                        input_tokens=in_tokens or None,
+                        output_tokens=out_tokens or None,
+                        outcome=Outcome.TIMEOUT,
+                        raw_metrics={"turns": transcript},
+                    )
+                if "PMC_RESOURCE_LIMIT:WORKSPACE_LIMIT" in p.stderr:
+                    return ExecutionResult(
+                        False,
+                        error=p.stderr.strip(),
+                        input_tokens=in_tokens or None,
+                        output_tokens=out_tokens or None,
+                        outcome=Outcome.RESOURCE_FAILURE,
+                        raw_metrics={"turns": transcript},
+                    )
                 observation = (
                     f"exit={p.returncode} duration={elapsed:.2f}s\n"
                     f"STDOUT:\n{p.stdout[-12000:]}\nSTDERR:\n{p.stderr[-12000:]}"
                 )
                 transcript.append(
-                    {"turn": turn + 1, "command": command, "exit": p.returncode, "seconds": elapsed}
+                    {
+                        "turn": turn + 1,
+                        "command": command,
+                        "exit": p.returncode,
+                        "seconds": elapsed,
+                    }
                 )
             except Exception as exc:
                 observation = f"tool error: {type(exc).__name__}: {exc}"
-                transcript.append({"turn": turn + 1, "command": command, "tool_error": str(exc)})
+                transcript.append(
+                    {"turn": turn + 1, "command": command, "tool_error": str(exc)}
+                )
             messages.append({"role": "user", "content": observation})
         return ExecutionResult(
             False,
@@ -160,5 +233,12 @@ class BashExecutor:
             input_tokens=in_tokens or None,
             output_tokens=out_tokens or None,
             provider_request_id=request_id,
-            raw_metrics={"turns": transcript, "turn_count": c.max_turns, "rate_headers": rate_headers},
+            raw_metrics={
+                "turns": transcript,
+                "turn_count": c.max_turns,
+                "rate_headers": rate_headers,
+            },
+            outcome=Outcome.PROTOCOL_FAILURE
+            if protocol_errors
+            else Outcome.EXECUTOR_FAILURE,
         )

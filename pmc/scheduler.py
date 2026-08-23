@@ -23,24 +23,40 @@ class Scheduler:
         self.exploration_rate = exploration_rate
         self.min_samples = min_samples
 
-    def available(self, c: Candidate, universe: list[Candidate] | None = None) -> Availability:
+    def available(
+        self, c: Candidate, universe: list[Candidate] | None = None
+    ) -> Availability:
         if not c.enabled:
             return Availability(False, "disabled")
         quota_ok, quota_reason = self.db.quota_availability(c.name)
         if not quota_ok:
             return Availability(False, quota_reason)
         universe = universe or [c]
-        if c.max_concurrency is not None and self.db.active_count(c.name) >= c.max_concurrency:
+        if (
+            c.max_concurrency is not None
+            and self.db.active_count(c.name) >= c.max_concurrency
+        ):
             return Availability(False, "candidate concurrency full")
         if c.resource_group and c.resource_concurrency is not None:
             if c.resource_concurrency == 1 and self.db.resource_busy(c.resource_group):
                 return Availability(False, f"resource {c.resource_group} leased")
-            group_names = [x.name for x in universe if x.resource_group == c.resource_group]
+            group_names = [
+                x.name for x in universe if x.resource_group == c.resource_group
+            ]
             if self.db.active_count_many(group_names) >= c.resource_concurrency:
                 return Availability(False, f"resource {c.resource_group} busy")
+        requested = c.extra.get("resource_requirements") or {}
+        capacity = c.extra.get("resource_capacity") or {}
+        if c.resource_group and requested:
+            ok, reason = self.db.quantitative_resource_available(
+                c.resource_group, requested, capacity
+            )
+            if not ok:
+                return Availability(False, reason)
         quota_names = (
             [x.name for x in universe if x.quota_group == c.quota_group]
-            if c.quota_group else [c.name]
+            if c.quota_group
+            else [c.name]
         )
         if c.quota_attempts is not None and c.quota_window_seconds is not None:
             used = self.db.attempts_many_in_window(quota_names, c.quota_window_seconds)
@@ -48,17 +64,22 @@ class Scheduler:
                 return Availability(False, "rolling attempt quota exhausted")
         quota_tokens = c.extra.get("quota_tokens")
         if quota_tokens is not None and c.quota_window_seconds is not None:
-            used_tokens = (self.db.tokens_many_in_window(quota_names, c.quota_window_seconds)
-                           + self.db.reserved_tokens(quota_names))
+            used_tokens = self.db.tokens_many_in_window(
+                quota_names, c.quota_window_seconds
+            ) + self.db.reserved_tokens(quota_names)
             if used_tokens >= int(quota_tokens):
                 return Availability(False, "rolling token quota exhausted")
         return Availability(True)
 
     def _stats_map(self, role: str, task_type: str, phase: str) -> dict[str, dict]:
-        generic = {x["candidate"]: x for x in self.db.candidate_stats(role=role, phase=phase)}
+        generic = {
+            x["candidate"]: x for x in self.db.candidate_stats(role=role, phase=phase)
+        }
         specific = {
             x["candidate"]: x
-            for x in self.db.candidate_stats(role=role, task_type=task_type, phase=phase)
+            for x in self.db.candidate_stats(
+                role=role, task_type=task_type, phase=phase
+            )
         }
         out = dict(generic)
         for name, row in specific.items():
@@ -76,6 +97,7 @@ class Scheduler:
         attempt_no: int = 1,
     ) -> SchedulerDecision:
         exclude = exclude or set()
+
         def fits(c: Candidate) -> bool:
             task_types = c.extra.get("task_types")
             if task_types and job.task_type not in task_types:
@@ -83,6 +105,7 @@ class Scheduler:
             if c.extra.get("first_attempt_only", False) and attempt_no > 1:
                 return False
             return True
+
         unavailable: dict[str, str] = {}
         pool = []
         for c in candidates:
@@ -104,16 +127,27 @@ class Scheduler:
         phase = "first" if attempt_no == 1 else "repair"
         stats = self._stats_map(role, job.task_type, phase)
         under_sampled = [
-            c for c in pool
+            c
+            for c in pool
             if c.extra.get("exploration", True)
             and int(stats.get(c.name, {}).get("attempts", 0)) < self.min_samples
         ]
         if under_sampled:
-            c = min(under_sampled, key=lambda x: int(stats.get(x.name, {}).get("attempts", 0)))
-            return SchedulerDecision(c, "cold_start", 0.5, "candidate needs production observations",
-                                     [x.name for x in pool], unavailable, 1.0,
-                                     SCHEDULER_POLICY_VERSION,
-                                     {"exploration_rate": self.exploration_rate, "phase": phase})
+            c = min(
+                under_sampled,
+                key=lambda x: int(stats.get(x.name, {}).get("attempts", 0)),
+            )
+            return SchedulerDecision(
+                c,
+                "cold_start",
+                0.5,
+                "candidate needs production observations",
+                [x.name for x in pool],
+                unavailable,
+                1.0,
+                SCHEDULER_POLICY_VERSION,
+                {"exploration_rate": self.exploration_rate, "phase": phase},
+            )
 
         scored: list[tuple[float, Candidate, str]] = []
         for c in pool:
@@ -135,7 +169,13 @@ class Scheduler:
             latency_penalty = min(0.12, math.log1p(latency) / 100.0)
             cost_penalty = min(0.25, cost / 2.0)
             score = p - latency_penalty - cost_penalty
-            scored.append((score, c, f"signal={signal}, posterior_success={p:.3f}, latency={latency:.1f}s, cost=${cost:.4f}"))
+            scored.append(
+                (
+                    score,
+                    c,
+                    f"signal={signal}, posterior_success={p:.3f}, latency={latency:.1f}s, cost=${cost:.4f}",
+                )
+            )
         scored.sort(key=lambda x: x[0], reverse=True)
 
         if len(scored) > 1 and random.random() < self.exploration_rate:
@@ -143,15 +183,27 @@ class Scheduler:
             if randomized:
                 score, c, detail = random.choice(randomized)
                 return SchedulerDecision(
-                    c, "explore", score, "randomized production exploration; " + detail,
-                    [x.name for x in pool], unavailable,
-                    self.exploration_rate / len(randomized), SCHEDULER_POLICY_VERSION,
+                    c,
+                    "explore",
+                    score,
+                    "randomized production exploration; " + detail,
+                    [x.name for x in pool],
+                    unavailable,
+                    self.exploration_rate / len(randomized),
+                    SCHEDULER_POLICY_VERSION,
                     {"exploration_rate": self.exploration_rate, "phase": phase},
                 )
 
         score, c, detail = scored[0]
         probability = 1.0 if len(scored) == 1 else 1.0 - self.exploration_rate
-        return SchedulerDecision(c, "exploit", score, "best observed utility; " + detail,
-                                 [x.name for x in pool], unavailable, probability,
-                                 SCHEDULER_POLICY_VERSION,
-                                 {"exploration_rate": self.exploration_rate, "phase": phase})
+        return SchedulerDecision(
+            c,
+            "exploit",
+            score,
+            "best observed utility; " + detail,
+            [x.name for x in pool],
+            unavailable,
+            probability,
+            SCHEDULER_POLICY_VERSION,
+            {"exploration_rate": self.exploration_rate, "phase": phase},
+        )

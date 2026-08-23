@@ -10,17 +10,22 @@ affecting acceptance must remain outside worker authority.
 - [x] Immutable, versioned Candidate as the empirical unit
 - [x] Append-only event ledger
 - [x] Fully reconstructable scheduler decisions including propensity
-- [x] Quota events, state, reservations, reconciliation, and live routing feedback
-- [x] Resource inventory, reservations, and leases
+- [x] Per-model-request quota events, reservations, reconciliation, and live routing feedback
+- [x] Quantitative CPU/RAM/disk/GPU/named-slot resource reservations and leases
 - [ ] Sandbox abstraction with identity, secret, process, resource, filesystem, and network isolation
 - [x] Baseline-owned Git and immutable verification policy
-- [x] Crash-safe terminal attempt outcome and structured failure taxonomy
-- [x] Failure-aware retry and escalation
+- [x] Canonical terminal outcome taxonomy and explicit retry/quality-scoring policy
+- [ ] Crash recovery at every transition (expired dispatch/executor leases and idempotent commit are
+  implemented; kill/restart canaries for verification, review, and acceptance remain)
 - [x] Versioned ContextBundle with persisted manifest/hash
 - [x] Independent deterministic verification after successful executor output
 - [x] Human decision attached to exact READY attempt
 - [x] Complete reconstructable audit bundle
-- [x] Tests for implemented P0 invariants; network/disk isolation conformance remains
+- [x] Process-tree termination, aggregate workspace/file/artifact limits, and accounting tests
+- [ ] Enforced worker network denial on this host (capabilities are explicit and doctor no longer
+  overclaims; guarded/restricted-user support only `full`, and bubblewrap is unavailable here)
+- [ ] Continuous during-execution workspace monitoring (limits are enforced before/after each tool
+  command; a command can temporarily exceed the aggregate limit before termination)
 - [x] Disposable canary lifecycle reconstructed from DB, events, and artifacts
 
 ## P1 — early production

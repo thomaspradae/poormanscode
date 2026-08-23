@@ -44,16 +44,28 @@ def resolve_commit(repo: Path, ref: str) -> str:
 def safe_branch(job_id: str) -> str:
     return "pmc/" + re.sub(r"[^A-Za-z0-9._-]+", "-", job_id.lower())
 
+
 DEFAULT_EPHEMERAL = [
-    ".pytest_cache/*", "*/.pytest_cache/*",
-    "__pycache__/*", "*/__pycache__/*", "*.pyc", "*/*.pyc",
-    ".ruff_cache/*", "*/.ruff_cache/*",
-    ".mypy_cache/*", "*/.mypy_cache/*",
-    ".coverage", "htmlcov/*",
-    "node_modules/*", "*/node_modules/*",
+    ".pytest_cache/*",
+    "*/.pytest_cache/*",
+    "__pycache__/*",
+    "*/__pycache__/*",
+    "*.pyc",
+    "*/*.pyc",
+    ".ruff_cache/*",
+    "*/.ruff_cache/*",
+    ".mypy_cache/*",
+    "*/.mypy_cache/*",
+    ".coverage",
+    "htmlcov/*",
+    "node_modules/*",
+    "*/node_modules/*",
 ]
 
-def intent_to_add_untracked(worktree: Path, ignore_patterns: list[str] | None = None) -> None:
+
+def intent_to_add_untracked(
+    worktree: Path, ignore_patterns: list[str] | None = None
+) -> None:
     """Make meaningful untracked files visible to git diff without staging contents."""
     out = git(worktree, "ls-files", "--others", "--exclude-standard").stdout
     patterns = DEFAULT_EPHEMERAL + list(ignore_patterns or [])
@@ -84,7 +96,17 @@ class WorktreeManager:
         # Remove stale branch from an earlier destroyed worktree.
         git(repo, "branch", "-D", branch, check=False)
         p = subprocess.run(
-            ["git", "-C", str(repo), "worktree", "add", "-b", branch, str(path), baseline],
+            [
+                "git",
+                "-C",
+                str(repo),
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                str(path),
+                baseline,
+            ],
             text=True,
             capture_output=True,
         )
@@ -146,6 +168,19 @@ class WorktreeManager:
         if p.returncode != 0:
             raise GitError(p.stderr.strip())
         return resolve_commit(worktree, "HEAD")
+
+    def commit_idempotent(
+        self, worktree: Path, baseline: str, message: str, job_id: str
+    ) -> str:
+        """Return a prior PMC commit after a crash instead of creating a duplicate."""
+        head = resolve_commit(worktree, "HEAD")
+        clean = not git(worktree, "status", "--porcelain").stdout.strip()
+        subject_body = git(worktree, "log", "-1", "--format=%B").stdout
+        marker = f"PMC-Job: {job_id}"
+        if head != baseline and clean and marker in subject_body:
+            return head
+        full_message = message if marker in message else f"{message}\n\n{marker}"
+        return self.commit(worktree, full_message)
 
     def destroy(self, repo: Path, worktree: Path, force: bool = False) -> None:
         args = ["worktree", "remove"]

@@ -26,6 +26,7 @@ class PMCConfig:
     review_enabled: bool = False
     lease_ttl_seconds: int = 300
     verifier_sandbox: str = "guarded"
+    artifact_max_bytes: int = 512 * 1024**2
     candidates: list[Candidate] = None  # type: ignore[assignment]
 
 
@@ -45,7 +46,9 @@ def load_config(path: Path | None = None) -> PMCConfig:
     cfg = PMCConfig(
         db_path=_expand(core.get("db_path", "~/.local/share/poormans-code/pmc.db")),
         runs_dir=_expand(core.get("runs_dir", "~/.local/share/poormans-code/runs")),
-        worktrees_dir=_expand(core.get("worktrees_dir", "~/.local/share/poormans-code/worktrees")),
+        worktrees_dir=_expand(
+            core.get("worktrees_dir", "~/.local/share/poormans-code/worktrees")
+        ),
         exploration_rate=float(core.get("exploration_rate", 0.20)),
         min_samples_per_candidate=int(core.get("min_samples_per_candidate", 5)),
         max_attempts=int(core.get("max_attempts", 3)),
@@ -53,6 +56,7 @@ def load_config(path: Path | None = None) -> PMCConfig:
         review_enabled=bool(core.get("review_enabled", False)),
         lease_ttl_seconds=int(core.get("lease_ttl_seconds", 300)),
         verifier_sandbox=str(core.get("verifier_sandbox", "guarded")),
+        artifact_max_bytes=int(core.get("artifact_max_bytes", 512 * 1024**2)),
         candidates=candidates,
     )
     for p in (cfg.db_path.parent, cfg.runs_dir, cfg.worktrees_dir):
@@ -73,9 +77,11 @@ def load_repo_config(repo: Path) -> dict[str, Any]:
 def load_repo_config_at(repo: Path, revision: str) -> dict[str, Any]:
     """Load acceptance policy from PMC's immutable Git baseline."""
     import subprocess
+
     proc = subprocess.run(
         ["git", "-C", str(repo), "show", f"{revision}:poorman.yaml"],
-        text=True, capture_output=True,
+        text=True,
+        capture_output=True,
     )
     if proc.returncode != 0:
         return {}

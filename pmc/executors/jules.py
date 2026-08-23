@@ -5,7 +5,7 @@ import time
 
 import httpx
 
-from ..domain import ExecutionRequest, ExecutionResult
+from ..domain import ExecutionRequest, ExecutionResult, Outcome
 from ..gitops import WorktreeManager, resolve_commit
 
 
@@ -26,8 +26,14 @@ class JulesExecutor:
         c = request.candidate
         if request.attempt_no > 1:
             from ..gitops import git
+
             baseline = request.job.baseline_commit or "HEAD"
-            if git(request.worktree, "diff", "--quiet", baseline, "--", check=False).returncode != 0:
+            if (
+                git(
+                    request.worktree, "diff", "--quiet", baseline, "--", check=False
+                ).returncode
+                != 0
+            ):
                 return ExecutionResult(
                     False,
                     error="Jules cannot safely repair an unpushed local patch; use it as a first attempt or push an explicit branch",
@@ -43,7 +49,9 @@ class JulesExecutor:
                     "prompt": request.prompt,
                     "sourceContext": {
                         "source": c.source,
-                        "githubRepoContext": {"startingBranch": request.job.base_branch},
+                        "githubRepoContext": {
+                            "startingBranch": request.job.base_branch
+                        },
                     },
                     "requirePlanApproval": False,
                 }
@@ -53,21 +61,37 @@ class JulesExecutor:
                 session_name = session.get("name") or f"sessions/{session['id']}"
                 session_id = session_name.split("/")[-1]
                 poll = float(c.extra.get("poll_seconds", 10))
-                deadline = time.monotonic() + float(c.extra.get("timeout_seconds", 3600))
+                deadline = time.monotonic() + float(
+                    c.extra.get("timeout_seconds", 3600)
+                )
                 state = session.get("state", "QUEUED")
                 while state not in {"COMPLETED", "FAILED"}:
                     if time.monotonic() >= deadline:
-                        return ExecutionResult(False, error="Jules session timed out", provider_request_id=session_id)
+                        return ExecutionResult(
+                            False,
+                            error="Jules session timed out",
+                            provider_request_id=session_id,
+                            outcome=Outcome.TIMEOUT,
+                            raw_metrics={"accounting": "unknown"},
+                        )
                     time.sleep(poll)
                     r = client.get(f"{self.BASE}/sessions/{session_id}")
                     r.raise_for_status()
                     session = r.json()
                     state = session.get("state", "")
                 if state == "FAILED":
-                    return ExecutionResult(False, error="Jules session failed", provider_request_id=session_id, raw_metrics={"session": session})
+                    return ExecutionResult(
+                        False,
+                        error="Jules session failed",
+                        provider_request_id=session_id,
+                        raw_metrics={"session": session},
+                    )
 
                 # Activities are immutable and carry the ChangeSet git patch.
-                r = client.get(f"{self.BASE}/sessions/{session_id}/activities", params={"pageSize": 100})
+                r = client.get(
+                    f"{self.BASE}/sessions/{session_id}/activities",
+                    params={"pageSize": 100},
+                )
                 r.raise_for_status()
                 activities = r.json().get("activities", [])
                 patches: list[dict] = []
@@ -77,22 +101,39 @@ class JulesExecutor:
                         if cs and cs.get("gitPatch", {}).get("unidiffPatch"):
                             patches.append(cs["gitPatch"])
                 if not patches:
-                    return ExecutionResult(False, error="Jules completed without a ChangeSet patch", provider_request_id=session_id, raw_metrics={"state": state})
+                    return ExecutionResult(
+                        False,
+                        error="Jules completed without a ChangeSet patch",
+                        provider_request_id=session_id,
+                        raw_metrics={"state": state},
+                    )
                 patch = patches[-1]
-                local_base = request.job.baseline_commit or resolve_commit(request.worktree, "HEAD")
+                local_base = request.job.baseline_commit or resolve_commit(
+                    request.worktree, "HEAD"
+                )
                 remote_base = patch.get("baseCommitId")
                 manager = WorktreeManager(request.worktree.parent)
                 manager.apply_patch(request.worktree, patch["unidiffPatch"])
                 return ExecutionResult(
                     True,
-                    summary=patch.get("suggestedCommitMessage") or "Jules patch retrieved",
+                    summary=patch.get("suggestedCommitMessage")
+                    or "Jules patch retrieved",
                     provider_request_id=session_id,
                     raw_metrics={
+                        "accounting": "unknown",
                         "jules_session": session_id,
                         "remote_base": remote_base,
                         "local_base": local_base,
-                        "base_match": bool(remote_base and local_base.startswith(remote_base)) or bool(remote_base and remote_base.startswith(local_base)),
+                        "base_match": bool(
+                            remote_base and local_base.startswith(remote_base)
+                        )
+                        or bool(remote_base and remote_base.startswith(local_base)),
                     },
                 )
         except Exception as exc:
-            return ExecutionResult(False, error=f"Jules failed: {type(exc).__name__}: {exc}")
+            return ExecutionResult(
+                False,
+                error=f"Jules failed: {type(exc).__name__}: {exc}",
+                outcome=Outcome.PROVIDER_FAILURE,
+                raw_metrics={"accounting": "unknown"},
+            )
