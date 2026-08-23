@@ -9,6 +9,13 @@ from .domain import Candidate, Job, SchedulerDecision
 from .versioning import SCHEDULER_POLICY_VERSION
 
 
+class NoAvailableCandidate(RuntimeError):
+    def __init__(self, role: str, unavailable: dict[str, str]):
+        self.role = role
+        self.unavailable = unavailable
+        super().__init__(f"No available {role} candidates: {unavailable}")
+
+
 @dataclass(slots=True)
 class Availability:
     ok: bool
@@ -18,10 +25,17 @@ class Availability:
 class Scheduler:
     """Simple on purpose: cold-start exploration + epsilon-greedy exploitation."""
 
-    def __init__(self, db: Database, exploration_rate: float, min_samples: int):
+    def __init__(
+        self,
+        db: Database,
+        exploration_rate: float,
+        min_samples: int,
+        capability_registry=None,
+    ):
         self.db = db
         self.exploration_rate = exploration_rate
         self.min_samples = min_samples
+        self.capability_registry = capability_registry
 
     def available(
         self, c: Candidate, universe: list[Candidate] | None = None
@@ -119,12 +133,16 @@ class Scheduler:
             availability = self.available(c, candidates)
             if not availability.ok:
                 unavailable[c.name] = availability.reason
+            elif self.capability_registry and self.capability_registry.missing(job, c):
+                unavailable[c.name] = "missing capabilities: " + ", ".join(
+                    self.capability_registry.missing(job, c)
+                )
             elif not fits(c):
                 unavailable[c.name] = "task/profile constraint"
             else:
                 pool.append(c)
         if not pool:
-            raise RuntimeError(f"No available {role} candidates")
+            raise NoAvailableCandidate(role, unavailable)
 
         ordered = job.constraints.get("_candidate_order") or []
         if ordered:

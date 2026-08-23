@@ -80,6 +80,13 @@ def cmd_submit(args) -> int:
     ensure_repo(repo)
     job_id = ctl.db.next_job_id()
     constraints = {}
+    from .capabilities import infer_required_capabilities, repository_is_skeletal
+
+    inferred = infer_required_capabilities(
+        args.request, skeletal=repository_is_skeletal(repo)
+    )
+    if inferred:
+        constraints["required_capabilities"] = inferred
     if args.max_files is not None:
         constraints["max_files_changed"] = args.max_files
     if args.max_lines is not None:
@@ -179,7 +186,9 @@ def cmd_feature_plan(args) -> int:
             c for c in ctl.cfg.candidates if c.name == args.candidate and c.enabled
         ]
         if not matches:
-            raise RuntimeError(f"unknown or disabled Foreman candidate: {args.candidate}")
+            raise RuntimeError(
+                f"unknown or disabled Foreman candidate: {args.candidate}"
+            )
         plan = propose_plan(
             Path(feature["repo"]), feature["title"], feature["request"], matches[0]
         )
@@ -198,6 +207,9 @@ def cmd_feature_approve(args) -> int:
     plan = validate_plan(json.loads(feature["plan_json"]))
     next_number = int(ctl.db.next_job_id().split("-")[-1])
     jobs = []
+    from .capabilities import infer_required_capabilities, repository_is_skeletal
+
+    skeletal = repository_is_skeletal(Path(feature["repo"]))
     for position, task in enumerate(plan["tasks"]):
         job = Job(
             id=f"PMC-{next_number + position:06d}",
@@ -210,11 +222,26 @@ def cmd_feature_approve(args) -> int:
             constraints={
                 "_feature_dependencies": list(task.get("depends_on", [])),
                 "_candidate_order": list(task.get("candidate_order", [])),
+                "required_capabilities": infer_required_capabilities(
+                    task["request"], skeletal=skeletal and not task.get("depends_on")
+                ),
             },
         )
-        jobs.append(
-            (job, task["id"], position, list(task.get("depends_on", [])))
+        jobs.append((job, task["id"], position, list(task.get("depends_on", []))))
+    by_name = {c.name: c for c in ctl.cfg.candidates if c.enabled}
+    for job, key, _position, _depends in jobs:
+        ordered = job.constraints.get("_candidate_order") or []
+        unknown = [name for name in ordered if name not in by_name]
+        if unknown:
+            raise RuntimeError(f"task {key} names unknown candidates: {unknown}")
+        considered = (
+            [by_name[name] for name in ordered] if ordered else list(by_name.values())
         )
+        if considered and all(ctl.capabilities.missing(job, c) for c in considered):
+            details = {c.name: ctl.capabilities.missing(job, c) for c in considered}
+            raise RuntimeError(
+                f"task {key} has no capability-compatible candidate: {details}"
+            )
     ctl.db.approve_feature_plan(args.feature_id, jobs)
     for job, key, _position, depends in jobs:
         suffix = f" depends={','.join(depends)}" if depends else " ready"
@@ -243,10 +270,12 @@ def cmd_board(args) -> int:
         for row in tasks:
             deps = json.loads(row["depends_json"])
             waiting = [dep for dep in deps if dep not in accepted]
-            display_state = f"WAITING({','.join(waiting)})" if waiting and row["state"] == "QUEUED" else row["state"]
-            print(
-                f"  {row['job_id']:<12} {row['task_key']:<24} {display_state}"
+            display_state = (
+                f"WAITING({','.join(waiting)})"
+                if waiting and row["state"] == "QUEUED"
+                else row["state"]
             )
+            print(f"  {row['job_id']:<12} {row['task_key']:<24} {display_state}")
     return 0
 
 
@@ -455,6 +484,15 @@ def cmd_candidates(args) -> int:
     return 0
 
 
+def cmd_capabilities(args) -> int:
+    ctl = _controller(args)
+    snapshot = ctl.capabilities.local
+    print(f"resource: {snapshot.resource}")
+    for name in sorted(snapshot.capabilities):
+        print(name)
+    return 0
+
+
 def cmd_doctor(args) -> int:
     ok = True
     print(
@@ -544,6 +582,15 @@ def cmd_doctor(args) -> int:
                 ok = False
             else:
                 print(f"candidate {c.name}: network_policy={policy} enforceable")
+    if ctl.cfg.research_enabled:
+        present = bool(os.getenv(ctl.cfg.research_api_key_env))
+        print(
+            f"research: {'configured' if present else 'MISSING ' + ctl.cfg.research_api_key_env} "
+            f"(model={ctl.cfg.research_model}, controller-side)"
+        )
+        ok &= present
+    else:
+        print("research: disabled")
     if ctl.cfg.verifier_sandbox in {"none", "guarded"}:
         print(f"verifier sandbox: UNSAFE ({ctl.cfg.verifier_sandbox})")
         ok = False
@@ -756,6 +803,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("candidates")
     s.set_defaults(func=cmd_candidates)
+
+    s = sub.add_parser("capabilities")
+    s.set_defaults(func=cmd_capabilities)
 
     s = sub.add_parser("doctor")
     s.set_defaults(func=cmd_doctor)

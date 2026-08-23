@@ -2,17 +2,18 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from .domain import Job, JobState, VerificationResult
 
 
 def utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _header_int(payload: dict[str, Any], name: str) -> int | None:
@@ -225,6 +226,22 @@ CREATE TABLE IF NOT EXISTS feature_tasks (
     PRIMARY KEY(feature_id, task_key)
 );
 CREATE INDEX IF NOT EXISTS idx_feature_tasks_job ON feature_tasks(job_id);
+
+CREATE TABLE IF NOT EXISTS capability_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    resource TEXT NOT NULL,
+    capabilities_json TEXT NOT NULL,
+    details_json TEXT NOT NULL,
+    probed_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS research_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL, attempt_id INTEGER NOT NULL REFERENCES attempts(id),
+    provider TEXT NOT NULL, model TEXT NOT NULL, query TEXT NOT NULL,
+    state TEXT NOT NULL, response_text TEXT, sources_json TEXT NOT NULL DEFAULT '[]',
+    search_queries INTEGER, input_tokens INTEGER, output_tokens INTEGER,
+    cost_usd REAL, error TEXT, created_at TEXT NOT NULL, finished_at TEXT
+);
 """
 
 
@@ -289,6 +306,56 @@ class Database:
                 ),
             )
         return event_id
+
+    def record_capability_snapshot(
+        self, resource: str, capabilities: list[str], details: dict[str, Any]
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO capability_snapshots(resource,capabilities_json,details_json,probed_at) VALUES(?,?,?,?)",
+                (resource, json.dumps(capabilities), json.dumps(details), utcnow()),
+            )
+
+    def begin_research(
+        self, job_id: str, attempt_id: int, model: str, query: str
+    ) -> int:
+        with self.connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO research_requests(job_id,attempt_id,provider,model,query,state,created_at) VALUES(?,?, 'google',?,?,'STARTED',?)",
+                (job_id, attempt_id, model, query, utcnow()),
+            )
+            return int(cur.lastrowid)
+
+    def finish_research(
+        self,
+        research_id: int,
+        *,
+        state: str,
+        text: str = "",
+        sources=None,
+        search_queries: int = 0,
+        input_tokens=None,
+        output_tokens=None,
+        cost_usd=None,
+        error: str | None = None,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """UPDATE research_requests SET state=?,response_text=?,sources_json=?,
+                search_queries=?,input_tokens=?,output_tokens=?,cost_usd=?,error=?,finished_at=? WHERE id=?""",
+                (
+                    state,
+                    text,
+                    json.dumps(sources or []),
+                    search_queries,
+                    input_tokens,
+                    output_tokens,
+                    cost_usd,
+                    error,
+                    utcnow(),
+                    research_id,
+                ),
+            )
 
     def event_once(
         self,
@@ -889,11 +956,15 @@ class Database:
                 VALUES(?,?,?,?,?,'DRAFT',?,?)""",
                 (feature_id, str(repo), title, request, base_branch, now, now),
             )
-        self.event("FEATURE_CREATED", payload={"feature_id": feature_id, "title": title})
+        self.event(
+            "FEATURE_CREATED", payload={"feature_id": feature_id, "title": title}
+        )
 
     def get_feature(self, feature_id: str) -> sqlite3.Row:
         with self.connect() as conn:
-            row = conn.execute("SELECT * FROM features WHERE id=?", (feature_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM features WHERE id=?", (feature_id,)
+            ).fetchone()
         if not row:
             raise KeyError(f"Unknown feature {feature_id}")
         return row
@@ -906,12 +977,19 @@ class Database:
                 "UPDATE features SET state='PLANNED',plan_json=?,plan_candidate=?,updated_at=? WHERE id=?",
                 (json.dumps(plan), candidate, utcnow(), feature_id),
             )
-        self.event("FEATURE_PLANNED", payload={"feature_id": feature_id, "candidate": candidate})
+        self.event(
+            "FEATURE_PLANNED",
+            payload={"feature_id": feature_id, "candidate": candidate},
+        )
 
-    def approve_feature_plan(self, feature_id: str, jobs: list[tuple[Job, str, int, list[str]]]) -> None:
+    def approve_feature_plan(
+        self, feature_id: str, jobs: list[tuple[Job, str, int, list[str]]]
+    ) -> None:
         now = utcnow()
         with self.connect() as conn:
-            feature = conn.execute("SELECT state FROM features WHERE id=?", (feature_id,)).fetchone()
+            feature = conn.execute(
+                "SELECT state FROM features WHERE id=?", (feature_id,)
+            ).fetchone()
             if not feature or feature["state"] != "PLANNED":
                 raise RuntimeError("feature must be PLANNED before approval")
             for job, task_key, position, depends in jobs:
@@ -921,9 +999,19 @@ class Database:
                      constraints_json,state,worktree,baseline_commit,created_at,updated_at)
                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
-                        job.id, str(job.repo), job.request, job.base_branch, job.priority,
-                        job.task_type, json.dumps(job.acceptance), json.dumps(job.constraints),
-                        job.state.value, None, None, now, now,
+                        job.id,
+                        str(job.repo),
+                        job.request,
+                        job.base_branch,
+                        job.priority,
+                        job.task_type,
+                        json.dumps(job.acceptance),
+                        json.dumps(job.constraints),
+                        job.state.value,
+                        None,
+                        None,
+                        now,
+                        now,
                     ),
                 )
                 conn.execute(
@@ -935,17 +1023,31 @@ class Database:
                 (now, feature_id),
             )
         for job, task_key, _position, depends in jobs:
-            self.event("JOB_CREATED", job_id=job.id, payload={"repo": str(job.repo), "request": job.request})
-            self.event("FEATURE_TASK_CREATED", job_id=job.id, payload={"feature_id": feature_id, "task_key": task_key, "depends_on": depends})
+            self.event(
+                "JOB_CREATED",
+                job_id=job.id,
+                payload={"repo": str(job.repo), "request": job.request},
+            )
+            self.event(
+                "FEATURE_TASK_CREATED",
+                job_id=job.id,
+                payload={
+                    "feature_id": feature_id,
+                    "task_key": task_key,
+                    "depends_on": depends,
+                },
+            )
 
     def feature_tasks(self, feature_id: str) -> list[sqlite3.Row]:
         with self.connect() as conn:
-            return list(conn.execute(
-                """SELECT ft.*,j.state,j.request,j.accepted_commit,j.priority,j.task_type
+            return list(
+                conn.execute(
+                    """SELECT ft.*,j.state,j.request,j.accepted_commit,j.priority,j.task_type
                 FROM feature_tasks ft JOIN jobs j ON j.id=ft.job_id
                 WHERE ft.feature_id=? ORDER BY ft.position""",
-                (feature_id,),
-            ))
+                    (feature_id,),
+                )
+            )
 
     def dependency_commits(self, job_id: str) -> list[str]:
         """Return accepted prerequisite commits in deterministic topological order."""

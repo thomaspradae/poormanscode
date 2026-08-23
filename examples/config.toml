@@ -10,6 +10,12 @@ review_enabled = false
 lease_ttl_seconds = 300
 verifier_sandbox = "bwrap"
 
+[research]
+enabled = false
+model = "gemini-3-flash-preview"
+api_key_env = "GEMINI_API_KEY"
+max_queries_per_attempt = 5
+
 # Candidate examples. Enable only resources you actually have.
 
 [[candidates]]
@@ -26,6 +32,7 @@ quota_group = "groq"
 max_turns = 20
 sandbox = "bwrap"
 network = false
+capabilities = ["python", "node", "npm"] # declare remote/special capabilities explicitly
 request_extra = { parallel_tool_calls = false, reasoning_effort = "low" }
 tool_protocol_retries = 2
 

@@ -3,16 +3,17 @@ from __future__ import annotations
 import json
 import os
 import pwd
-import socket
 import shutil
+import socket
 import subprocess
 import threading
 import time
 import uuid
 from dataclasses import asdict
-from pathlib import Path
 
 from .accounting import ModelRequestAccounting
+from .capabilities import CapabilityRegistry
+from .capabilities import infer_required_capabilities, repository_is_skeletal
 from .config import PMCConfig, load_repo_config_at
 from .context import build_context_bundle
 from .db import Database
@@ -20,11 +21,12 @@ from .domain import AttemptStatus, ExecutionRequest, ExecutionResult, JobState, 
 from .executors import build_executor
 from .gitops import WorktreeManager
 from .prompts import builder_prompt
-from .reviewer import ReviewerService
 from .reporting import Reporter
+from .research import ResearchService
 from .retry import RetryAction, policy_for
-from .scheduler import Scheduler
+from .reviewer import ReviewerService
 from .sandbox import resource_snapshot
+from .scheduler import NoAvailableCandidate, Scheduler
 from .verifier import verify
 from .versioning import (
     JOB_CONTRACT_VERSION,
@@ -109,8 +111,12 @@ class Controller:
         self.cfg = cfg
         self.db = Database(cfg.db_path)
         self.worktrees = WorktreeManager(cfg.worktrees_dir)
+        self.capabilities = CapabilityRegistry(self.db)
         self.scheduler = Scheduler(
-            self.db, cfg.exploration_rate, cfg.min_samples_per_candidate
+            self.db,
+            cfg.exploration_rate,
+            cfg.min_samples_per_candidate,
+            self.capabilities,
         )
         self.reporter = Reporter(cfg.runs_dir, cfg.artifact_max_bytes)
         self.owner = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
@@ -194,7 +200,20 @@ class Controller:
     def _run_job_locked(
         self, job_id: str, forced_candidate: str | None = None
     ) -> JobState:
-        job = self.ensure_worktree(self.db.get_job(job_id))
+        job = self.db.get_job(job_id)
+        if "required_capabilities" not in job.constraints:
+            inferred = infer_required_capabilities(
+                job.request, skeletal=repository_is_skeletal(job.repo)
+            )
+            if inferred:
+                job.constraints["required_capabilities"] = inferred
+                self.db.update_job(job)
+                self.db.event(
+                    "CAPABILITIES_INFERRED",
+                    job_id=job.id,
+                    payload={"required": inferred, "source": "runtime-preflight"},
+                )
+        job = self.ensure_worktree(job)
         if job.state in {JobState.ACCEPTED, JobState.CANCELLED}:
             raise RuntimeError(f"{job.id} is {job.state}")
         repo_cfg = load_repo_config_at(job.repo, job.baseline_commit)
@@ -251,7 +270,11 @@ class Controller:
                 from .domain import SchedulerDecision
 
                 candidate0 = matches[0]
-                mode = "forced" if forced_candidate and total_attempts == 0 else "retry_same"
+                mode = (
+                    "forced"
+                    if forced_candidate and total_attempts == 0
+                    else "retry_same"
+                )
                 decision = SchedulerDecision(candidate0, mode, 0.0, mode)
             else:
                 try:
@@ -262,11 +285,36 @@ class Controller:
                         exclude=exclude,
                         attempt_no=attempt_no,
                     )
-                except RuntimeError:
+                except NoAvailableCandidate:
                     # If excluding the last worker emptied the pool, allow it again.
-                    decision = self.scheduler.choose(
-                        job, self.cfg.candidates, role="builder", attempt_no=attempt_no
-                    )
+                    try:
+                        decision = self.scheduler.choose(
+                            job,
+                            self.cfg.candidates,
+                            role="builder",
+                            attempt_no=attempt_no,
+                        )
+                    except NoAvailableCandidate as exc:
+                        missing = {
+                            name: reason
+                            for name, reason in exc.unavailable.items()
+                            if reason.startswith("missing capabilities:")
+                        }
+                        if missing:
+                            self.db.event(
+                                "BLOCKED_CAPABILITY",
+                                job_id=job.id,
+                                payload={
+                                    "required": job.constraints.get(
+                                        "required_capabilities", []
+                                    ),
+                                    "candidates": exc.unavailable,
+                                },
+                            )
+                            self.db.set_state(job.id, JobState.BLOCKED)
+                            self._write_event_audit(job.id)
+                            return JobState.BLOCKED
+                        raise
             if not persisted_decision:
                 self.db.record_decision(job.id, attempt_no, decision)
             candidate = decision.candidate
@@ -345,6 +393,15 @@ class Controller:
                 req.accounting = ModelRequestAccounting(
                     self.db, job_id=job.id, attempt_id=attempt_id, candidate=candidate
                 )
+                if self.cfg.research_enabled:
+                    req.research = ResearchService(
+                        self.db,
+                        job_id=job.id,
+                        attempt_id=attempt_id,
+                        model=self.cfg.research_model,
+                        api_key_env=self.cfg.research_api_key_env,
+                        max_queries=self.cfg.research_max_queries_per_attempt,
+                    )
             resource_key = candidate.resource_group or f"candidate:{candidate.name}"
             resource_state = {
                 "machine": socket.gethostname(),

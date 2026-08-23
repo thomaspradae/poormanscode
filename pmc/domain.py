@@ -93,6 +93,7 @@ class ExecutionRequest:
     attempt_no: int
     feedback: str | None = None
     accounting: Any | None = None
+    research: Any | None = None
 
 
 class Outcome(StrEnum):

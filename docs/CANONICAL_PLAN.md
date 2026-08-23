@@ -27,14 +27,21 @@ affecting acceptance must remain outside worker authority.
   guarded/restricted-user explicitly advertise `full` only
 - [x] Continuous during-execution workspace byte/file monitoring and termination
 - [x] Disposable canary lifecycle reconstructed from DB, events, and artifacts
+- [x] Generic skeletal-repository detection, inferred hard capabilities, probed
+  capability registry, pre-token scheduler rejection, and BLOCKED_CAPABILITY audit events
+- [x] Authoritative bootstrap guidance for Unity, Node, Rust, .NET, and Python
+- [x] Controller-side Gemini Google Search grounding with query budgets and persisted
+  research events/results/sources; worker credentials and network remain isolated
+- [x] Repeated-command and token-without-diff convergence controls
 
 ## P1 — early production
 
-- [ ] Generic project/toolchain profiles and Unity/C# profile
+- [~] Generic project/toolchain profiles (bootstrap foundation complete); Unity/C#
+  execution and verification profile still requires a registered Unity Editor
 - [ ] First-class artifacts and machine/visual/performance/playtest gates
 - [ ] Unity EditMode, PlayMode, build, scene, serialization, runtime, and performance checks
 - [ ] Independent read-only reviewer and reviewer scoring
-- [ ] Research role/profile
+- [x] Controller-mediated grounded research tool for Bash workers
 - [ ] Task characterization, risk, context size, and verification strength
 
 ## P2 — multi-agent/distributed capability

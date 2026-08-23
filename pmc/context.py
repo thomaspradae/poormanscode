@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from .bootstrap import bootstrap_guidance
 from .config import read_agents
 from .gitops import git
 from .versioning import CONTEXT_BUILDER_VERSION, stable_hash
@@ -55,6 +56,9 @@ def build_context_bundle(
             "are expected and are not a blocker. Do not stop merely because the "
             "requested framework or application has not been initialized yet."
         )
+        guidance = bootstrap_guidance(request, True)
+        if guidance:
+            sections.append(guidance)
     agents = read_agents(repo)
     if agents:
         sections.append("REPOSITORY INSTRUCTIONS:\n" + agents)

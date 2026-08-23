@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import subprocess
@@ -13,6 +14,7 @@ from ..providers import OpenAICompatibleClient, ProviderError
 from ..sandbox import SandboxLimits, build_sandbox, scrubbed_environment
 
 SYSTEM = """You are a software engineering agent. Use the provided shell tool to inspect and modify the repository.
+Use the research tool when current authoritative documentation is required; it is controller-mediated and returns sourced results.
 When the ticket is fully implemented, respond with exactly one JSON object as ordinary text and no markdown:
 {"action":"done","summary":"..."}
 Prefer small, targeted changes. Never commit or push.
@@ -28,6 +30,19 @@ SHELL_TOOL = {
             "type": "object",
             "properties": {"command": {"type": "string"}},
             "required": ["command"],
+            "additionalProperties": False,
+        },
+    },
+}
+RESEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "research",
+        "description": "Ask the controller to research current authoritative information using Google Search grounding.",
+        "parameters": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
             "additionalProperties": False,
         },
     },
@@ -121,6 +136,9 @@ class BashExecutor:
         format_errors = 0
         rate_retries = int(c.extra.get("rate_limit_retries", 3))
         tool_protocol_retries = int(c.extra.get("tool_protocol_retries", 2))
+        command_counts: dict[str, int] = {}
+        no_progress_turns = 0
+        last_diff = ""
         for turn in range(c.max_turns):
             rate_try = 0
             tool_protocol_try = 0
@@ -137,7 +155,8 @@ class BashExecutor:
                         temperature=float(c.extra.get("temperature", 0.0)),
                         max_tokens=int(c.extra.get("max_tokens", 4096)),
                         extra_body=c.extra.get("request_extra"),
-                        tools=[SHELL_TOOL],
+                        tools=[SHELL_TOOL]
+                        + ([RESEARCH_TOOL] if request.research else []),
                     )
                     if ticket:
                         request.accounting.succeed(ticket, reply)
@@ -232,14 +251,19 @@ class BashExecutor:
                 call = reply.tool_calls[0]
                 try:
                     arguments = json.loads(call["function"]["arguments"])
-                    command = arguments["command"]
+                    tool_name = call["function"]["name"]
+                    if tool_name == "shell":
+                        action = {"action": "bash", "command": arguments["command"]}
+                    elif tool_name == "research" and request.research:
+                        action = {"action": "research", "query": arguments["query"]}
+                    else:
+                        raise KeyError(f"unsupported tool {tool_name}")
                 except (KeyError, TypeError, json.JSONDecodeError) as exc:
                     return ExecutionResult(
                         False,
                         error=f"invalid shell tool call: {exc}",
                         outcome=Outcome.PROTOCOL_FAILURE,
                     )
-                action = {"action": "bash", "command": command}
             else:
                 messages.append({"role": "assistant", "content": reply.content})
                 try:
@@ -267,6 +291,24 @@ class BashExecutor:
                         "rate_headers": rate_headers,
                     },
                 )
+            if kind == "research" and isinstance(action.get("query"), str):
+                try:
+                    researched = request.research.search(action["query"])
+                    observation = json.dumps(
+                        {"answer": researched.text, "sources": researched.sources}
+                    )
+                except Exception as exc:
+                    observation = f"research error: {type(exc).__name__}: {exc}"
+                transcript.append({"turn": turn + 1, "research": action["query"]})
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call["id"],
+                        "name": "research",
+                        "content": observation,
+                    }
+                )
+                continue
             if kind != "bash" or not isinstance(action.get("command"), str):
                 format_errors += 1
                 messages.append(
@@ -277,6 +319,23 @@ class BashExecutor:
                 )
                 continue
             command = action["command"]
+            command_key = hashlib.sha256(command.strip().encode()).hexdigest()
+            command_counts[command_key] = command_counts.get(command_key, 0) + 1
+            if command_counts[command_key] > int(
+                c.extra.get("repeat_command_limit", 3)
+            ):
+                return ExecutionResult(
+                    False,
+                    error="repeated-command convergence limit exceeded",
+                    input_tokens=in_tokens or None,
+                    output_tokens=out_tokens or None,
+                    cost_usd=cost_usd or None,
+                    outcome=Outcome.EXECUTOR_FAILURE,
+                    raw_metrics={
+                        "turns": transcript,
+                        "convergence": "repeated_command",
+                    },
+                )
             try:
                 started = time.monotonic()
                 p = self._command(request, command)
@@ -323,6 +382,35 @@ class BashExecutor:
                         "seconds": elapsed,
                     }
                 )
+                diff_now = subprocess.run(
+                    ["git", "-C", str(request.worktree), "diff", "--binary"],
+                    text=True,
+                    capture_output=True,
+                    timeout=20,
+                    check=False,
+                ).stdout
+                if diff_now == last_diff:
+                    no_progress_turns += 1
+                else:
+                    no_progress_turns = 0
+                    last_diff = diff_now
+                no_diff_limit = int(c.extra.get("no_diff_limit", 12))
+                token_limit = int(c.extra.get("tokens_without_progress", 20_000))
+                if (
+                    no_progress_turns >= no_diff_limit
+                    and (in_tokens + out_tokens) >= token_limit
+                ):
+                    return ExecutionResult(
+                        False,
+                        error="token-without-progress convergence limit exceeded",
+                        input_tokens=in_tokens or None,
+                        output_tokens=out_tokens or None,
+                        cost_usd=cost_usd or None,
+                        outcome=Outcome.EXECUTOR_FAILURE,
+                        raw_metrics={"turns": transcript, "convergence": "no_diff"},
+                    )
+                if no_progress_turns == int(c.extra.get("no_diff_warning_turns", 6)):
+                    observation += "\nPMC WARNING: no repository change has been observed; make concrete progress now."
             except UnsafeCommand as exc:
                 return ExecutionResult(
                     False,

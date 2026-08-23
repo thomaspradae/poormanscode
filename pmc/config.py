@@ -12,7 +12,6 @@ import yaml
 
 from .domain import Candidate
 
-
 DEFAULT_CONFIG = Path("~/.config/poormans-code/config.toml").expanduser()
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -30,6 +29,10 @@ class PMCConfig:
     lease_ttl_seconds: int = 300
     verifier_sandbox: str = "guarded"
     artifact_max_bytes: int = 512 * 1024**2
+    research_enabled: bool = False
+    research_model: str = "gemini-3-flash-preview"
+    research_api_key_env: str = "GEMINI_API_KEY"
+    research_max_queries_per_attempt: int = 5
     candidates: list[Candidate] = None  # type: ignore[assignment]
 
 
@@ -78,6 +81,7 @@ def load_config(path: Path | None = None) -> PMCConfig:
     load_secrets_file(path.parent / "secrets.env")
     raw = tomllib.loads(path.read_text())
     core = raw.get("pmc", {})
+    research = raw.get("research", {})
     candidates = [Candidate.from_mapping(x) for x in raw.get("candidates", [])]
     cfg = PMCConfig(
         db_path=_expand(core.get("db_path", "~/.local/share/poormans-code/pmc.db")),
@@ -93,6 +97,12 @@ def load_config(path: Path | None = None) -> PMCConfig:
         lease_ttl_seconds=int(core.get("lease_ttl_seconds", 300)),
         verifier_sandbox=str(core.get("verifier_sandbox", "guarded")),
         artifact_max_bytes=int(core.get("artifact_max_bytes", 512 * 1024**2)),
+        research_enabled=bool(research.get("enabled", False)),
+        research_model=str(research.get("model", "gemini-3-flash-preview")),
+        research_api_key_env=str(research.get("api_key_env", "GEMINI_API_KEY")),
+        research_max_queries_per_attempt=int(
+            research.get("max_queries_per_attempt", 5)
+        ),
         candidates=candidates,
     )
     for p in (cfg.db_path.parent, cfg.runs_dir, cfg.worktrees_dir):
