@@ -219,8 +219,8 @@ class Controller:
                     persisted_decision.get("policy_version") or "unknown",
                     json.loads(persisted_decision.get("snapshot_json") or "{}"),
                 )
-            elif forced_candidate or retry_same:
-                selected_name = forced_candidate or retry_same
+            elif (forced_candidate and total_attempts == 0) or retry_same:
+                selected_name = forced_candidate if total_attempts == 0 else retry_same
                 retry_same = None
                 matches = [
                     c
@@ -234,7 +234,7 @@ class Controller:
                 from .domain import SchedulerDecision
 
                 candidate0 = matches[0]
-                mode = "forced" if forced_candidate else "retry_same"
+                mode = "forced" if forced_candidate and total_attempts == 0 else "retry_same"
                 decision = SchedulerDecision(candidate0, mode, 0.0, mode)
             else:
                 try:

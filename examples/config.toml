@@ -14,7 +14,7 @@ verifier_sandbox = "bwrap"
 
 [[candidates]]
 name = "groq-oss20-bash"
-version = "1"
+version = "3"
 provider = "groq"
 enabled = true
 executor = "bash"
@@ -81,7 +81,7 @@ api_key_env = "JULES_API_KEY"
 source = "auto"
 quota_group = "jules"
 exploration = false
-first_attempt_only = true
+first_attempt_only = false
 task_types = ["FEATURE", "ARCHITECTURAL", "DEPENDENCY_API"]
 quota_attempts = 15
 quota_window_seconds = 86400

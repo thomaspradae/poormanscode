@@ -33,6 +33,7 @@ class ChatReply:
     cost_usd: float | None = None
     rate_headers: dict[str, str] = field(default_factory=dict)
     raw: dict[str, Any] | None = None
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
 
 
 class OpenAICompatibleClient:
@@ -52,10 +53,11 @@ class OpenAICompatibleClient:
         self,
         *,
         model: str,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         temperature: float = 0.0,
         max_tokens: int = 4096,
         extra_body: dict[str, Any] | None = None,
+        tools: list[dict[str, Any]] | None = None,
     ) -> ChatReply:
         key = os.getenv(self.api_key_env) if self.api_key_env else None
         headers = {"Accept": "application/json", **self.extra_headers}
@@ -69,6 +71,9 @@ class OpenAICompatibleClient:
         }
         if extra_body:
             payload.update(extra_body)
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
         url = f"{self.base_url}/chat/completions"
         with httpx.Client(timeout=self.timeout) as client:
             # Retries are deliberately controller-visible. A hidden HTTP retry
@@ -112,7 +117,8 @@ class OpenAICompatibleClient:
                 )
             data = response.json()
         choice = data["choices"][0]
-        content = choice.get("message", {}).get("content") or ""
+        message = choice.get("message", {})
+        content = message.get("content") or ""
         usage = data.get("usage") or {}
         raw_cost = usage.get("cost") or data.get("cost")
         try:
@@ -132,4 +138,5 @@ class OpenAICompatibleClient:
             cost_usd=cost,
             rate_headers=rate_headers,
             raw=data,
+            tool_calls=message.get("tool_calls") or [],
         )

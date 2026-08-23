@@ -4,7 +4,6 @@ import json
 import re
 import subprocess
 import time
-from pathlib import Path
 from typing import Any
 
 import httpx
@@ -13,14 +12,26 @@ from ..domain import ExecutionRequest, ExecutionResult, Outcome
 from ..providers import OpenAICompatibleClient, ProviderError
 from ..sandbox import SandboxLimits, build_sandbox, scrubbed_environment
 
-
-SYSTEM = """You are a software engineering agent. No native API tools or function calls are available.
-Respond with exactly one JSON object as ordinary text and no markdown.
-To run a command: {"action":"bash","command":"..."}
-When the ticket is fully implemented: {"action":"done","summary":"..."}
-Request shell commands through the JSON text protocol above. Prefer small, targeted changes. Never commit or push.
+SYSTEM = """You are a software engineering agent. Use the provided shell tool to inspect and modify the repository.
+When the ticket is fully implemented, respond with exactly one JSON object as ordinary text and no markdown:
+{"action":"done","summary":"..."}
+Prefer small, targeted changes. Never commit or push.
 Do not claim success until you have run the visible relevant tests yourself.
 """
+
+SHELL_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "shell",
+        "description": "Run a bash command inside the isolated repository worktree.",
+        "parameters": {
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
+            "additionalProperties": False,
+        },
+    },
+}
 
 
 class UnsafeCommand(RuntimeError):
@@ -96,7 +107,7 @@ class BashExecutor:
                 False, error="bash executor requires model and base_url"
             )
         client = OpenAICompatibleClient(c.base_url, c.api_key_env)
-        messages: list[dict[str, str]] = [
+        messages: list[dict[str, Any]] = [
             {"role": "system", "content": SYSTEM},
             {"role": "user", "content": request.prompt},
         ]
@@ -108,80 +119,115 @@ class BashExecutor:
         transcript: list[dict[str, Any]] = []
         protocol_errors = 0
         format_errors = 0
+        rate_retries = int(c.extra.get("rate_limit_retries", 3))
         for turn in range(c.max_turns):
-            ticket = None
-            try:
-                if request.accounting:
-                    ticket = request.accounting.reserve(
-                        turn + 1, messages, int(c.extra.get("max_tokens", 4096))
+            for rate_try in range(rate_retries + 1):
+                ticket = None
+                try:
+                    if request.accounting:
+                        ticket = request.accounting.reserve(
+                            turn + 1, messages, int(c.extra.get("max_tokens", 4096))
+                        )
+                    reply = client.chat(
+                        model=c.model,
+                        messages=messages,
+                        temperature=float(c.extra.get("temperature", 0.0)),
+                        max_tokens=int(c.extra.get("max_tokens", 4096)),
+                        extra_body=c.extra.get("request_extra"),
+                        tools=[SHELL_TOOL],
                     )
-                reply = client.chat(
-                    model=c.model,
-                    messages=messages,
-                    temperature=float(c.extra.get("temperature", 0.0)),
-                    max_tokens=int(c.extra.get("max_tokens", 4096)),
-                    extra_body=c.extra.get("request_extra"),
-                )
-                if ticket:
-                    request.accounting.succeed(ticket, reply)
-            except ProviderError as exc:
-                if ticket:
-                    request.accounting.fail(ticket, exc)
-                return ExecutionResult(
-                    False,
-                    error=str(exc),
-                    input_tokens=in_tokens or None,
-                    output_tokens=out_tokens or None,
-                    cost_usd=cost_usd or None,
-                    raw_metrics={
-                        "turns": transcript,
-                        "provider_status": exc.status_code,
-                        "rate_headers": exc.rate_headers,
-                    },
-                    outcome=Outcome.RATE_LIMIT
-                    if exc.status_code == 429
-                    else Outcome.PROVIDER_FAILURE,
-                )
-            except httpx.TimeoutException as exc:
-                if ticket:
-                    request.accounting.fail(ticket, exc)
-                return ExecutionResult(
-                    False,
-                    error=f"model request timed out: {exc}",
-                    input_tokens=in_tokens or None,
-                    output_tokens=out_tokens or None,
-                    cost_usd=cost_usd or None,
-                    raw_metrics={"turns": transcript, "timeout_source": "model"},
-                    outcome=Outcome.TIMEOUT,
-                )
-            except Exception as exc:
-                if ticket:
-                    request.accounting.fail(ticket, exc)
-                return ExecutionResult(
-                    False,
-                    error=f"LLM request failed: {type(exc).__name__}: {exc}",
-                    input_tokens=in_tokens or None,
-                    output_tokens=out_tokens or None,
-                    cost_usd=cost_usd or None,
-                    raw_metrics={"turns": transcript},
-                    outcome=Outcome.PROVIDER_FAILURE,
-                )
+                    if ticket:
+                        request.accounting.succeed(ticket, reply)
+                    break
+                except ProviderError as exc:
+                    if ticket:
+                        request.accounting.fail(ticket, exc)
+                    retry_after = exc.rate_headers.get("retry-after")
+                    if exc.status_code == 429 and rate_try < rate_retries:
+                        try:
+                            delay = max(1.0, min(float(retry_after or 1), 120.0))
+                        except ValueError:
+                            delay = 1.0
+                        transcript.append(
+                            {"turn": turn + 1, "rate_limited": True, "wait": delay}
+                        )
+                        time.sleep(delay)
+                        continue
+                    return ExecutionResult(
+                        False,
+                        error=str(exc),
+                        input_tokens=in_tokens or None,
+                        output_tokens=out_tokens or None,
+                        cost_usd=cost_usd or None,
+                        raw_metrics={
+                            "turns": transcript,
+                            "provider_status": exc.status_code,
+                            "rate_headers": exc.rate_headers,
+                        },
+                        outcome=Outcome.RATE_LIMIT
+                        if exc.status_code == 429
+                        else Outcome.PROVIDER_FAILURE,
+                    )
+                except httpx.TimeoutException as exc:
+                    if ticket:
+                        request.accounting.fail(ticket, exc)
+                    return ExecutionResult(
+                        False,
+                        error=f"model request timed out: {exc}",
+                        input_tokens=in_tokens or None,
+                        output_tokens=out_tokens or None,
+                        cost_usd=cost_usd or None,
+                        raw_metrics={"turns": transcript, "timeout_source": "model"},
+                        outcome=Outcome.TIMEOUT,
+                    )
+                except Exception as exc:  # noqa: BLE001 - normalize client failures
+                    if ticket:
+                        request.accounting.fail(ticket, exc)
+                    return ExecutionResult(
+                        False,
+                        error=f"LLM request failed: {type(exc).__name__}: {exc}",
+                        input_tokens=in_tokens or None,
+                        output_tokens=out_tokens or None,
+                        cost_usd=cost_usd or None,
+                        raw_metrics={"turns": transcript},
+                        outcome=Outcome.PROVIDER_FAILURE,
+                    )
             in_tokens += reply.input_tokens or 0
             out_tokens += reply.output_tokens or 0
             cost_usd += reply.cost_usd or 0
             request_id = reply.request_id or request_id
             rate_headers = reply.rate_headers or rate_headers
-            messages.append({"role": "assistant", "content": reply.content})
-            try:
-                action = _extract_json(reply.content)
-            except Exception as exc:
-                protocol_errors += 1
-                obs = f"Protocol error: return exactly one JSON action. Parser error: {exc}"
-                messages.append({"role": "user", "content": obs})
-                transcript.append(
-                    {"turn": turn + 1, "protocol_error": reply.content[:1000]}
+            if reply.tool_calls:
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": reply.content or None,
+                        "tool_calls": reply.tool_calls,
+                    }
                 )
-                continue
+                call = reply.tool_calls[0]
+                try:
+                    arguments = json.loads(call["function"]["arguments"])
+                    command = arguments["command"]
+                except (KeyError, TypeError, json.JSONDecodeError) as exc:
+                    return ExecutionResult(
+                        False,
+                        error=f"invalid shell tool call: {exc}",
+                        outcome=Outcome.PROTOCOL_FAILURE,
+                    )
+                action = {"action": "bash", "command": command}
+            else:
+                messages.append({"role": "assistant", "content": reply.content})
+                try:
+                    action = _extract_json(reply.content)
+                except Exception as exc:  # noqa: BLE001 - report parser failure to model
+                    protocol_errors += 1
+                    obs = f"Protocol error: use the shell tool or return the done JSON. Parser error: {exc}"
+                    messages.append({"role": "user", "content": obs})
+                    transcript.append(
+                        {"turn": turn + 1, "protocol_error": reply.content[:1000]}
+                    )
+                    continue
             kind = action.get("action")
             if kind == "done":
                 return ExecutionResult(
@@ -263,12 +309,22 @@ class BashExecutor:
                     outcome=Outcome.SECURITY_FAILURE,
                     raw_metrics={"turns": transcript},
                 )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - tool errors become observations
                 observation = f"tool error: {type(exc).__name__}: {exc}"
                 transcript.append(
                     {"turn": turn + 1, "command": command, "tool_error": str(exc)}
                 )
-            messages.append({"role": "user", "content": observation})
+            if reply.tool_calls:
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call["id"],
+                        "name": "shell",
+                        "content": observation,
+                    }
+                )
+            else:
+                messages.append({"role": "user", "content": observation})
         return ExecutionResult(
             False,
             error=f"agent exceeded max_turns={c.max_turns}",
