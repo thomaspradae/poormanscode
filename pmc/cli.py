@@ -388,7 +388,7 @@ def cmd_version(args) -> int:
 
 def cmd_canary(args) -> int:
     from .canary import run_canary
-    print(json.dumps(run_canary(), indent=2))
+    print(json.dumps(run_canary(args.verifier_sandbox), indent=2))
     return 0
 
 
@@ -401,6 +401,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_version)
 
     s = sub.add_parser("canary")
+    s.add_argument("--verifier-sandbox", default="guarded",
+                   choices=["guarded", "restricted-user", "bwrap"])
     s.set_defaults(func=cmd_canary)
 
     s = sub.add_parser("init-config")

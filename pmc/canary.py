@@ -35,7 +35,7 @@ class _Handler(BaseHTTPRequestHandler):
         return
 
 
-def run_canary() -> dict[str, object]:
+def run_canary(verifier_sandbox: str = "guarded") -> dict[str, object]:
     with tempfile.TemporaryDirectory(prefix="pmc-canary-") as td:
         root = Path(td)
         repo = root / "repo"
@@ -54,7 +54,8 @@ def run_canary() -> dict[str, object]:
             candidate = Candidate("canary-bash-v1", "bash", model="canary-model",
                                   provider="local-canary", base_url=f"http://127.0.0.1:{server.server_port}/v1",
                                   sandbox="guarded", max_turns=3)
-            cfg = PMCConfig(root / "pmc.db", root / "runs", root / "worktrees", candidates=[candidate])
+            cfg = PMCConfig(root / "pmc.db", root / "runs", root / "worktrees",
+                            verifier_sandbox=verifier_sandbox, candidates=[candidate])
             ctl = Controller(cfg)
             job = Job("PMC-CANARY", repo, "Fix add", acceptance=["syntax verification passes"])
             ctl.db.create_job(job)
@@ -67,7 +68,8 @@ def run_canary() -> dict[str, object]:
                 attempts = conn.execute("SELECT COUNT(*) FROM attempts WHERE outcome='SUCCESS'").fetchone()[0]
             artifacts = len(list((root / "runs" / job.id).iterdir()))
             return {"state": "ACCEPTED", "commit": commit, "events": events,
-                    "successful_attempts": attempts, "audit_artifacts": artifacts}
+                    "successful_attempts": attempts, "audit_artifacts": artifacts,
+                    "verifier_sandbox": verifier_sandbox}
         finally:
             server.shutdown()
             server.server_close()

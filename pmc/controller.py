@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import pwd
 import socket
 import shutil
 import subprocess
@@ -76,8 +77,11 @@ class Controller:
         if self.cfg.verifier_sandbox == "restricted-user":
             if not shutil.which("setfacl"):
                 raise RuntimeError("restricted-user verifier requires setfacl")
-            subprocess.run(["setfacl", "-Rm", "u:pmc-worker:rwX", str(wt)], check=True)
-            subprocess.run(["setfacl", "-Rm", "d:u:pmc-worker:rwX", str(wt)], check=True)
+            controller_user = pwd.getpwuid(os.getuid()).pw_name
+            subprocess.run(["setfacl", "-Rm",
+                            f"u:{controller_user}:rwX,u:pmc-worker:rwX", str(wt)], check=True)
+            subprocess.run(["setfacl", "-Rm",
+                            f"d:u:{controller_user}:rwX,d:u:pmc-worker:rwX", str(wt)], check=True)
         job.worktree = wt
         job.baseline_commit = baseline
         self.db.update_job(job)

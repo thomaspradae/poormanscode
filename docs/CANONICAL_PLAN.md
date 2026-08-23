@@ -20,7 +20,7 @@ affecting acceptance must remain outside worker authority.
 - [x] Independent deterministic verification after successful executor output
 - [x] Human decision attached to exact READY attempt
 - [x] Complete reconstructable audit bundle
-- [ ] Tests for every P0 invariant
+- [x] Tests for implemented P0 invariants; network/disk isolation conformance remains
 - [x] Disposable canary lifecycle reconstructed from DB, events, and artifacts
 
 ## P1 — early production

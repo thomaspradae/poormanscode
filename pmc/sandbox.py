@@ -52,8 +52,11 @@ class Sandbox:
             network: bool, limits: SandboxLimits) -> subprocess.CompletedProcess[str]:
         args = self.command(worktree, command, network)
         if shutil.which("prlimit"):
-            args = ["prlimit", f"--cpu={limits.cpu_seconds}", f"--as={limits.memory_bytes}",
-                    f"--fsize={limits.file_bytes}", "--", *args]
+            limit_args = ["prlimit", f"--cpu={limits.cpu_seconds}", f"--as={limits.memory_bytes}",
+                          f"--fsize={limits.file_bytes}"]
+            if self.name != "guarded":
+                limit_args.append(f"--nproc={limits.processes}")
+            args = [*limit_args, "--", *args]
         if shutil.which("setsid"):
             args = ["setsid", *args]
         if shutil.which("timeout"):
