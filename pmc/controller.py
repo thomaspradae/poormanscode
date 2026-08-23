@@ -485,7 +485,10 @@ class Controller:
                     return JobState.FAILED
                 if outcome == Outcome.RESOURCE_FAILURE:
                     self.worktrees.reset_attempt(job.worktree, job.baseline_commit)
-                if retry_policy.action == RetryAction.RETRY_ALTERNATE:
+                if job.constraints.get("_candidate_order"):
+                    retry_same = None
+                    retry_exclude.add(candidate.name)
+                elif retry_policy.action == RetryAction.RETRY_ALTERNATE:
                     retry_exclude.add(candidate.name)
                 elif retry_policy.action == RetryAction.RETRY_SAME_WITH_EVIDENCE:
                     if used.count(candidate.name) <= self.cfg.same_candidate_retries:
@@ -547,7 +550,10 @@ class Controller:
                     return JobState.BLOCKED
                 if outcome == Outcome.SCOPE_FAILURE:
                     self.worktrees.reset_attempt(job.worktree, job.baseline_commit)
-                if retry_policy.action == RetryAction.RETRY_ALTERNATE:
+                if job.constraints.get("_candidate_order"):
+                    retry_same = None
+                    retry_exclude.add(candidate.name)
+                elif retry_policy.action == RetryAction.RETRY_ALTERNATE:
                     retry_exclude.add(candidate.name)
                 elif retry_policy.action == RetryAction.RETRY_SAME_WITH_EVIDENCE:
                     if used.count(candidate.name) <= self.cfg.same_candidate_retries:
