@@ -29,7 +29,9 @@ class CapabilitySnapshot:
     details: dict[str, Any]
 
 
-def probe_local_capabilities() -> CapabilitySnapshot:
+def probe_local_capabilities(
+    toolchains: dict[str, dict[str, Any]] | None = None,
+) -> CapabilitySnapshot:
     found: set[str] = {"filesystem", "shell"}
     details: dict[str, Any] = {"host": socket.gethostname(), "executables": {}}
     for capability, commands in PROBES.items():
@@ -50,6 +52,15 @@ def probe_local_capabilities() -> CapabilitySnapshot:
         found.add("scaffolder:python")
     if "unity-editor" in found:
         found.add("scaffolder:unity")
+    unity = (toolchains or {}).get("unity", {})
+    configured_editor = unity.get("editor_path")
+    if configured_editor and Path(str(configured_editor)).expanduser().is_file():
+        found.update({"unity-editor", "scaffolder:unity", "unity-batchmode"})
+        details["executables"]["unity-editor"] = str(
+            Path(str(configured_editor)).expanduser().resolve()
+        )
+        if unity.get("version"):
+            found.add(f"unity-version:{unity['version']}")
     return CapabilitySnapshot("controller", frozenset(found), details)
 
 
@@ -103,9 +114,9 @@ def repository_is_skeletal(repo: Path) -> bool:
 
 
 class CapabilityRegistry:
-    def __init__(self, db: Any):
+    def __init__(self, db: Any, toolchains: dict[str, dict[str, Any]] | None = None):
         self.db = db
-        self.local = probe_local_capabilities()
+        self.local = probe_local_capabilities(toolchains)
         self.db.record_capability_snapshot(
             self.local.resource, sorted(self.local.capabilities), self.local.details
         )

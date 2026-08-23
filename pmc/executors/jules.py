@@ -42,10 +42,7 @@ class JulesExecutor:
         for pattern in patterns:
             match = re.match(pattern, remote)
             if match:
-                return (
-                    "sources/github/"
-                    f"{match.group('owner')}/{match.group('repo')}"
-                )
+                return f"sources/github/{match.group('owner')}/{match.group('repo')}"
         raise RuntimeError(
             "Jules requires a GitHub origin remote or an explicit source override"
         )

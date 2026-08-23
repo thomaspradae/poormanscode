@@ -84,7 +84,13 @@ class Sandbox:
     def supports_network_policy(self, policy: str) -> bool:
         return policy in self.network_policies
 
-    def command(self, worktree: Path, command: str, network: bool) -> list[str]:
+    def command(
+        self,
+        worktree: Path,
+        command: str,
+        network: bool,
+        readonly_paths: tuple[Path, ...] = (),
+    ) -> list[str]:
         raise NotImplementedError
 
     def run(
@@ -95,6 +101,7 @@ class Sandbox:
         env: dict[str, str],
         network: bool,
         limits: SandboxLimits,
+        readonly_paths: tuple[Path, ...] = (),
     ) -> subprocess.CompletedProcess[str]:
         requested_policy = "full" if network else "none"
         if not self.supports_network_policy(requested_policy):
@@ -113,7 +120,7 @@ class Sandbox:
             return subprocess.CompletedProcess(
                 [], 75, "", "PMC_RESOURCE_LIMIT:WORKSPACE_LIMIT\n"
             )
-        args = self.command(worktree, command, network)
+        args = self.command(worktree, command, network, readonly_paths)
         if shutil.which("prlimit"):
             limit_args = [
                 "prlimit",
@@ -216,7 +223,9 @@ class RestrictedUserSandbox(Sandbox):
     name = "restricted-user"
     network_policies = frozenset({"full"})
 
-    def command(self, worktree: Path, command: str, network: bool) -> list[str]:
+    def command(
+        self, worktree: Path, command: str, network: bool, readonly_paths=()
+    ) -> list[str]:
         return ["sudo", "-n", "-u", "pmc-worker", "/bin/bash", "-lc", command]
 
 
@@ -224,7 +233,9 @@ class ContainerSandbox(Sandbox):
     name = "bwrap"
     network_policies = frozenset({"none", "full"})
 
-    def command(self, worktree: Path, command: str, network: bool) -> list[str]:
+    def command(
+        self, worktree: Path, command: str, network: bool, readonly_paths=()
+    ) -> list[str]:
         if not shutil.which("bwrap"):
             raise RuntimeError("bubblewrap is not installed")
         args = [
@@ -276,6 +287,11 @@ class ContainerSandbox(Sandbox):
         ):
             if Path(path).exists():
                 args.extend(["--ro-bind", path, path])
+        for path in readonly_paths:
+            resolved = path.resolve()
+            if not resolved.exists():
+                raise RuntimeError(f"sandbox readonly path does not exist: {resolved}")
+            args.extend(["--ro-bind", str(resolved), str(resolved)])
         if not network:
             args.append("--unshare-net")
         return [*args, "/bin/bash", "-lc", command]
@@ -284,7 +300,9 @@ class ContainerSandbox(Sandbox):
 class RemoteSandbox(Sandbox):
     name = "remote"
 
-    def command(self, worktree: Path, command: str, network: bool) -> list[str]:
+    def command(
+        self, worktree: Path, command: str, network: bool, readonly_paths=()
+    ) -> list[str]:
         raise RuntimeError("remote sandboxes are executor-managed")
 
 
@@ -292,7 +310,9 @@ class GuardedSandbox(Sandbox):
     name = "guarded"
     network_policies = frozenset({"full"})
 
-    def command(self, worktree: Path, command: str, network: bool) -> list[str]:
+    def command(
+        self, worktree: Path, command: str, network: bool, readonly_paths=()
+    ) -> list[str]:
         return ["/bin/bash", "-lc", command]
 
 

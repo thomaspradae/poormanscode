@@ -10,6 +10,17 @@ review_enabled = false
 lease_ttl_seconds = 300
 verifier_sandbox = "restricted-user"
 
+[research]
+enabled = false
+model = "gemini-3-flash-preview"
+api_key_env = "GEMINI_API_KEY"
+max_queries_per_attempt = 5
+
+[toolchains.unity]
+# Set this to the exact executable installed by Unity Hub.
+editor_path = "/home/YOU/Unity/Hub/Editor/6000.x/Editor/Unity"
+version = "6000.x"
+
 # Candidate examples. Enable only resources you actually have.
 
 [[candidates]]

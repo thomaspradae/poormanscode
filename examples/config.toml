@@ -16,6 +16,11 @@ model = "gemini-3-flash-preview"
 api_key_env = "GEMINI_API_KEY"
 max_queries_per_attempt = 5
 
+[toolchains.unity]
+# Set after installing an Editor; PMC probes this exact executable.
+editor_path = "/opt/unity/Editor/Unity"
+version = "6000.0"
+
 # Candidate examples. Enable only resources you actually have.
 
 [[candidates]]

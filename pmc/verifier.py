@@ -24,7 +24,12 @@ SECRET_PATTERNS = [
 
 
 def _run(
-    name: str, command: str, cwd: Path, timeout: int, sandbox_name: str = "guarded"
+    name: str,
+    command: str,
+    cwd: Path,
+    timeout: int,
+    sandbox_name: str = "guarded",
+    readonly_paths: tuple[Path, ...] = (),
 ) -> CommandResult:
     started = time.monotonic()
     try:
@@ -38,6 +43,7 @@ def _run(
             env=scrubbed_environment(),
             network=network,
             limits=SandboxLimits(wall_seconds=timeout, cpu_seconds=max(1, timeout - 5)),
+            readonly_paths=readonly_paths,
         )
         return CommandResult(
             name, command, p.returncode, time.monotonic() - started, p.stdout, p.stderr
@@ -103,10 +109,23 @@ def verify(
     intent_to_add_untracked(worktree, list(repo_cfg.get("verification_ignore", [])))
     timeout = int(repo_cfg.get("timeout_seconds", 600))
     commands: list[CommandResult] = []
+    profile_commands: dict[str, str] = {}
+    readonly_paths: tuple[Path, ...] = ()
+    if repo_cfg.get("toolchain") == "unity":
+        from .toolchains import UnityToolchain
+
+        toolchain_cfg = dict(repo_cfg.get("unity_toolchain", {}))
+        unity = UnityToolchain.from_config(toolchain_cfg)
+        profile_commands = unity.verification_commands(repo_cfg)
+        readonly_paths = (unity.editor.parent,)
     for name in ("test", "lint", "typecheck", "build", "hidden_test"):
         command = repo_cfg.get(name)
         if command:
             commands.append(_run(name, str(command), worktree, timeout, sandbox_name))
+    for name, command in profile_commands.items():
+        commands.append(
+            _run(name, command, worktree, timeout, sandbox_name, readonly_paths)
+        )
 
     changed = [
         x

@@ -38,6 +38,9 @@ affecting acceptance must remain outside worker authority.
 
 - [~] Generic project/toolchain profiles (bootstrap foundation complete); Unity/C#
   execution and verification profile still requires a registered Unity Editor
+- [~] Unity profile now provides native skeletal-repo bootstrap, versioned Editor
+  registration, batch compilation, and optional EditMode/PlayMode gates. Host Editor
+  installation/licensing and the first live canary remain outstanding.
 - [ ] First-class artifacts and machine/visual/performance/playtest gates
 - [ ] Unity EditMode, PlayMode, build, scene, serialization, runtime, and performance checks
 - [ ] Independent read-only reviewer and reviewer scoring

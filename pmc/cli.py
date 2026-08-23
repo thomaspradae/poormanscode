@@ -493,6 +493,21 @@ def cmd_capabilities(args) -> int:
     return 0
 
 
+def cmd_bootstrap_unity(args) -> int:
+    ctl = _controller(args)
+    repo = Path(args.repo).resolve()
+    ensure_repo(repo)
+    from .toolchains import UnityToolchain
+
+    toolchain = UnityToolchain.from_config(ctl.cfg.toolchains.get("unity", {}))
+    toolchain.bootstrap(repo, timeout=args.timeout)
+    print(f"Unity project created through {toolchain.editor}")
+    print(
+        "Review generated files, update immutable poorman.yaml policy, then commit the baseline."
+    )
+    return 0
+
+
 def cmd_doctor(args) -> int:
     ok = True
     print(
@@ -591,6 +606,15 @@ def cmd_doctor(args) -> int:
         ok &= present
     else:
         print("research: disabled")
+    for name, toolchain_cfg in ctl.cfg.toolchains.items():
+        if name == "unity":
+            from .toolchains import UnityToolchain, UnityToolchainError
+
+            try:
+                unity = UnityToolchain.from_config(toolchain_cfg)
+                print(f"toolchain unity: configured ({unity.editor})")
+            except UnityToolchainError as exc:
+                print(f"toolchain unity: unavailable ({exc})")
     if ctl.cfg.verifier_sandbox in {"none", "guarded"}:
         print(f"verifier sandbox: UNSAFE ({ctl.cfg.verifier_sandbox})")
         ok = False
@@ -806,6 +830,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("capabilities")
     s.set_defaults(func=cmd_capabilities)
+
+    s = sub.add_parser("bootstrap-unity")
+    s.add_argument("repo")
+    s.add_argument("--timeout", type=int, default=1800)
+    s.set_defaults(func=cmd_bootstrap_unity)
 
     s = sub.add_parser("doctor")
     s.set_defaults(func=cmd_doctor)

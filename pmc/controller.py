@@ -32,6 +32,7 @@ from .versioning import (
     JOB_CONTRACT_VERSION,
     PROMPT_PROFILE_VERSION,
     SCHEMA_VERSION,
+    TOOLCHAIN_PROFILE_VERSION,
     VERIFIER_VERSION,
     pmc_git_sha,
     stable_hash,
@@ -111,7 +112,7 @@ class Controller:
         self.cfg = cfg
         self.db = Database(cfg.db_path)
         self.worktrees = WorktreeManager(cfg.worktrees_dir)
-        self.capabilities = CapabilityRegistry(self.db)
+        self.capabilities = CapabilityRegistry(self.db, cfg.toolchains)
         self.scheduler = Scheduler(
             self.db,
             cfg.exploration_rate,
@@ -217,6 +218,10 @@ class Controller:
         if job.state in {JobState.ACCEPTED, JobState.CANCELLED}:
             raise RuntimeError(f"{job.id} is {job.state}")
         repo_cfg = load_repo_config_at(job.repo, job.baseline_commit)
+        if repo_cfg.get("toolchain") == "unity":
+            # Machine-owned registration is injected only after immutable policy
+            # loading; workers cannot redirect the verifier executable.
+            repo_cfg["unity_toolchain"] = dict(self.cfg.toolchains.get("unity", {}))
         prior_feedback = self.db.feedback_text(job.id)
         total_attempts = self.db.attempt_count(job.id)
         failures: list[str] = []
@@ -358,6 +363,9 @@ class Controller:
                 "prompt_profile_version": PROMPT_PROFILE_VERSION,
                 "context_builder_version": context_bundle.manifest["version"],
                 "verifier_version": VERIFIER_VERSION,
+                "toolchain_profile_version": TOOLCHAIN_PROFILE_VERSION,
+                "toolchain": repo_cfg.get("toolchain"),
+                "toolchain_hash": stable_hash(repo_cfg.get("unity_toolchain", {})),
                 "candidate_id": candidate.name,
                 "candidate_version": candidate.version,
                 "candidate_hash": stable_hash(candidate),

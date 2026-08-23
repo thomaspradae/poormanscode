@@ -12,6 +12,7 @@ PROMPT_PROFILE_VERSION = "builder-v4"
 CONTEXT_BUILDER_VERSION = "context-v3"
 SCHEDULER_POLICY_VERSION = "epsilon-greedy-v2"
 VERIFIER_VERSION = "deterministic-v2"
+TOOLCHAIN_PROFILE_VERSION = "toolchains-v1"
 
 
 def stable_hash(value: Any) -> str:

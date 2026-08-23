@@ -33,6 +33,7 @@ class PMCConfig:
     research_model: str = "gemini-3-flash-preview"
     research_api_key_env: str = "GEMINI_API_KEY"
     research_max_queries_per_attempt: int = 5
+    toolchains: dict[str, dict[str, Any]] = None  # type: ignore[assignment]
     candidates: list[Candidate] = None  # type: ignore[assignment]
 
 
@@ -103,6 +104,7 @@ def load_config(path: Path | None = None) -> PMCConfig:
         research_max_queries_per_attempt=int(
             research.get("max_queries_per_attempt", 5)
         ),
+        toolchains={str(k): dict(v) for k, v in raw.get("toolchains", {}).items()},
         candidates=candidates,
     )
     for p in (cfg.db_path.parent, cfg.runs_dir, cfg.worktrees_dir):

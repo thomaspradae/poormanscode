@@ -1,5 +1,13 @@
 setup: null
 
+# Optional native toolchain profile, for example: unity
+toolchain: null
+
+# Unity profile gates. The Editor path/version live in global config.toml.
+unity:
+  editmode_tests: true
+  playmode_tests: false
+
 test: "pytest -q"
 lint: null
 typecheck: null
