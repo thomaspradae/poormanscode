@@ -7,6 +7,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 from ..domain import ExecutionRequest, ExecutionResult, Outcome
 from ..providers import OpenAICompatibleClient, ProviderError
 from ..sandbox import SandboxLimits, build_sandbox, scrubbed_environment
@@ -100,10 +102,12 @@ class BashExecutor:
         ]
         in_tokens = 0
         out_tokens = 0
+        cost_usd = 0.0
         request_id = None
         rate_headers: dict[str, str] = {}
         transcript: list[dict[str, Any]] = []
         protocol_errors = 0
+        format_errors = 0
         for turn in range(c.max_turns):
             ticket = None
             try:
@@ -128,6 +132,7 @@ class BashExecutor:
                     error=str(exc),
                     input_tokens=in_tokens or None,
                     output_tokens=out_tokens or None,
+                    cost_usd=cost_usd or None,
                     raw_metrics={
                         "turns": transcript,
                         "provider_status": exc.status_code,
@@ -137,6 +142,18 @@ class BashExecutor:
                     if exc.status_code == 429
                     else Outcome.PROVIDER_FAILURE,
                 )
+            except httpx.TimeoutException as exc:
+                if ticket:
+                    request.accounting.fail(ticket, exc)
+                return ExecutionResult(
+                    False,
+                    error=f"model request timed out: {exc}",
+                    input_tokens=in_tokens or None,
+                    output_tokens=out_tokens or None,
+                    cost_usd=cost_usd or None,
+                    raw_metrics={"turns": transcript, "timeout_source": "model"},
+                    outcome=Outcome.TIMEOUT,
+                )
             except Exception as exc:
                 if ticket:
                     request.accounting.fail(ticket, exc)
@@ -145,11 +162,13 @@ class BashExecutor:
                     error=f"LLM request failed: {type(exc).__name__}: {exc}",
                     input_tokens=in_tokens or None,
                     output_tokens=out_tokens or None,
+                    cost_usd=cost_usd or None,
                     raw_metrics={"turns": transcript},
                     outcome=Outcome.PROVIDER_FAILURE,
                 )
             in_tokens += reply.input_tokens or 0
             out_tokens += reply.output_tokens or 0
+            cost_usd += reply.cost_usd or 0
             request_id = reply.request_id or request_id
             rate_headers = reply.rate_headers or rate_headers
             messages.append({"role": "assistant", "content": reply.content})
@@ -170,6 +189,7 @@ class BashExecutor:
                     summary=str(action.get("summary") or "worker reported completion"),
                     input_tokens=in_tokens or None,
                     output_tokens=out_tokens or None,
+                    cost_usd=cost_usd or None,
                     provider_request_id=request_id,
                     raw_metrics={
                         "turns": transcript,
@@ -178,7 +198,7 @@ class BashExecutor:
                     },
                 )
             if kind != "bash" or not isinstance(action.get("command"), str):
-                protocol_errors += 1
+                format_errors += 1
                 messages.append(
                     {
                         "role": "user",
@@ -197,8 +217,9 @@ class BashExecutor:
                         error="worker command timed out",
                         input_tokens=in_tokens or None,
                         output_tokens=out_tokens or None,
+                        cost_usd=cost_usd or None,
                         outcome=Outcome.TIMEOUT,
-                        raw_metrics={"turns": transcript},
+                        raw_metrics={"turns": transcript, "timeout_source": "shell"},
                     )
                 if "PMC_RESOURCE_LIMIT:WORKSPACE_LIMIT" in p.stderr:
                     return ExecutionResult(
@@ -206,7 +227,18 @@ class BashExecutor:
                         error=p.stderr.strip(),
                         input_tokens=in_tokens or None,
                         output_tokens=out_tokens or None,
+                        cost_usd=cost_usd or None,
                         outcome=Outcome.RESOURCE_FAILURE,
+                        raw_metrics={"turns": transcript},
+                    )
+                if "PMC_POLICY_FAILURE:" in p.stderr:
+                    return ExecutionResult(
+                        False,
+                        error=p.stderr.strip(),
+                        input_tokens=in_tokens or None,
+                        output_tokens=out_tokens or None,
+                        cost_usd=cost_usd or None,
+                        outcome=Outcome.POLICY_FAILURE,
                         raw_metrics={"turns": transcript},
                     )
                 observation = (
@@ -221,6 +253,16 @@ class BashExecutor:
                         "seconds": elapsed,
                     }
                 )
+            except UnsafeCommand as exc:
+                return ExecutionResult(
+                    False,
+                    error=str(exc),
+                    input_tokens=in_tokens or None,
+                    output_tokens=out_tokens or None,
+                    cost_usd=cost_usd or None,
+                    outcome=Outcome.SECURITY_FAILURE,
+                    raw_metrics={"turns": transcript},
+                )
             except Exception as exc:
                 observation = f"tool error: {type(exc).__name__}: {exc}"
                 transcript.append(
@@ -232,13 +274,20 @@ class BashExecutor:
             error=f"agent exceeded max_turns={c.max_turns}",
             input_tokens=in_tokens or None,
             output_tokens=out_tokens or None,
+            cost_usd=cost_usd or None,
             provider_request_id=request_id,
             raw_metrics={
                 "turns": transcript,
                 "turn_count": c.max_turns,
                 "rate_headers": rate_headers,
             },
-            outcome=Outcome.PROTOCOL_FAILURE
-            if protocol_errors
-            else Outcome.EXECUTOR_FAILURE,
+            outcome=(
+                Outcome.PROTOCOL_FAILURE
+                if protocol_errors
+                else (
+                    Outcome.FORMAT_FAILURE
+                    if format_errors
+                    else Outcome.EXECUTOR_FAILURE
+                )
+            ),
         )

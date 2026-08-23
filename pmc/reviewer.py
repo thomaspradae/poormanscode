@@ -21,10 +21,17 @@ class ReviewerService:
         attempt_no: int,
         verification_summary: str,
     ) -> ReviewResult:
-        diff = WorktreeManager(worktree.parent).diff(worktree, job.baseline_commit or "HEAD")
+        diff = WorktreeManager(worktree.parent).diff(
+            worktree, job.baseline_commit or "HEAD"
+        )
         with tempfile.TemporaryDirectory(prefix="pmc-review-") as td:
             review_dir = Path(td) / "repo"
-            shutil.copytree(worktree, review_dir, symlinks=True, ignore=shutil.ignore_patterns(".git"))
+            shutil.copytree(
+                worktree,
+                review_dir,
+                symlinks=True,
+                ignore=shutil.ignore_patterns(".git"),
+            )
             req = ExecutionRequest(
                 job=job,
                 candidate=candidate,
@@ -35,7 +42,12 @@ class ReviewerService:
             result = build_executor(candidate.executor).run(req)
             output = review_dir / "PMC_REVIEW.json"
             if not result.ok or not output.exists():
-                return ReviewResult(False, "REJECT", result.error or "reviewer did not produce PMC_REVIEW.json", [])
+                return ReviewResult(
+                    False,
+                    "REJECT",
+                    result.error or "reviewer did not produce PMC_REVIEW.json",
+                    [],
+                )
             try:
                 data = json.loads(output.read_text())
                 verdict = str(data.get("verdict", "REJECT")).upper()
@@ -43,4 +55,6 @@ class ReviewerService:
                 summary = str(data.get("summary", ""))
                 return ReviewResult(verdict == "ACCEPT", verdict, summary, findings)
             except Exception as exc:
-                return ReviewResult(False, "REJECT", f"invalid reviewer output: {exc}", [])
+                return ReviewResult(
+                    False, "REJECT", f"invalid reviewer output: {exc}", []
+                )

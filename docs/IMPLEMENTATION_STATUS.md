@@ -4,14 +4,21 @@ PMC already implements the schema/persistence contract, operator CLI, isolated G
 worktrees, deterministic verification, retries with failure evidence, scheduling,
 audit reports, human acceptance, leases, and Bash/OpenHands/Jules adapters.
 
-## Required before the first untrusted real job
+## P0 substrate
 
-- [ ] Provision a dedicated `pmc-worker` account on each worker host.
-- [ ] Require `sandbox = "bwrap"` for Bash candidates and validate UID, filesystem,
-  network, CPU, memory, timeout, and process-group behavior with an adversarial job.
-- [ ] Configure provider credentials outside repositories and verify child commands
-  receive none of them. The HTTP client may read only the selected provider key.
-- [ ] Run `pmc doctor` successfully on the selected worker.
+- [x] Provision a dedicated `pmc-worker` identity for the restricted-user backend.
+- [x] Harden and validate `sandbox = "bwrap"`: controller home invisibility,
+  no-network namespace, CPU/memory/process limits, continuous workspace limits,
+  timeout, and complete process-tree termination.
+- [x] Keep provider credentials controller-side and prove child commands receive none.
+- [x] Validate the complete lifecycle with an all-Bubblewrap disposable canary and
+  reconstruct tokens, quota reconciliation, leases, human attribution, events, and artifacts.
+- [x] Exercise SIGKILL/restart recovery across every durable transition.
+
+## Operational activation before project #1
+
+- [x] Expose the selected provider credential by environment-variable name and run
+  `pmc doctor` successfully with the sandboxed Groq Bash candidate.
 - [ ] Run one supervised real ticket through submit, inspect/diff, reject or accept,
   and confirm all attempt and human-decision rows exist.
 

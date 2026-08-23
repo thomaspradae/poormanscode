@@ -76,7 +76,7 @@ Early on the scheduler is intentionally simple. `pmc stats` is the truth. More s
 
 ## Security boundary
 
-The controller strips secrets from child-process environments. `BashExecutor` should preferably run with `sandbox = "bwrap"`, which mounts the host filesystem read-only and the task worktree writable. OpenHands should run in its own sandbox/Agent Server for untrusted jobs. No executor is allowed to decide that its own work passed verification.
+The controller strips secrets from child-process environments. `BashExecutor` should run with `sandbox = "bwrap"`; that backend exposes only system runtimes and the task worktree, denies network when configured, and applies process/memory plus continuously monitored workspace limits. It does not mount the controller's home. OpenHands should run in its own sandbox/Agent Server for untrusted jobs. No executor is allowed to decide that its own work passed verification.
 
 ## State lifecycle
 

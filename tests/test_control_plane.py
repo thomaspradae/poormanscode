@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from pmc.db import Database
-from pmc.domain import Candidate, Job
+from pmc.domain import Candidate, Job, SchedulerDecision
 from pmc.scheduler import Scheduler
 
 
@@ -50,6 +50,36 @@ def test_quantitative_resource_reservations(tmp_path: Path):
     assert "cpu" in reason
 
 
+def test_resource_lease_can_be_renewed(tmp_path: Path):
+    db = Database(tmp_path / "db.sqlite")
+    job = Job("PMC-000001", tmp_path, "task")
+    db.create_job(job)
+    candidate = Candidate(name="a", executor="bash")
+    attempt = db.begin_attempt(job.id, 1, candidate, "forced", 0)
+    assert db.reserve_resource("machine", job.id, attempt, "owner", 1, {})
+    with db.connect() as conn:
+        old = conn.execute("SELECT expires_at FROM resource_leases").fetchone()[0]
+    assert db.renew_resource("machine", job.id, "owner", 60)
+    with db.connect() as conn:
+        new = conn.execute("SELECT expires_at FROM resource_leases").fetchone()[0]
+    assert new > old
+
+
+def test_scheduler_decision_is_durable_before_attempt(tmp_path: Path):
+    db = Database(tmp_path / "db.sqlite")
+    job = Job("PMC-000001", tmp_path, "task")
+    db.create_job(job)
+    candidate = Candidate(name="a", executor="bash")
+    decision = SchedulerDecision(
+        candidate, "explore", 0.5, "test", ["a"], {}, 0.2, "v1", {"quota": "ok"}
+    )
+    db.record_decision(job.id, 1, decision)
+    persisted = db.scheduler_decision(job.id, 1)
+    assert persisted is not None
+    assert persisted["candidate"] == "a"
+    assert persisted["selection_probability"] == 0.2
+
+
 def test_expired_lease_recovers_running_job(tmp_path: Path):
     db = Database(tmp_path / "db.sqlite")
     job = Job("PMC-000001", tmp_path, "task")
@@ -83,6 +113,53 @@ def test_expired_lease_recovers_running_job(tmp_path: Path):
             == "RECONCILED"
         )
     assert any(e["event_type"] == "JOB_RECOVERED" for e in db.job_events(job.id))
+
+
+def test_recovery_restores_ready_attempt_instead_of_duplicate_retry(tmp_path: Path):
+    from pmc.domain import ExecutionResult, JobState
+
+    db = Database(tmp_path / "db.sqlite")
+    job = Job("PMC-000001", tmp_path, "task")
+    db.create_job(job)
+    candidate = Candidate(name="a", executor="bash")
+    attempt = db.begin_attempt(job.id, 1, candidate, "forced", 0)
+    db.finish_attempt(attempt, "READY", ExecutionResult(True), 1, outcome="SUCCESS")
+    db.set_state(job.id, JobState.VERIFYING)
+    assert db.recover_expired_leases(3) == [job.id]
+    assert db.get_job(job.id).state == JobState.READY
+    assert db.attempt_count(job.id) == 1
+
+
+def test_human_feedback_is_idempotent_for_crash_replay(tmp_path: Path):
+    db = Database(tmp_path / "db.sqlite")
+    job = Job("PMC-000001", tmp_path, "task")
+    db.create_job(job)
+    candidate = Candidate(name="a", executor="bash")
+    attempt = db.begin_attempt(job.id, 1, candidate, "forced", 0)
+    db.add_feedback(job.id, "ACCEPT", attempt_id=attempt)
+    db.add_feedback(job.id, "ACCEPT", attempt_id=attempt)
+    with db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM human_feedback").fetchone()[0] == 1
+
+
+def test_acceptance_state_feedback_and_events_are_atomic_and_idempotent(tmp_path: Path):
+    from pmc.domain import ExecutionResult
+
+    db = Database(tmp_path / "db.sqlite")
+    job = Job("PMC-000001", tmp_path, "task")
+    db.create_job(job)
+    candidate = Candidate(name="a", executor="bash")
+    attempt = db.begin_attempt(job.id, 1, candidate, "forced", 0)
+    db.finish_attempt(attempt, "READY", ExecutionResult(True), 1, outcome="SUCCESS")
+    db.complete_acceptance(job.id, attempt, "abc123")
+    db.complete_acceptance(job.id, attempt, "abc123")
+    with db.connect() as conn:
+        assert conn.execute("SELECT state FROM jobs").fetchone()[0] == "ACCEPTED"
+        assert conn.execute("SELECT COUNT(*) FROM human_feedback").fetchone()[0] == 1
+        events = conn.execute(
+            "SELECT event_type FROM events WHERE event_type IN ('HUMAN_ACCEPTED','COMMIT_CREATED')"
+        ).fetchall()
+        assert sorted(row[0] for row in events) == ["COMMIT_CREATED", "HUMAN_ACCEPTED"]
 
 
 def test_manual_baseline_stats(tmp_path: Path):

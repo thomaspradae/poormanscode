@@ -6,6 +6,8 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import pytest
+
 from pmc.config import PMCConfig
 from pmc.controller import Controller
 from pmc.domain import Candidate, Job, JobState
@@ -32,7 +34,7 @@ class Handler(BaseHTTPRequestHandler):
             {
                 "id": f"mock-{Handler.calls}",
                 "choices": [{"message": {"content": content}}],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "cost": 0.001},
             }
         ).encode()
         self.send_response(200)
@@ -118,6 +120,9 @@ def test_controller_full_cycle(tmp_path: Path):
             assert (
                 sum(r["actual_output_tokens"] for r in requests)
                 == attempt["output_tokens"]
+            )
+            assert sum(r["actual_cost_usd"] for r in requests) == pytest.approx(
+                attempt["cost_usd"]
             )
         event_types = [e["event_type"] for e in ctl.db.job_events(job.id)]
         assert event_types.count("MODEL_REQUEST_RESERVED") == 3

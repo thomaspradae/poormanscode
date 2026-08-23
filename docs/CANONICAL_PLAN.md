@@ -12,20 +12,20 @@ affecting acceptance must remain outside worker authority.
 - [x] Fully reconstructable scheduler decisions including propensity
 - [x] Per-model-request quota events, reservations, reconciliation, and live routing feedback
 - [x] Quantitative CPU/RAM/disk/GPU/named-slot resource reservations and leases
-- [ ] Sandbox abstraction with identity, secret, process, resource, filesystem, and network isolation
+- [x] Sandbox abstraction with secret-free environment, process-tree/cgroup limits,
+  worktree-only filesystem, continuous disk limits, and enforced Bubblewrap no-network mode
 - [x] Baseline-owned Git and immutable verification policy
 - [x] Canonical terminal outcome taxonomy and explicit retry/quality-scoring policy
-- [ ] Crash recovery at every transition (expired dispatch/executor leases and idempotent commit are
-  implemented; kill/restart canaries for verification, review, and acceptance remain)
+- [x] SIGKILL/restart recovery across dispatch, model request, execution, verification,
+  review, READY, and commit; acceptance state/feedback/events are atomic and idempotent
 - [x] Versioned ContextBundle with persisted manifest/hash
 - [x] Independent deterministic verification after successful executor output
 - [x] Human decision attached to exact READY attempt
 - [x] Complete reconstructable audit bundle
 - [x] Process-tree termination, aggregate workspace/file/artifact limits, and accounting tests
-- [ ] Enforced worker network denial on this host (capabilities are explicit and doctor no longer
-  overclaims; guarded/restricted-user support only `full`, and bubblewrap is unavailable here)
-- [ ] Continuous during-execution workspace monitoring (limits are enforced before/after each tool
-  command; a command can temporarily exceed the aggregate limit before termination)
+- [x] Enforced worker network denial on this host through a minimal-mount Bubblewrap backend;
+  guarded/restricted-user explicitly advertise `full` only
+- [x] Continuous during-execution workspace byte/file monitoring and termination
 - [x] Disposable canary lifecycle reconstructed from DB, events, and artifacts
 
 ## P1 — early production

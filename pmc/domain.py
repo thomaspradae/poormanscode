@@ -128,6 +128,7 @@ class ExecutionResult:
     provider_request_id: str | None = None
     raw_metrics: dict[str, Any] = field(default_factory=dict)
     outcome: Outcome | None = None
+    accounting_level: str = "unknown"  # per_model_request | aggregate | unknown
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)

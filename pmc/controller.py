@@ -69,6 +69,41 @@ class _LeaseHeartbeat:
         self.db.release_lease(self.job_id, self.owner)
 
 
+class _ResourceHeartbeat:
+    def __init__(
+        self, db: Database, resource_key: str, job_id: str, owner: str, ttl: int
+    ):
+        self.db = db
+        self.resource_key = resource_key
+        self.job_id = job_id
+        self.owner = owner
+        self.ttl = ttl
+        self.stop = threading.Event()
+        self.thread: threading.Thread | None = None
+
+    def __enter__(self):
+        interval = max(5.0, self.ttl / 3)
+
+        def beat():
+            while not self.stop.wait(interval):
+                if not self.db.renew_resource(
+                    self.resource_key, self.job_id, self.owner, self.ttl
+                ):
+                    return
+
+        self.thread = threading.Thread(
+            target=beat, daemon=True, name=f"pmc-resource-{self.job_id}"
+        )
+        self.thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.stop.set()
+        if self.thread:
+            self.thread.join(timeout=2)
+        self.db.release_resource(self.resource_key, self.job_id)
+
+
 class Controller:
     def __init__(self, cfg: PMCConfig):
         self.cfg = cfg
@@ -150,28 +185,57 @@ class Controller:
         total_attempts = self.db.attempt_count(job.id)
         failures: list[str] = []
         used: list[str] = []
+        retry_exclude: set[str] = set()
+        retry_same: str | None = None
 
         while total_attempts < self.cfg.max_attempts:
             attempt_no = total_attempts + 1
-            exclude = set()
+            exclude = set(retry_exclude)
+            retry_exclude.clear()
             if used and len(used) >= self.cfg.same_candidate_retries:
                 exclude.add(used[-1])
-            if forced_candidate:
+            persisted_decision = self.db.scheduler_decision(job.id, attempt_no)
+            if persisted_decision:
+                from .domain import SchedulerDecision
+
                 matches = [
                     c
                     for c in self.cfg.candidates
-                    if c.name == forced_candidate and c.enabled
+                    if c.name == persisted_decision["candidate"] and c.enabled
                 ]
                 if not matches:
                     raise RuntimeError(
-                        f"forced candidate is unavailable: {forced_candidate}"
+                        f"persisted candidate unavailable: {persisted_decision['candidate']}"
+                    )
+                candidate0 = matches[0]
+                decision = SchedulerDecision(
+                    candidate0,
+                    persisted_decision["mode"],
+                    persisted_decision["score"],
+                    persisted_decision["reason"],
+                    json.loads(persisted_decision.get("eligible_json") or "[]"),
+                    json.loads(persisted_decision.get("unavailable_json") or "{}"),
+                    persisted_decision.get("selection_probability") or 0.0,
+                    persisted_decision.get("policy_version") or "unknown",
+                    json.loads(persisted_decision.get("snapshot_json") or "{}"),
+                )
+            elif forced_candidate or retry_same:
+                selected_name = forced_candidate or retry_same
+                retry_same = None
+                matches = [
+                    c
+                    for c in self.cfg.candidates
+                    if c.name == selected_name and c.enabled
+                ]
+                if not matches:
+                    raise RuntimeError(
+                        f"forced candidate is unavailable: {selected_name}"
                     )
                 from .domain import SchedulerDecision
 
                 candidate0 = matches[0]
-                decision = SchedulerDecision(
-                    candidate0, "forced", 0.0, "explicit CLI override"
-                )
+                mode = "forced" if forced_candidate else "retry_same"
+                decision = SchedulerDecision(candidate0, mode, 0.0, mode)
             else:
                 try:
                     decision = self.scheduler.choose(
@@ -186,7 +250,8 @@ class Controller:
                     decision = self.scheduler.choose(
                         job, self.cfg.candidates, role="builder", attempt_no=attempt_no
                     )
-            self.db.record_decision(job.id, attempt_no, decision)
+            if not persisted_decision:
+                self.db.record_decision(job.id, attempt_no, decision)
             candidate = decision.candidate
             self.db.register_candidate(candidate)
             used.append(candidate.name)
@@ -303,16 +368,28 @@ class Controller:
                 total_attempts += 1
                 continue
             started = time.monotonic()
-            try:
-                result = build_executor(candidate.executor).run(req)
-            except Exception as exc:
-                result = ExecutionResult(
-                    False,
-                    error=f"executor crash: {type(exc).__name__}: {exc}",
-                    outcome=Outcome.EXECUTOR_CRASH,
-                )
+            with _ResourceHeartbeat(
+                self.db,
+                resource_key,
+                job.id,
+                self.owner,
+                self.cfg.lease_ttl_seconds,
+            ):
+                try:
+                    result = build_executor(candidate.executor).run(req)
+                except Exception as exc:
+                    result = ExecutionResult(
+                        False,
+                        error=f"executor crash: {type(exc).__name__}: {exc}",
+                        outcome=Outcome.EXECUTOR_CRASH,
+                    )
             duration = time.monotonic() - started
-            self.db.release_resource(resource_key, job.id)
+            result.accounting_level = {
+                "bash": "per_model_request",
+                "openhands": "aggregate",
+                "jules": "unknown",
+            }.get(candidate.executor, "unknown")
+            result.raw_metrics.setdefault("accounting", result.accounting_level)
             if reservation_id:
                 self.db.reconcile_quota(
                     reservation_id,
@@ -330,9 +407,18 @@ class Controller:
                 result.raw_metrics["model_request_totals"] = totals
                 recorded = totals["input_tokens"] + totals["output_tokens"]
                 reported = (result.input_tokens or 0) + (result.output_tokens or 0)
-                if recorded != reported:
+                cost_mismatch = (
+                    totals["cost_usd"] is not None
+                    and abs(float(totals["cost_usd"]) - float(result.cost_usd or 0))
+                    > 1e-9
+                )
+                if recorded != reported or cost_mismatch:
                     result.ok = False
-                    result.error = f"accounting mismatch: model requests={recorded}, executor={reported}"
+                    result.error = (
+                        f"accounting mismatch: model request tokens={recorded}, "
+                        f"executor tokens={reported}, model request cost={totals['cost_usd']}, "
+                        f"executor cost={result.cost_usd}"
+                    )
                     result.outcome = Outcome.POLICY_FAILURE
             provider_status = result.raw_metrics.get("provider_status")
             if provider_status:
@@ -371,6 +457,24 @@ class Controller:
                 failures.append(
                     f"Attempt {attempt_no} executor failure ({candidate.name}): {result.error}"
                 )
+                retry_policy = policy_for(outcome)
+                if retry_policy.action == RetryAction.BLOCK:
+                    self.db.set_state(job.id, JobState.BLOCKED)
+                    self._write_event_audit(job.id)
+                    return JobState.BLOCKED
+                if retry_policy.action == RetryAction.TERMINAL:
+                    self.db.set_state(job.id, JobState.FAILED)
+                    self._write_event_audit(job.id)
+                    return JobState.FAILED
+                if outcome == Outcome.RESOURCE_FAILURE:
+                    self.worktrees.reset_attempt(job.worktree, job.baseline_commit)
+                if retry_policy.action == RetryAction.RETRY_ALTERNATE:
+                    retry_exclude.add(candidate.name)
+                elif retry_policy.action == RetryAction.RETRY_SAME_WITH_EVIDENCE:
+                    if used.count(candidate.name) <= self.cfg.same_candidate_retries:
+                        retry_same = candidate.name
+                    else:
+                        retry_exclude.add(candidate.name)
                 self.db.set_state(job.id, JobState.RETRY)
                 continue
 
@@ -419,12 +523,20 @@ class Controller:
                 failures.append(
                     f"Attempt {attempt_no} verification:\n{v.short_failure()}"
                 )
-                if policy_for(outcome).action == RetryAction.BLOCK:
+                retry_policy = policy_for(outcome)
+                if retry_policy.action == RetryAction.BLOCK:
                     self.db.set_state(job.id, JobState.BLOCKED)
                     self._write_event_audit(job.id)
                     return JobState.BLOCKED
                 if outcome == Outcome.SCOPE_FAILURE:
                     self.worktrees.reset_attempt(job.worktree, job.baseline_commit)
+                if retry_policy.action == RetryAction.RETRY_ALTERNATE:
+                    retry_exclude.add(candidate.name)
+                elif retry_policy.action == RetryAction.RETRY_SAME_WITH_EVIDENCE:
+                    if used.count(candidate.name) <= self.cfg.same_candidate_retries:
+                        retry_same = candidate.name
+                    else:
+                        retry_exclude.add(candidate.name)
                 self.db.set_state(job.id, JobState.RETRY)
                 continue
 
@@ -464,6 +576,13 @@ class Controller:
                             + "\n"
                             + "\n".join(review.findings)
                         )
+                        if (
+                            used.count(candidate.name)
+                            <= self.cfg.same_candidate_retries
+                        ):
+                            retry_same = candidate.name
+                        else:
+                            retry_exclude.add(candidate.name)
                         self.db.set_state(job.id, JobState.RETRY)
                         continue
 
@@ -522,23 +641,12 @@ class Controller:
             message or f"{job.id}: {job.request[:60]}",
             job.id,
         )
-        self.db.add_feedback(
-            job.id, "ACCEPT", None, attempt_id=self.db.latest_ready_attempt_id(job.id)
-        )
-        self.db.event(
-            "HUMAN_ACCEPTED",
-            job_id=job.id,
-            attempt_id=self.db.latest_ready_attempt_id(job.id),
-        )
-        self.db.set_accepted_commit(job.id, commit)
+        ready_attempt = self.db.latest_ready_attempt_id(job.id)
+        if ready_attempt is None:
+            raise RuntimeError("job has no READY attempt to accept")
+        self.db.complete_acceptance(job.id, ready_attempt, commit)
         job.state = JobState.ACCEPTED
         self.reporter.summary(job, commit=commit)
-        self.db.event(
-            "COMMIT_CREATED",
-            job_id=job.id,
-            attempt_id=self.db.latest_ready_attempt_id(job.id),
-            payload={"commit": commit},
-        )
         self._write_event_audit(job.id)
         return commit
 

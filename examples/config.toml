@@ -8,7 +8,7 @@ max_attempts = 3
 same_candidate_retries = 2
 review_enabled = false
 lease_ttl_seconds = 300
-verifier_sandbox = "restricted-user"
+verifier_sandbox = "bwrap"
 
 # Candidate examples. Enable only resources you actually have.
 

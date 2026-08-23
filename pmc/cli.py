@@ -439,7 +439,7 @@ def cmd_doctor(args) -> int:
             print(f"verifier sandbox: FAIL restricted-user ({probe.stderr.strip()})")
             ok = False
         else:
-            print("verifier sandbox: OK restricted-user")
+            print("verifier sandbox: OK restricted-user (network_policy=full only)")
     elif ctl.cfg.verifier_sandbox == "bwrap":
         verifier_probe = (
             subprocess.run(
@@ -489,7 +489,7 @@ def cmd_version(args) -> int:
 def cmd_canary(args) -> int:
     from .canary import run_canary
 
-    print(json.dumps(run_canary(args.verifier_sandbox), indent=2))
+    print(json.dumps(run_canary(args.verifier_sandbox, args.builder_sandbox), indent=2))
     return 0
 
 
@@ -504,6 +504,11 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("canary")
     s.add_argument(
         "--verifier-sandbox",
+        default="guarded",
+        choices=["guarded", "restricted-user", "bwrap"],
+    )
+    s.add_argument(
+        "--builder-sandbox",
         default="guarded",
         choices=["guarded", "restricted-user", "bwrap"],
     )

@@ -265,6 +265,28 @@ class Database:
             )
         return event_id
 
+    def event_once(
+        self,
+        event_type: str,
+        *,
+        job_id: str,
+        attempt_id: int | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> str:
+        with self.connect() as conn:
+            row = conn.execute(
+                """SELECT event_id FROM events WHERE event_type=? AND job_id=?
+                AND attempt_id IS ? LIMIT 1""",
+                (event_type, job_id, attempt_id),
+            ).fetchone()
+        return (
+            str(row["event_id"])
+            if row
+            else self.event(
+                event_type, job_id=job_id, attempt_id=attempt_id, payload=payload
+            )
+        )
+
     def reserve_quota(self, candidate: str, job_id: str, estimated_tokens: int) -> int:
         with self.connect() as conn:
             cur = conn.execute(
@@ -438,8 +460,8 @@ class Database:
     def model_request_totals(self, attempt_id: int) -> dict[str, Any]:
         with self.connect() as conn:
             row = conn.execute(
-                """SELECT COUNT(*) requests,SUM(actual_input_tokens) input_tokens,
-                SUM(actual_output_tokens) output_tokens,SUM(actual_cost_usd) cost_usd
+                """SELECT COUNT(*) requests,COALESCE(SUM(actual_input_tokens),0) input_tokens,
+                COALESCE(SUM(actual_output_tokens),0) output_tokens,SUM(actual_cost_usd) cost_usd
                 FROM model_requests WHERE attempt_id=?""",
                 (attempt_id,),
             ).fetchone()
@@ -645,6 +667,19 @@ class Database:
                 (resource_key, job_id),
             )
 
+    def renew_resource(
+        self, resource_key: str, job_id: str, owner: str, ttl_seconds: int
+    ) -> bool:
+        import time
+
+        with self.connect() as conn:
+            cur = conn.execute(
+                """UPDATE resource_leases SET expires_at=?
+                WHERE resource_key=? AND job_id=? AND owner=?""",
+                (time.time() + ttl_seconds, resource_key, job_id, owner),
+            )
+            return cur.rowcount == 1
+
     def resource_busy(self, resource_key: str) -> bool:
         import time
 
@@ -721,6 +756,11 @@ class Database:
             ).fetchall()
             for row in rows:
                 job_id = row["id"]
+                ready = conn.execute(
+                    """SELECT id FROM attempts WHERE job_id=? AND status='READY'
+                    ORDER BY attempt_no DESC LIMIT 1""",
+                    (job_id,),
+                ).fetchone()
                 attempt_ids = [
                     int(r[0])
                     for r in conn.execute(
@@ -731,7 +771,11 @@ class Database:
                 count = conn.execute(
                     "SELECT COUNT(*) n FROM attempts WHERE job_id=?", (job_id,)
                 ).fetchone()["n"]
-                state = "FAILED" if int(count) >= max_attempts else "RETRY"
+                state = (
+                    JobState.READY.value
+                    if ready
+                    else ("FAILED" if int(count) >= max_attempts else "RETRY")
+                )
                 conn.execute(
                     """UPDATE attempts SET status='EXECUTOR_FAILED', finished_at=?,
                     error=COALESCE(error,'controller lease expired; recovered after restart'),
@@ -759,11 +803,21 @@ class Database:
                     )
                 conn.execute("DELETE FROM leases WHERE job_id=?", (job_id,))
                 recovered.append(job_id)
+            # A controller can die after persisting READY/terminal state but
+            # before its heartbeat context removes the lease.
+            conn.execute("DELETE FROM leases WHERE expires_at < ?", (now_epoch,))
+            conn.execute(
+                "DELETE FROM resource_leases WHERE expires_at < ?", (now_epoch,)
+            )
         for job_id in recovered:
+            recovered_state = self.get_job(job_id).state.value
             self.event(
                 "JOB_RECOVERED",
                 job_id=job_id,
-                payload={"reason": "controller lease expired"},
+                payload={
+                    "reason": "controller lease expired",
+                    "recovered_state": recovered_state,
+                },
             )
         return recovered
 
@@ -869,6 +923,46 @@ class Database:
                 "UPDATE jobs SET state=?, accepted_commit=?, updated_at=? WHERE id=?",
                 (JobState.ACCEPTED.value, commit, utcnow(), job_id),
             )
+
+    def complete_acceptance(self, job_id: str, attempt_id: int, commit: str) -> None:
+        """Atomically materialize the human decision and its audit events."""
+        import uuid
+
+        now = utcnow()
+        with self.connect() as conn:
+            conn.execute(
+                """INSERT INTO human_feedback(job_id,attempt_id,verdict,feedback,created_at)
+                SELECT ?,?,'ACCEPT',NULL,? WHERE NOT EXISTS (
+                    SELECT 1 FROM human_feedback WHERE job_id=? AND attempt_id=?
+                    AND verdict='ACCEPT')""",
+                (job_id, attempt_id, now, job_id, attempt_id),
+            )
+            conn.execute(
+                "UPDATE jobs SET state=?,accepted_commit=?,updated_at=? WHERE id=?",
+                (JobState.ACCEPTED.value, commit, now, job_id),
+            )
+            for event_type, payload in (
+                ("HUMAN_ACCEPTED", {}),
+                ("COMMIT_CREATED", {"commit": commit}),
+            ):
+                exists = conn.execute(
+                    """SELECT 1 FROM events WHERE event_type=? AND job_id=?
+                    AND attempt_id=?""",
+                    (event_type, job_id, attempt_id),
+                ).fetchone()
+                if not exists:
+                    conn.execute(
+                        """INSERT INTO events(event_id,job_id,attempt_id,event_type,
+                        payload_json,occurred_at) VALUES(?,?,?,?,?,?)""",
+                        (
+                            f"evt-{uuid.uuid4().hex}",
+                            job_id,
+                            attempt_id,
+                            event_type,
+                            json.dumps(payload),
+                            now,
+                        ),
+                    )
 
     def list_jobs(self, limit: int = 50) -> list[sqlite3.Row]:
         with self.connect() as conn:
@@ -1037,8 +1131,22 @@ class Database:
     ) -> None:
         with self.connect() as conn:
             conn.execute(
-                "INSERT INTO human_feedback(job_id, attempt_id, verdict, feedback, created_at) VALUES (?, ?, ?, ?, ?)",
-                (job_id, attempt_id, verdict, feedback, utcnow()),
+                """INSERT INTO human_feedback(job_id, attempt_id, verdict, feedback, created_at)
+                SELECT ?,?,?,?,? WHERE NOT EXISTS (
+                    SELECT 1 FROM human_feedback WHERE job_id=? AND attempt_id IS ? AND verdict=?
+                    AND COALESCE(feedback,'')=COALESCE(?,'')
+                )""",
+                (
+                    job_id,
+                    attempt_id,
+                    verdict,
+                    feedback,
+                    utcnow(),
+                    job_id,
+                    attempt_id,
+                    verdict,
+                    feedback,
+                ),
             )
 
     def feedback_text(self, job_id: str) -> str:
@@ -1090,6 +1198,15 @@ class Database:
                 "snapshot": d.snapshot,
             },
         )
+
+    def scheduler_decision(self, job_id: str, attempt_no: int) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """SELECT * FROM scheduler_decisions WHERE job_id=? AND attempt_no=?
+                ORDER BY id LIMIT 1""",
+                (job_id, attempt_no),
+            ).fetchone()
+        return dict(row) if row else None
 
     def candidate_stats(
         self,

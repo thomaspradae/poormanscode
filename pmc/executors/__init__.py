@@ -14,4 +14,10 @@ def build_executor(name: str):
     raise ValueError(f"unknown executor: {name}")
 
 
-__all__ = ["Executor", "BashExecutor", "OpenHandsExecutor", "JulesExecutor", "build_executor"]
+__all__ = [
+    "Executor",
+    "BashExecutor",
+    "OpenHandsExecutor",
+    "JulesExecutor",
+    "build_executor",
+]

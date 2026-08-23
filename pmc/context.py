@@ -20,8 +20,9 @@ def _terms(text: str) -> set[str]:
     return {x.lower() for x in re.findall(r"[A-Za-z_][A-Za-z0-9_-]{2,}", text)}
 
 
-def build_context_bundle(repo: Path, request: str, *, baseline: str | None = None,
-                         limit: int = 24_000) -> ContextBundle:
+def build_context_bundle(
+    repo: Path, request: str, *, baseline: str | None = None, limit: int = 24_000
+) -> ContextBundle:
     """Build bounded, reproducible repository context without sending the whole repo."""
     files = [p for p in git(repo, "ls-files").stdout.splitlines() if p]
     terms = _terms(request)
@@ -53,13 +54,21 @@ def build_context_bundle(repo: Path, request: str, *, baseline: str | None = Non
         snippets.append(f"--- {name} ---\n{body}")
     if snippets:
         sections.append("LIKELY RELEVANT FILE EXCERPTS:\n" + "\n\n".join(snippets))
-    dependency_names = {"pyproject.toml", "requirements.txt", "package.json", "Cargo.toml",
-                        "Packages/manifest.json", "Packages/packages-lock.json"}
+    dependency_names = {
+        "pyproject.toml",
+        "requirements.txt",
+        "package.json",
+        "Cargo.toml",
+        "Packages/manifest.json",
+        "Packages/packages-lock.json",
+    }
     dependencies = [name for name in files if name in dependency_names]
     if dependencies:
         dep_text = []
         for name in dependencies:
-            dep_text.append(f"--- {name} ---\n" + (repo / name).read_text(errors="replace")[:4000])
+            dep_text.append(
+                f"--- {name} ---\n" + (repo / name).read_text(errors="replace")[:4000]
+            )
         sections.append("DEPENDENCY MANIFESTS:\n" + "\n\n".join(dep_text))
     previous_diff = ""
     if baseline:
@@ -75,7 +84,9 @@ def build_context_bundle(repo: Path, request: str, *, baseline: str | None = Non
         "previous_diff_hash": stable_hash(previous_diff) if previous_diff else None,
         "limit": limit,
     }
-    return ContextBundle(content, manifest, stable_hash({"content": content, "manifest": manifest}))
+    return ContextBundle(
+        content, manifest, stable_hash({"content": content, "manifest": manifest})
+    )
 
 
 def build_context_packet(repo: Path, request: str, *, limit: int = 24_000) -> str:

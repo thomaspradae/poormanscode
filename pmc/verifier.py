@@ -17,29 +17,49 @@ SECRET_PATTERNS = [
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{30,}\b"),
     re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
-    re.compile(r"(?i)\b(?:api[_-]?key|secret|password|token)\s*[:=]\s*['\"][^'\"]{12,}['\"]"),
+    re.compile(
+        r"(?i)\b(?:api[_-]?key|secret|password|token)\s*[:=]\s*['\"][^'\"]{12,}['\"]"
+    ),
 ]
 
 
-def _run(name: str, command: str, cwd: Path, timeout: int,
-         sandbox_name: str = "guarded") -> CommandResult:
+def _run(
+    name: str, command: str, cwd: Path, timeout: int, sandbox_name: str = "guarded"
+) -> CommandResult:
     started = time.monotonic()
     try:
-        p = build_sandbox(sandbox_name).run(
-            cwd, command, env=scrubbed_environment(), network=False,
+        sandbox = build_sandbox(sandbox_name)
+        # Verifiers do not receive secrets. Use no-network when enforceable;
+        # otherwise explicitly run with full network rather than overclaiming.
+        network = not sandbox.supports_network_policy("none")
+        p = sandbox.run(
+            cwd,
+            command,
+            env=scrubbed_environment(),
+            network=network,
             limits=SandboxLimits(wall_seconds=timeout, cpu_seconds=max(1, timeout - 5)),
         )
-        return CommandResult(name, command, p.returncode, time.monotonic() - started, p.stdout, p.stderr)
+        return CommandResult(
+            name, command, p.returncode, time.monotonic() - started, p.stdout, p.stderr
+        )
     except subprocess.TimeoutExpired as exc:
-        out = exc.stdout.decode() if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-        err = exc.stderr.decode() if isinstance(exc.stderr, bytes) else (exc.stderr or "")
-        return CommandResult(name, command, 124, time.monotonic() - started, out, err + "\nTIMEOUT")
+        out = (
+            exc.stdout.decode() if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        )
+        err = (
+            exc.stderr.decode() if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        )
+        return CommandResult(
+            name, command, 124, time.monotonic() - started, out, err + "\nTIMEOUT"
+        )
 
 
 def _matches_any(path: str, patterns: list[str]) -> bool:
     normalized = path.replace("\\", "/")
     for p in patterns:
-        if fnmatch.fnmatch(normalized, p) or fnmatch.fnmatch(normalized, p.rstrip("/**")):
+        if fnmatch.fnmatch(normalized, p) or fnmatch.fnmatch(
+            normalized, p.rstrip("/**")
+        ):
             return True
     return False
 
@@ -63,7 +83,8 @@ def _added_diff(worktree: Path, baseline: str) -> str:
 def _secret_scan(diff: str) -> list[str]:
     findings = []
     added = "\n".join(
-        line[1:] for line in diff.splitlines()
+        line[1:]
+        for line in diff.splitlines()
         if line.startswith("+") and not line.startswith("+++")
     )
     for p in SECRET_PATTERNS:
@@ -73,8 +94,9 @@ def _secret_scan(diff: str) -> list[str]:
     return findings
 
 
-def verify(job: Job, worktree: Path, repo_cfg: dict[str, Any],
-           sandbox_name: str = "guarded") -> VerificationResult:
+def verify(
+    job: Job, worktree: Path, repo_cfg: dict[str, Any], sandbox_name: str = "guarded"
+) -> VerificationResult:
     baseline = job.baseline_commit
     if not baseline:
         raise RuntimeError("job has no baseline commit")
@@ -86,12 +108,22 @@ def verify(job: Job, worktree: Path, repo_cfg: dict[str, Any],
         if command:
             commands.append(_run(name, str(command), worktree, timeout, sandbox_name))
 
-    changed = [x for x in git(worktree, "diff", "--name-only", baseline, "--").stdout.splitlines() if x]
+    changed = [
+        x
+        for x in git(
+            worktree, "diff", "--name-only", baseline, "--"
+        ).stdout.splitlines()
+        if x
+    ]
     patch_lines = _patch_lines(worktree, baseline)
     findings: list[str] = []
 
-    max_files = int(job.constraints.get("max_files_changed", repo_cfg.get("max_files_changed", 10)))
-    max_lines = int(job.constraints.get("max_patch_lines", repo_cfg.get("max_patch_lines", 500)))
+    max_files = int(
+        job.constraints.get("max_files_changed", repo_cfg.get("max_files_changed", 10))
+    )
+    max_lines = int(
+        job.constraints.get("max_patch_lines", repo_cfg.get("max_patch_lines", 500))
+    )
     scope_ok = len(changed) <= max_files and patch_lines <= max_lines
     if len(changed) > max_files:
         findings.append(f"changed {len(changed)} files; budget is {max_files}")
@@ -105,18 +137,27 @@ def verify(job: Job, worktree: Path, repo_cfg: dict[str, Any],
             scope_ok = False
             findings.append("changes outside allowed_paths: " + ", ".join(outside))
 
-    protected = list(repo_cfg.get("protected", [])) + list(job.constraints.get("protected", []))
+    protected = list(repo_cfg.get("protected", [])) + list(
+        job.constraints.get("protected", [])
+    )
     protected_hits = [p for p in changed if _matches_any(p, protected)]
     protected_ok = not protected_hits
     if protected_hits:
         findings.append("protected paths changed: " + ", ".join(protected_hits))
 
-    no_new_deps = bool(job.constraints.get("no_new_dependencies", repo_cfg.get("no_new_dependencies", False)))
+    no_new_deps = bool(
+        job.constraints.get(
+            "no_new_dependencies", repo_cfg.get("no_new_dependencies", False)
+        )
+    )
     dependency_files = set(repo_cfg.get("dependency_files", []))
     dep_hits = sorted(dependency_files.intersection(changed)) if no_new_deps else []
     dependencies_ok = not dep_hits
     if dep_hits:
-        findings.append("dependency manifests changed while no_new_dependencies=true: " + ", ".join(dep_hits))
+        findings.append(
+            "dependency manifests changed while no_new_dependencies=true: "
+            + ", ".join(dep_hits)
+        )
 
     diff = _added_diff(worktree, baseline)
     secret_findings = _secret_scan(diff)

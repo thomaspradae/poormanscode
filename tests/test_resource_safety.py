@@ -47,6 +47,20 @@ def test_aggregate_workspace_limits(tmp_path: Path):
     assert "WORKSPACE_LIMIT" in result.stderr
 
 
+def test_workspace_limit_terminates_command_while_it_is_still_running(tmp_path: Path):
+    started = time.monotonic()
+    result = GuardedSandbox().run(
+        tmp_path,
+        "dd if=/dev/zero of=growing bs=1024 count=128 status=none; sleep 30",
+        env={"PATH": "/usr/bin:/bin"},
+        network=True,
+        limits=SandboxLimits(wall_seconds=20, workspace_bytes=32 * 1024),
+    )
+    assert result.returncode == 75
+    assert "WORKSPACE_LIMIT" in result.stderr
+    assert time.monotonic() - started < 5
+
+
 def test_aggregate_artifact_limit(tmp_path: Path):
     reporter = Reporter(tmp_path, max_job_bytes=10)
     reporter.text("job", "a", "12345")

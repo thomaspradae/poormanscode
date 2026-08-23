@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -21,6 +20,7 @@ class ChatReply:
     input_tokens: int | None = None
     output_tokens: int | None = None
     request_id: str | None = None
+    cost_usd: float | None = None
     rate_headers: dict[str, str] = field(default_factory=dict)
     raw: dict[str, Any] | None = None
 
@@ -60,37 +60,28 @@ class OpenAICompatibleClient:
         if extra_body:
             payload.update(extra_body)
         url = f"{self.base_url}/chat/completions"
-        waits = [0, 2, 5, 10, 20]
-        last_response: httpx.Response | None = None
         with httpx.Client(timeout=self.timeout) as client:
-            for i, wait in enumerate(waits):
-                if wait:
-                    time.sleep(wait)
-                response = client.post(url, headers=headers, json=payload)
-                last_response = response
-                if response.status_code < 400:
-                    break
-                transient = response.status_code in {408, 409, 425, 429, 500, 502, 503, 504}
-                if not transient or i == len(waits) - 1:
-                    rate = {k.lower(): v for k, v in response.headers.items()
-                            if k.lower().startswith("x-ratelimit") or k.lower() == "retry-after"}
-                    raise ProviderError(response.status_code, f"provider HTTP {response.status_code}", rate)
-                retry_after = response.headers.get("retry-after")
-                if retry_after:
-                    try:
-                        waits[min(i + 1, len(waits) - 1)] = min(60, float(retry_after))
-                    except ValueError:
-                        pass
-            assert last_response is not None
-            response = last_response
+            # Retries are deliberately controller-visible. A hidden HTTP retry
+            # would consume quota without its own model-request ledger record.
+            response = client.post(url, headers=headers, json=payload)
             if response.status_code >= 400:
-                rate = {k.lower(): v for k, v in response.headers.items()
-                        if k.lower().startswith("x-ratelimit") or k.lower() == "retry-after"}
-                raise ProviderError(response.status_code, f"provider HTTP {response.status_code}", rate)
+                rate = {
+                    k.lower(): v
+                    for k, v in response.headers.items()
+                    if k.lower().startswith("x-ratelimit") or k.lower() == "retry-after"
+                }
+                raise ProviderError(
+                    response.status_code, f"provider HTTP {response.status_code}", rate
+                )
             data = response.json()
         choice = data["choices"][0]
         content = choice.get("message", {}).get("content") or ""
         usage = data.get("usage") or {}
+        raw_cost = usage.get("cost") or data.get("cost")
+        try:
+            cost = float(raw_cost) if raw_cost is not None else None
+        except (TypeError, ValueError):
+            cost = None
         rate_headers = {
             k.lower(): v
             for k, v in response.headers.items()
@@ -101,6 +92,7 @@ class OpenAICompatibleClient:
             input_tokens=usage.get("prompt_tokens") or usage.get("input_tokens"),
             output_tokens=usage.get("completion_tokens") or usage.get("output_tokens"),
             request_id=response.headers.get("x-request-id") or data.get("id"),
+            cost_usd=cost,
             rate_headers=rate_headers,
             raw=data,
         )

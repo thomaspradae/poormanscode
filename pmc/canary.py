@@ -40,7 +40,9 @@ class _Handler(BaseHTTPRequestHandler):
         return
 
 
-def run_canary(verifier_sandbox: str = "guarded") -> dict[str, object]:
+def run_canary(
+    verifier_sandbox: str = "guarded", builder_sandbox: str = "guarded"
+) -> dict[str, object]:
     with tempfile.TemporaryDirectory(prefix="pmc-canary-") as td:
         root = Path(td)
         repo = root / "repo"
@@ -68,8 +70,8 @@ def run_canary(verifier_sandbox: str = "guarded") -> dict[str, object]:
                 model="canary-model",
                 provider="local-canary",
                 base_url=f"http://127.0.0.1:{server.server_port}/v1",
-                sandbox="guarded",
-                network=True,
+                sandbox=builder_sandbox,
+                network=builder_sandbox == "guarded",
                 max_turns=3,
             )
             cfg = PMCConfig(
@@ -89,18 +91,55 @@ def run_canary(verifier_sandbox: str = "guarded") -> dict[str, object]:
                 raise RuntimeError(f"canary ended in {state}")
             commit = ctl.accept(job.id)
             with ctl.db.connect() as conn:
-                events = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
-                attempts = conn.execute(
-                    "SELECT COUNT(*) FROM attempts WHERE outcome='SUCCESS'"
+                event_rows = conn.execute(
+                    "SELECT * FROM events ORDER BY seq"
+                ).fetchall()
+                attempt = conn.execute(
+                    "SELECT * FROM attempts WHERE outcome='SUCCESS'"
+                ).fetchone()
+                requests = conn.execute(
+                    "SELECT * FROM model_requests WHERE attempt_id=?", (attempt["id"],)
+                ).fetchall()
+                feedback = conn.execute(
+                    "SELECT * FROM human_feedback WHERE job_id=?", (job.id,)
+                ).fetchall()
+                reserved = conn.execute(
+                    "SELECT COUNT(*) FROM quota_reservations WHERE state='RESERVED'"
                 ).fetchone()[0]
+                leases = conn.execute(
+                    "SELECT (SELECT COUNT(*) FROM leases) + "
+                    "(SELECT COUNT(*) FROM resource_leases)"
+                ).fetchone()[0]
+            reconstructed = (
+                bool(requests)
+                and sum((row["actual_input_tokens"] or 0) for row in requests)
+                == (attempt["input_tokens"] or 0)
+                and sum((row["actual_output_tokens"] or 0) for row in requests)
+                == (attempt["output_tokens"] or 0)
+                and len(feedback) == 1
+                and feedback[0]["attempt_id"] == attempt["id"]
+                and reserved == 0
+                and leases == 0
+                and {"HUMAN_ACCEPTED", "COMMIT_CREATED"}
+                <= {row["event_type"] for row in event_rows}
+            )
+            if not reconstructed:
+                raise RuntimeError(
+                    "canary ledger could not reconstruct accepted lifecycle"
+                )
             artifacts = len(list((root / "runs" / job.id).iterdir()))
             return {
                 "state": "ACCEPTED",
                 "commit": commit,
-                "events": events,
-                "successful_attempts": attempts,
+                "events": len(event_rows),
+                "successful_attempts": 1,
+                "model_requests": len(requests),
+                "unreconciled_quota_reservations": reserved,
+                "active_leases": leases,
+                "reconstructable": reconstructed,
                 "audit_artifacts": artifacts,
                 "verifier_sandbox": verifier_sandbox,
+                "builder_sandbox": builder_sandbox,
             }
         finally:
             server.shutdown()
