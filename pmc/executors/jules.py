@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 
 import httpx
@@ -22,6 +23,33 @@ class JulesExecutor:
             timeout=60,
         )
 
+    @staticmethod
+    def _source_for(request: ExecutionRequest) -> str:
+        """Resolve the Jules source from the job repo unless explicitly pinned."""
+        configured = request.candidate.source
+        if configured and configured != "auto":
+            return configured
+
+        from ..gitops import git
+
+        result = git(request.job.repo, "remote", "get-url", "origin", check=False)
+        remote = result.stdout.strip()
+        patterns = (
+            r"^git@github\.com:(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?$",
+            r"^ssh://git@github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?$",
+            r"^https?://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?/?$",
+        )
+        for pattern in patterns:
+            match = re.match(pattern, remote)
+            if match:
+                return (
+                    "sources/github/"
+                    f"{match.group('owner')}/{match.group('repo')}"
+                )
+        raise RuntimeError(
+            "Jules requires a GitHub origin remote or an explicit source override"
+        )
+
     def run(self, request: ExecutionRequest) -> ExecutionResult:
         c = request.candidate
         if request.attempt_no > 1:
@@ -38,17 +66,16 @@ class JulesExecutor:
                     False,
                     error="Jules cannot safely repair an unpushed local patch; use it as a first attempt or push an explicit branch",
                 )
-        if not c.source:
-            return ExecutionResult(False, error="Jules candidate requires source=...")
         if not c.api_key_env:
             return ExecutionResult(False, error="Jules candidate requires api_key_env")
         try:
+            source = self._source_for(request)
             with self._client(c.api_key_env) as client:
                 payload = {
                     "title": f"{request.job.id}: {request.job.request[:80]}",
                     "prompt": request.prompt,
                     "sourceContext": {
-                        "source": c.source,
+                        "source": source,
                         "githubRepoContext": {
                             "startingBranch": request.job.base_branch
                         },
@@ -130,7 +157,7 @@ class JulesExecutor:
                         or bool(remote_base and remote_base.startswith(local_base)),
                     },
                 )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - normalize provider/transport failures
             return ExecutionResult(
                 False,
                 error=f"Jules failed: {type(exc).__name__}: {exc}",

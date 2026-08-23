@@ -76,7 +76,9 @@ enabled = false
 executor = "jules"
 role = "builder"
 api_key_env = "JULES_API_KEY"
-source = "sources/github/OWNER/REPO"
+# "auto" derives sources/github/OWNER/REPO from each job repository's origin.
+# Pin an explicit Jules source only for unusual deployments.
+source = "auto"
 quota_group = "jules"
 exploration = false
 first_attempt_only = true
