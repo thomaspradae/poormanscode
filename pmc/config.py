@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import re
+import stat
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,6 +14,7 @@ from .domain import Candidate
 
 
 DEFAULT_CONFIG = Path("~/.config/poormans-code/config.toml").expanduser()
+_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 @dataclass(slots=True)
@@ -34,12 +37,45 @@ def _expand(value: str) -> Path:
     return Path(os.path.expandvars(os.path.expanduser(value))).resolve()
 
 
+def load_secrets_file(path: Path) -> list[str]:
+    """Load literal KEY=VALUE entries without shell evaluation or logging values."""
+    if not path.exists():
+        return []
+    info = path.stat()
+    if info.st_uid != os.getuid():
+        raise PermissionError(f"secrets file must be owned by the current user: {path}")
+    if stat.S_IMODE(info.st_mode) & 0o077:
+        raise PermissionError(f"secrets file must have mode 600: {path}")
+    loaded: list[str] = []
+    for number, original in enumerate(path.read_text().splitlines(), 1):
+        line = original.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if "=" not in line:
+            raise ValueError(f"invalid secrets.env line {number}: expected KEY=VALUE")
+        name, value = line.split("=", 1)
+        name = name.strip()
+        value = value.strip()
+        if not _ENV_NAME.fullmatch(name):
+            raise ValueError(
+                f"invalid environment-variable name on secrets.env line {number}"
+            )
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        os.environ.setdefault(name, value)
+        loaded.append(name)
+    return loaded
+
+
 def load_config(path: Path | None = None) -> PMCConfig:
     path = path or Path(os.getenv("PMC_CONFIG", str(DEFAULT_CONFIG))).expanduser()
     if not path.exists():
         raise FileNotFoundError(
             f"PMC config not found: {path}. Copy examples/config.toml there first."
         )
+    load_secrets_file(path.parent / "secrets.env")
     raw = tomllib.loads(path.read_text())
     core = raw.get("pmc", {})
     candidates = [Candidate.from_mapping(x) for x in raw.get("candidates", [])]

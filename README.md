@@ -78,6 +78,11 @@ Early on the scheduler is intentionally simple. `pmc stats` is the truth. More s
 
 The controller strips secrets from child-process environments. `BashExecutor` should run with `sandbox = "bwrap"`; that backend exposes only system runtimes and the task worktree, denies network when configured, and applies process/memory plus continuously monitored workspace limits. It does not mount the controller's home. OpenHands should run in its own sandbox/Agent Server for untrusted jobs. No executor is allowed to decide that its own work passed verification.
 
+Provider credentials may be stored as literal `KEY=VALUE` entries in
+`~/.config/poormans-code/secrets.env`. PMC loads that file controller-side only and
+refuses it unless it is owned by the current user with mode `600`. Values are never
+copied into worktrees or child-shell environments.
+
 ## State lifecycle
 
 `QUEUED -> RUNNING -> VERIFYING -> REVIEWING -> READY_FOR_REVIEW -> ACCEPTED`
