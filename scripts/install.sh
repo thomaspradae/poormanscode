@@ -6,6 +6,8 @@ python3 -m venv "$repo_dir/.venv"
 mkdir -p "$HOME/.local/bin"
 ln -sfn "$repo_dir/.venv/bin/pmc" "$HOME/.local/bin/pmc"
 ln -sfn "$repo_dir/.venv/bin/pmc-add-keys" "$HOME/.local/bin/pmc-add-keys"
+ln -sfn "$repo_dir/.venv/bin/pmc-add-nvidia-key" "$HOME/.local/bin/pmc-add-nvidia-key"
 "$repo_dir/.venv/bin/pmc" init-config
 echo "Installed pmc at $HOME/.local/bin/pmc"
 echo "Installed pmc-add-keys at $HOME/.local/bin/pmc-add-keys"
+echo "Installed pmc-add-nvidia-key at $HOME/.local/bin/pmc-add-nvidia-key"

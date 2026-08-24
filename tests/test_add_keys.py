@@ -68,3 +68,21 @@ def test_empty_value_leaves_file_unchanged(tmp_path: Path):
         add_provider_keys(path, reader=lambda _: "", output=io.StringIO())
 
     assert path.read_text() == "EXISTING=untouched\n"
+
+
+def test_single_nvidia_key_uses_next_available_number(tmp_path: Path):
+    path = tmp_path / "secrets.env"
+    path.write_text("NVIDIA_API_KEY_1=preserved\n")
+    path.chmod(0o600)
+    output = io.StringIO()
+
+    added = add_provider_keys(
+        path,
+        reader=lambda _: "new-nvidia-secret",
+        output=output,
+        requests=(("NVIDIA_API_KEY", "Additional NVIDIA key", 1, 1),),
+    )
+
+    assert added == ["NVIDIA_API_KEY_2"]
+    assert path.read_text().startswith("NVIDIA_API_KEY_1=preserved\n")
+    assert "new-nvidia-secret" not in output.getvalue()

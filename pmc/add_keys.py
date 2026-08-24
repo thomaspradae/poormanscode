@@ -41,10 +41,13 @@ def _next_names(
     return names
 
 
-def planned_names(contents: str) -> list[tuple[str, str]]:
+def planned_names(
+    contents: str,
+    requests: tuple[tuple[str, str, int, int], ...] = _REQUESTS,
+) -> list[tuple[str, str]]:
     existing = set(_ASSIGNMENT.findall(contents))
     planned: list[tuple[str, str]] = []
-    for base, label, count, first_number in _REQUESTS:
+    for base, label, count, first_number in requests:
         names = _next_names(existing, base, count, first_number)
         for index, name in enumerate(names, 1):
             prompt = label if count == 1 else f"{label} {index}"
@@ -58,13 +61,14 @@ def add_provider_keys(
     *,
     reader: Callable[[str], str] = getpass.getpass,
     output: TextIO | None = None,
+    requests: tuple[tuple[str, str, int, int], ...] = _REQUESTS,
 ) -> list[str]:
     import sys
 
     output = output or sys.stdout
     path = path.expanduser()
     original = path.read_text() if path.exists() else ""
-    additions = planned_names(original)
+    additions = planned_names(original, requests)
 
     print("Adding PMC provider credentials.", file=output)
     print("Values will not be displayed.\n", file=output)
@@ -109,6 +113,20 @@ def add_provider_keys(
 def main() -> int:
     try:
         add_provider_keys()
+    except (EOFError, KeyboardInterrupt):
+        print("\nCancelled. No credentials were changed.")
+        return 130
+    except ValueError as exc:
+        print(f"Credential collection failed: {exc}")
+        return 2
+    return 0
+
+
+def nvidia_main() -> int:
+    try:
+        add_provider_keys(
+            requests=(("NVIDIA_API_KEY", "Additional NVIDIA key", 1, 1),)
+        )
     except (EOFError, KeyboardInterrupt):
         print("\nCancelled. No credentials were changed.")
         return 130
