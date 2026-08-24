@@ -29,8 +29,16 @@ SHELL_TOOL = {
         "description": "Run a bash command inside the isolated repository worktree.",
         "parameters": {
             "type": "object",
-            "properties": {"command": {"type": "string"}},
-            "required": ["command"],
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "The bash command to execute (preferred field).",
+                },
+                "cmd": {
+                    "type": "string",
+                    "description": "Compatibility alias for command.",
+                },
+            },
             "additionalProperties": False,
         },
     },

@@ -65,7 +65,7 @@ tool_protocol_retries = 2
 # colliding in a single worker instance.
 [[candidates]]
 name = "groq-oss120-ofi1-node"
-version = "1"
+version = "2"
 provider = "groq"
 enabled = false
 executor = "bash"
@@ -73,6 +73,8 @@ role = "builder"
 model = "openai/gpt-oss-120b"
 base_url = "https://api.groq.com/openai/v1"
 max_turns = 30
+max_tokens = 1800
+context_limit = 14000
 sandbox = "remote-lxd"
 network = false
 resource_class = "ofi1-lxd-node24"
