@@ -160,6 +160,13 @@ class Controller:
                 ):
                     already_present.append(commit)
                     continue
+                cherry = git(wt, "cherry", "HEAD", commit, check=False)
+                if cherry.returncode == 0 and cherry.stdout.lstrip().startswith("-"):
+                    # The accepted commit may have been human-integrated via
+                    # cherry-pick and therefore have a different SHA but the
+                    # same patch identity.
+                    already_present.append(commit)
+                    continue
                 result = git(wt, "cherry-pick", commit, check=False)
                 if result.returncode != 0:
                     git(wt, "cherry-pick", "--abort", check=False)
