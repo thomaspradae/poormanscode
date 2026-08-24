@@ -381,7 +381,10 @@ class Controller:
                 )
             prompt_feedback = "\n\n".join(x for x in [prior_feedback, *failures] if x)
             context_bundle = build_context_bundle(
-                job.worktree, job.request, baseline=job.baseline_commit
+                job.worktree,
+                job.request,
+                baseline=job.baseline_commit,
+                limit=int(candidate.extra.get("context_limit", 24_000)),
             )
             prompt = builder_prompt(
                 job,

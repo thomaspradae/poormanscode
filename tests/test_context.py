@@ -37,3 +37,19 @@ def test_established_repo_does_not_get_bootstrap_preflight(tmp_path: Path):
 
     assert bundle.manifest["repository_state"] == "ESTABLISHED"
     assert "BOOTSTRAP PREFLIGHT" not in bundle.content
+
+
+def test_context_does_not_excerpt_lockfiles_or_binary_assets(tmp_path: Path):
+    _git(tmp_path, "init", "-q", "-b", "main")
+    _git(tmp_path, "config", "user.email", "test@example.com")
+    _git(tmp_path, "config", "user.name", "Test")
+    (tmp_path / "package-lock.json").write_text('{"config": "large generated data"}')
+    (tmp_path / "config.ico").write_bytes(b"\x00\x01config")
+    (tmp_path / "config.ts").write_text("export const config = true;\n")
+    _git(tmp_path, "add", ".")
+    _git(tmp_path, "commit", "-qm", "init")
+
+    bundle = build_context_bundle(tmp_path, "Implement config")
+
+    assert bundle.manifest["excerpt_files"] == ["config.ts"]
+    assert "large generated data" not in bundle.content

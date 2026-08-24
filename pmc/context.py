@@ -9,6 +9,28 @@ from .config import read_agents
 from .gitops import git
 from .versioning import CONTEXT_BUILDER_VERSION, stable_hash
 
+_NON_SOURCE_EXCERPTS = {
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "Cargo.lock",
+}
+_BINARY_SUFFIXES = {
+    ".ico",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".woff",
+    ".woff2",
+    ".pdf",
+}
+
+
+def _can_excerpt(name: str) -> bool:
+    return name not in _NON_SOURCE_EXCERPTS and Path(name).suffix.lower() not in _BINARY_SUFFIXES
+
 
 @dataclass(frozen=True, slots=True)
 class ContextBundle:
@@ -67,6 +89,8 @@ def build_context_bundle(
     for score, name in ranked:
         if score <= 0 or len(snippets) >= 8:
             break
+        if not _can_excerpt(name):
+            continue
         path = repo / name
         try:
             if path.stat().st_size > 100_000:
@@ -104,7 +128,9 @@ def build_context_bundle(
         "tracked_files": files[:400],
         "repository_state": repo_state,
         "substantive_files": substantive_files[:400],
-        "excerpt_files": [name for score, name in ranked[:8] if score > 0],
+        "excerpt_files": [
+            name for score, name in ranked if score > 0 and _can_excerpt(name)
+        ][:8],
         "dependency_files": dependencies,
         "previous_diff_hash": stable_hash(previous_diff) if previous_diff else None,
         "limit": limit,
