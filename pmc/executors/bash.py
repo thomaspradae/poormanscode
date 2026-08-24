@@ -454,9 +454,11 @@ class BashExecutor:
                         outcome=Outcome.POLICY_FAILURE,
                         raw_metrics={"turns": transcript},
                     )
+                observation_chars = int(c.extra.get("observation_chars", 12_000))
                 observation = (
                     f"exit={p.returncode} duration={elapsed:.2f}s\n"
-                    f"STDOUT:\n{p.stdout[-12000:]}\nSTDERR:\n{p.stderr[-12000:]}"
+                    f"STDOUT:\n{p.stdout[-observation_chars:]}\n"
+                    f"STDERR:\n{p.stderr[-observation_chars:]}"
                 )
                 transcript.append(
                     {
