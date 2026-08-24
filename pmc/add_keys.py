@@ -134,3 +134,17 @@ def nvidia_main() -> int:
         print(f"Credential collection failed: {exc}")
         return 2
     return 0
+
+
+def gemini_main() -> int:
+    try:
+        add_provider_keys(
+            requests=(("GEMINI_API_KEY", "Additional Gemini key", 2, 2),)
+        )
+    except (EOFError, KeyboardInterrupt):
+        print("\nCancelled. No credentials were changed.")
+        return 130
+    except ValueError as exc:
+        print(f"Credential collection failed: {exc}")
+        return 2
+    return 0

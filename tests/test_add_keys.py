@@ -86,3 +86,21 @@ def test_single_nvidia_key_uses_next_available_number(tmp_path: Path):
     assert added == ["NVIDIA_API_KEY_2"]
     assert path.read_text().startswith("NVIDIA_API_KEY_1=preserved\n")
     assert "new-nvidia-secret" not in output.getvalue()
+
+
+def test_two_gemini_keys_start_at_two_and_skip_collisions(tmp_path: Path):
+    path = tmp_path / "secrets.env"
+    path.write_text("GEMINI_API_KEY_2=preserved\n")
+    path.chmod(0o600)
+    supplied = iter(("gemini-secret-a", "gemini-secret-b"))
+    output = io.StringIO()
+
+    added = add_provider_keys(
+        path,
+        reader=lambda _: next(supplied),
+        output=output,
+        requests=(("GEMINI_API_KEY", "Additional Gemini key", 2, 2),),
+    )
+
+    assert added == ["GEMINI_API_KEY_3", "GEMINI_API_KEY_4"]
+    assert "gemini-secret" not in output.getvalue()
