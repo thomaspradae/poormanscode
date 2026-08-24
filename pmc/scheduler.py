@@ -31,17 +31,29 @@ class Scheduler:
         exploration_rate: float,
         min_samples: int,
         capability_registry=None,
+        require_model_conformance: bool = False,
     ):
         self.db = db
         self.exploration_rate = exploration_rate
         self.min_samples = min_samples
         self.capability_registry = capability_registry
+        self.require_model_conformance = require_model_conformance
 
     def available(
         self, c: Candidate, universe: list[Candidate] | None = None
     ) -> Availability:
         if not c.enabled:
             return Availability(False, "disabled")
+        if c.provider:
+            provider_ok, provider_reason = self.db.provider_availability(c.provider)
+            if not provider_ok:
+                return Availability(False, provider_reason)
+        if self.require_model_conformance:
+            conformance = self.db.model_conformance(c)
+            if not conformance:
+                return Availability(False, "model conformance unknown")
+            if conformance["status"] != "AVAILABLE":
+                return Availability(False, f"model {conformance['status'].lower()}")
         quota_ok, quota_reason = self.db.quota_availability(c.name)
         if not quota_ok:
             return Availability(False, quota_reason)

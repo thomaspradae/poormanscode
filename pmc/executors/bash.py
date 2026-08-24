@@ -9,6 +9,7 @@ from typing import Any
 
 import httpx
 
+from ..accounting import BudgetExceeded
 from ..domain import ExecutionRequest, ExecutionResult, Outcome
 from ..providers import OpenAICompatibleClient, ProviderError
 from ..sandbox import SandboxLimits, build_sandbox, scrubbed_environment
@@ -167,6 +168,7 @@ class BashExecutor:
                         ticket = request.accounting.reserve(
                             turn + 1, messages, int(c.extra.get("max_tokens", 4096))
                         )
+                        client.api_key_env = ticket.api_key_env
                     reply = client.chat(
                         model=c.model,
                         messages=messages,
@@ -182,6 +184,12 @@ class BashExecutor:
                     if ticket:
                         request.accounting.succeed(ticket, reply)
                     break
+                except BudgetExceeded as exc:
+                    return ExecutionResult(
+                        False, error=str(exc), outcome=Outcome.POLICY_FAILURE,
+                        input_tokens=in_tokens, output_tokens=out_tokens,
+                        cost_usd=cost_usd,
+                    )
                 except ProviderError as exc:
                     if ticket:
                         request.accounting.fail(ticket, exc)

@@ -40,6 +40,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     worktree TEXT,
     baseline_commit TEXT,
     accepted_commit TEXT,
+    complexity TEXT NOT NULL DEFAULT 'STANDARD',
+    risk TEXT NOT NULL DEFAULT 'MEDIUM',
+    budget_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -242,6 +245,28 @@ CREATE TABLE IF NOT EXISTS research_requests (
     search_queries INTEGER, input_tokens INTEGER, output_tokens INTEGER,
     cost_usd REAL, error TEXT, created_at TEXT NOT NULL, finished_at TEXT
 );
+CREATE TABLE IF NOT EXISTS provider_credentials (
+    credential_id TEXT PRIMARY KEY, provider TEXT NOT NULL, api_key_env TEXT NOT NULL,
+    enabled INTEGER NOT NULL, health TEXT NOT NULL DEFAULT 'UNKNOWN',
+    quota_scope_id TEXT, quota_scope_confidence TEXT NOT NULL DEFAULT 'UNKNOWN',
+    concurrency_limit INTEGER NOT NULL DEFAULT 1, cooldown_until REAL,
+    requests_remaining INTEGER, tokens_remaining INTEGER, reset_at TEXT,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0, last_success_at TEXT,
+    last_failure_at TEXT, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS credential_reservations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, credential_id TEXT NOT NULL REFERENCES provider_credentials(credential_id),
+    job_id TEXT NOT NULL, attempt_id INTEGER, estimated_tokens INTEGER NOT NULL,
+    state TEXT NOT NULL, actual_tokens INTEGER, created_at TEXT NOT NULL, reconciled_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_credential_reservations_active ON credential_reservations(credential_id,state);
+CREATE TABLE IF NOT EXISTS model_conformance (
+    candidate TEXT NOT NULL, version TEXT NOT NULL, status TEXT NOT NULL,
+    generation_ok INTEGER NOT NULL DEFAULT 0, tool_ok INTEGER NOT NULL DEFAULT 0,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0, adapter_version TEXT,
+    prompt_version TEXT, details_json TEXT NOT NULL DEFAULT '{}', checked_at TEXT NOT NULL,
+    PRIMARY KEY(candidate,version)
+);
 """
 
 
@@ -270,6 +295,16 @@ class Database:
                 "policy_version": "TEXT",
                 "snapshot_json": "TEXT",
             },
+            "jobs": {
+                "complexity": "TEXT NOT NULL DEFAULT 'STANDARD'",
+                "risk": "TEXT NOT NULL DEFAULT 'MEDIUM'",
+                "budget_json": "TEXT NOT NULL DEFAULT '{}'",
+            },
+            "quota_reservations": {
+                "credential_id": "TEXT",
+                "quota_scope_id": "TEXT",
+            },
+            "model_requests": {"credential_id": "TEXT"},
         }
         for table, columns in additions.items():
             existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
@@ -379,17 +414,272 @@ class Database:
             )
         )
 
-    def reserve_quota(self, candidate: str, job_id: str, estimated_tokens: int) -> int:
+    def register_provider_credentials(self, credentials: list[Any]) -> None:
+        now = utcnow()
+        with self.connect() as conn:
+            for credential in credentials:
+                conn.execute(
+                    """INSERT INTO provider_credentials
+                    (credential_id,provider,api_key_env,enabled,health,quota_scope_id,
+                     quota_scope_confidence,concurrency_limit,updated_at)
+                    VALUES(?,?,?,?, 'UNKNOWN',?,?,?,?)
+                    ON CONFLICT(credential_id) DO UPDATE SET
+                    provider=excluded.provider,api_key_env=excluded.api_key_env,
+                    enabled=excluded.enabled,quota_scope_id=excluded.quota_scope_id,
+                    quota_scope_confidence=excluded.quota_scope_confidence,
+                    concurrency_limit=excluded.concurrency_limit,updated_at=excluded.updated_at""",
+                    (
+                        credential.id,
+                        credential.provider,
+                        credential.api_key_env,
+                        int(credential.enabled),
+                        credential.quota_scope_id,
+                        credential.quota_scope_confidence,
+                        credential.concurrency_limit,
+                        now,
+                    ),
+                )
+
+    def reserve_provider_credential(
+        self, provider: str, job_id: str, attempt_id: int, estimated_tokens: int
+    ) -> dict[str, Any]:
+        import os
+        import time
+
+        now_epoch = time.time()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """SELECT pc.*,
+                (SELECT COUNT(*) FROM credential_reservations cr
+                 WHERE cr.credential_id=pc.credential_id AND cr.state='RESERVED') active,
+                (SELECT COUNT(*) FROM credential_reservations cr
+                 WHERE cr.credential_id=pc.credential_id) used
+                ,(SELECT COUNT(*) FROM credential_reservations cr
+                  JOIN provider_credentials sibling ON sibling.credential_id=cr.credential_id
+                  WHERE cr.state='RESERVED' AND pc.quota_scope_id IS NOT NULL
+                  AND sibling.quota_scope_id=pc.quota_scope_id) active_scope
+                FROM provider_credentials pc WHERE provider=? AND enabled=1
+                AND health NOT IN ('AUTH_FAILED','DISABLED','QUOTA_EXHAUSTED')
+                AND (cooldown_until IS NULL OR cooldown_until<=?)
+                ORDER BY active ASC, used ASC, credential_id ASC""",
+                (provider, now_epoch),
+            ).fetchall()
+            row = next(
+                (
+                    item
+                    for item in rows
+                    if item["active"] < item["concurrency_limit"]
+                    and (
+                        item["quota_scope_confidence"] == "UNKNOWN"
+                        or item["active_scope"] < item["concurrency_limit"]
+                    )
+                    and os.getenv(item["api_key_env"])
+                ),
+                None,
+            )
+            if row is None:
+                raise RuntimeError(f"no available credential for provider {provider}")
+            cur = conn.execute(
+                """INSERT INTO credential_reservations
+                (credential_id,job_id,attempt_id,estimated_tokens,state,created_at)
+                VALUES(?,?,?,?, 'RESERVED',?)""",
+                (row["credential_id"], job_id, attempt_id, estimated_tokens, utcnow()),
+            )
+            return {
+                "reservation_id": int(cur.lastrowid),
+                "credential_id": row["credential_id"],
+                "api_key_env": row["api_key_env"],
+                "quota_scope_id": row["quota_scope_id"],
+            }
+
+    def reconcile_provider_credential(
+        self,
+        reservation_id: int,
+        *,
+        status_code: int | None,
+        actual_tokens: int,
+        headers: dict[str, Any],
+    ) -> None:
+        import time
+
+        retry_after = headers.get("retry-after")
+        try:
+            cooldown = time.time() + float(retry_after) if retry_after else None
+        except (TypeError, ValueError):
+            cooldown = None
+        if status_code in {401, 403}:
+            health = "AUTH_FAILED"
+        elif status_code == 429:
+            health = "RATE_LIMITED"
+        elif status_code is not None and status_code >= 500:
+            health = "DEGRADED"
+        else:
+            health = "AVAILABLE"
+        with self.connect() as conn:
+            row = conn.execute(
+                """SELECT cr.credential_id,pc.quota_scope_id,pc.quota_scope_confidence
+                FROM credential_reservations cr JOIN provider_credentials pc
+                ON pc.credential_id=cr.credential_id WHERE cr.id=?""",
+                (reservation_id,),
+            ).fetchone()
+            if not row:
+                return
+            conn.execute(
+                """UPDATE credential_reservations SET state='RECONCILED',actual_tokens=?,reconciled_at=? WHERE id=?""",
+                (actual_tokens, utcnow(), reservation_id),
+            )
+            conn.execute(
+                """UPDATE provider_credentials SET health=?,cooldown_until=?,
+                requests_remaining=?,tokens_remaining=?,reset_at=?,
+                consecutive_failures=CASE WHEN ?='AVAILABLE' THEN 0 ELSE consecutive_failures+1 END,
+                last_success_at=CASE WHEN ?='AVAILABLE' THEN ? ELSE last_success_at END,
+                last_failure_at=CASE WHEN ?!='AVAILABLE' THEN ? ELSE last_failure_at END,
+                updated_at=? WHERE credential_id=?""",
+                (
+                    health,
+                    cooldown,
+                    _header_int(headers, "x-ratelimit-remaining-requests"),
+                    _header_int(headers, "x-ratelimit-remaining-tokens"),
+                    headers.get("x-ratelimit-reset") or retry_after,
+                    health,
+                    health,
+                    utcnow(),
+                    health,
+                    utcnow(),
+                    utcnow(),
+                    row["credential_id"],
+                ),
+            )
+            if (
+                row["quota_scope_id"]
+                and health in {"RATE_LIMITED", "QUOTA_EXHAUSTED"}
+                and row["quota_scope_confidence"] != "UNKNOWN"
+            ):
+                conn.execute(
+                    """UPDATE provider_credentials SET health=?,cooldown_until=?,reset_at=?,updated_at=?
+                    WHERE quota_scope_id=? AND enabled=1""",
+                    (health, cooldown, headers.get("x-ratelimit-reset") or retry_after,
+                     utcnow(), row["quota_scope_id"]),
+                )
+
+    def provider_availability(self, provider: str) -> tuple[bool, str]:
+        import os
+        import time
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM provider_credentials WHERE provider=? AND enabled=1",
+                (provider,),
+            ).fetchall()
+        if not rows:
+            return True, "legacy candidate credential"
+        usable = [
+            row
+            for row in rows
+            if row["health"] not in {"AUTH_FAILED", "DISABLED", "QUOTA_EXHAUSTED"}
+            and (not row["cooldown_until"] or row["cooldown_until"] <= time.time())
+            and os.getenv(row["api_key_env"])
+        ]
+        return (True, "") if usable else (False, "provider credential pool unavailable")
+
+    def provider_credential_env(self, provider: str) -> str | None:
+        """Return an eligible secret reference, never the secret value."""
+        import os
+        import time
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT * FROM provider_credentials WHERE provider=? AND enabled=1
+                AND health NOT IN ('AUTH_FAILED','DISABLED','QUOTA_EXHAUSTED')
+                ORDER BY consecutive_failures, credential_id""", (provider,)
+            ).fetchall()
+        for row in rows:
+            if (not row["cooldown_until"] or row["cooldown_until"] <= time.time()) and os.getenv(row["api_key_env"]):
+                return str(row["api_key_env"])
+        return None
+
+    def provider_capacity(self, provider: str) -> dict[str, Any]:
+        """Scheduler-safe aggregate; contains no secret names or values."""
+        import time
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT credential_id,health,cooldown_until,requests_remaining,
+                tokens_remaining,reset_at,concurrency_limit,quota_scope_id,
+                quota_scope_confidence FROM provider_credentials
+                WHERE provider=? AND enabled=1""", (provider,)
+            ).fetchall()
+            active = conn.execute(
+                """SELECT COUNT(*) FROM credential_reservations cr
+                JOIN provider_credentials pc ON pc.credential_id=cr.credential_id
+                WHERE pc.provider=? AND cr.state='RESERVED'""", (provider,)
+            ).fetchone()[0]
+        usable = sum(
+            1 for row in rows
+            if row["health"] not in {"AUTH_FAILED", "DISABLED", "QUOTA_EXHAUSTED"}
+            and (not row["cooldown_until"] or row["cooldown_until"] <= time.time())
+        )
+        return {
+            "provider": provider, "configured_credentials": len(rows),
+            "usable_credentials": usable, "active_reservations": active,
+            "available_concurrency": max(0, sum(r["concurrency_limit"] for r in rows) - active),
+            "known_requests_remaining": sum(r["requests_remaining"] or 0 for r in rows),
+            "known_tokens_remaining": sum(r["tokens_remaining"] or 0 for r in rows),
+            "earliest_reset": min((r["reset_at"] for r in rows if r["reset_at"]), default=None),
+            "confidence": sorted({r["quota_scope_confidence"] for r in rows}),
+        }
+
+    def set_model_conformance(
+        self, candidate: Any, *, generation_ok: bool, tool_ok: bool,
+        details: dict[str, Any], status: str | None = None,
+    ) -> None:
+        status = status or ("AVAILABLE" if generation_ok and tool_ok else "QUARANTINED")
+        with self.connect() as conn:
+            conn.execute(
+                """INSERT INTO model_conformance(candidate,version,status,generation_ok,tool_ok,
+                consecutive_failures,adapter_version,prompt_version,details_json,checked_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(candidate,version) DO UPDATE SET
+                status=excluded.status,generation_ok=excluded.generation_ok,tool_ok=excluded.tool_ok,
+                consecutive_failures=CASE WHEN excluded.status='AVAILABLE' THEN 0 ELSE model_conformance.consecutive_failures+1 END,
+                adapter_version=excluded.adapter_version,prompt_version=excluded.prompt_version,
+                details_json=excluded.details_json,checked_at=excluded.checked_at""",
+                (
+                    candidate.name,
+                    candidate.version,
+                    status,
+                    int(generation_ok),
+                    int(tool_ok),
+                    0 if status == "AVAILABLE" else 1,
+                    candidate.tool_profile,
+                    candidate.prompt_profile,
+                    json.dumps(details, default=str),
+                    utcnow(),
+                ),
+            )
+
+    def model_conformance(self, candidate: Any) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM model_conformance WHERE candidate=? AND version=?",
+                (candidate.name, candidate.version),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def reserve_quota(self, candidate: str, job_id: str, estimated_tokens: int,
+                      credential_id: str | None = None,
+                      quota_scope_id: str | None = None) -> int:
         with self.connect() as conn:
             cur = conn.execute(
-                "INSERT INTO quota_reservations(candidate,job_id,estimated_tokens,state,created_at) VALUES(?,?,?,'RESERVED',?)",
-                (candidate, job_id, estimated_tokens, utcnow()),
+                """INSERT INTO quota_reservations
+                (candidate,job_id,estimated_tokens,state,created_at,credential_id,quota_scope_id)
+                VALUES(?,?,?,'RESERVED',?,?,?)""",
+                (candidate, job_id, estimated_tokens, utcnow(), credential_id, quota_scope_id),
             )
             reservation_id = int(cur.lastrowid)
         self.event(
             "QUOTA_RESERVED",
             job_id=job_id,
-            payload={"candidate": candidate, "estimated_tokens": estimated_tokens},
+            payload={"candidate": candidate, "estimated_tokens": estimated_tokens,
+                     "credential_id": credential_id, "quota_scope_id": quota_scope_id},
         )
         return reservation_id
 
@@ -404,15 +694,19 @@ class Database:
         estimated_input: int,
         estimated_output: int,
         estimated_cost: float | None,
+        credential_id: str | None = None,
+        quota_scope_id: str | None = None,
     ) -> tuple[int, int]:
         reservation_id = self.reserve_quota(
-            candidate.name, job_id, estimated_input + estimated_output
+            candidate.name, job_id, estimated_input + estimated_output,
+            credential_id, quota_scope_id,
         )
         with self.connect() as conn:
             cur = conn.execute(
                 """INSERT INTO model_requests(request_key,job_id,attempt_id,candidate,provider,model,
-                turn_number,state,estimated_input_tokens,estimated_output_tokens,estimated_cost_usd,created_at)
-                VALUES(?,?,?,?,?,?,?,'RESERVED',?,?,?,?)""",
+                turn_number,state,estimated_input_tokens,estimated_output_tokens,estimated_cost_usd,
+                created_at,credential_id)
+                VALUES(?,?,?,?,?,?,?,'RESERVED',?,?,?,?,?)""",
                 (
                     request_key,
                     job_id,
@@ -425,6 +719,7 @@ class Database:
                     estimated_output,
                     estimated_cost,
                     utcnow(),
+                    credential_id,
                 ),
             )
             model_request_id = int(cur.lastrowid)
@@ -439,6 +734,8 @@ class Database:
                 "model": candidate.model,
                 "estimated_input_tokens": estimated_input,
                 "estimated_output_tokens": estimated_output,
+                "credential_id": credential_id,
+                "quota_scope_id": quota_scope_id,
             },
         )
         return model_request_id, reservation_id
@@ -556,6 +853,17 @@ class Database:
                 COALESCE(SUM(actual_output_tokens),0) output_tokens,SUM(actual_cost_usd) cost_usd
                 FROM model_requests WHERE attempt_id=?""",
                 (attempt_id,),
+            ).fetchone()
+        return dict(row)
+
+    def job_model_request_totals(self, job_id: str) -> dict[str, Any]:
+        with self.connect() as conn:
+            row = conn.execute(
+                """SELECT COUNT(*) requests,
+                COALESCE(SUM(COALESCE(actual_input_tokens,estimated_input_tokens)),0) input_tokens,
+                COALESCE(SUM(COALESCE(actual_output_tokens,estimated_output_tokens)),0) output_tokens,
+                COALESCE(SUM(COALESCE(actual_cost_usd,estimated_cost_usd)),0) cost_usd
+                FROM model_requests WHERE job_id=?""", (job_id,)
             ).fetchone()
         return dict(row)
 
@@ -1124,8 +1432,8 @@ class Database:
                 """INSERT INTO jobs
                 (id, repo, request, base_branch, priority, task_type,
                  acceptance_json, constraints_json, state, worktree,
-                 baseline_commit, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                 baseline_commit, complexity, risk, budget_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     job.id,
                     str(job.repo),
@@ -1138,6 +1446,9 @@ class Database:
                     job.state.value,
                     str(job.worktree) if job.worktree else None,
                     job.baseline_commit,
+                    job.complexity,
+                    job.risk,
+                    json.dumps(asdict(job.budget)),
                     now,
                     now,
                 ),
@@ -1153,6 +1464,7 @@ class Database:
             row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         if not row:
             raise KeyError(f"Unknown job {job_id}")
+        from .domain import BudgetEnvelope
         return Job(
             id=row["id"],
             repo=Path(row["repo"]),
@@ -1165,17 +1477,25 @@ class Database:
             state=JobState(row["state"]),
             worktree=Path(row["worktree"]) if row["worktree"] else None,
             baseline_commit=row["baseline_commit"],
+            complexity=row["complexity"],
+            risk=row["risk"],
+            budget=BudgetEnvelope.from_mapping(json.loads(row["budget_json"] or "{}")),
         )
 
     def update_job(self, job: Job) -> None:
         with self.connect() as conn:
             conn.execute(
-                """UPDATE jobs SET state=?, worktree=?, baseline_commit=?, updated_at=?
+                """UPDATE jobs SET state=?, worktree=?, baseline_commit=?, complexity=?, risk=?,
+                budget_json=?, constraints_json=?, updated_at=?
                 WHERE id=?""",
                 (
                     job.state.value,
                     str(job.worktree) if job.worktree else None,
                     job.baseline_commit,
+                    job.complexity,
+                    job.risk,
+                    json.dumps(asdict(job.budget)),
+                    json.dumps(job.constraints),
                     utcnow(),
                     job.id,
                 ),

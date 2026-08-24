@@ -6,11 +6,11 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 5
-JOB_CONTRACT_VERSION = "1"
+SCHEMA_VERSION = 6
+JOB_CONTRACT_VERSION = "2"
 PROMPT_PROFILE_VERSION = "builder-v4"
 CONTEXT_BUILDER_VERSION = "context-v3"
-SCHEDULER_POLICY_VERSION = "epsilon-greedy-v2"
+SCHEDULER_POLICY_VERSION = "provider-pool-budget-v3"
 VERIFIER_VERSION = "deterministic-v2"
 TOOLCHAIN_PROFILE_VERSION = "toolchains-v1"
 

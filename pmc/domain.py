@@ -6,6 +6,36 @@ from pathlib import Path
 from typing import Any
 
 
+@dataclass(frozen=True, slots=True)
+class ProviderCredential:
+    id: str
+    provider: str
+    api_key_env: str
+    enabled: bool = True
+    quota_scope_id: str | None = None
+    quota_scope_confidence: str = "UNKNOWN"
+    concurrency_limit: int = 1
+
+
+@dataclass(frozen=True, slots=True)
+class BudgetEnvelope:
+    name: str = "standard"
+    max_attempts: int = 3
+    max_model_requests: int = 30
+    max_input_tokens: int | None = None
+    max_output_tokens: int | None = None
+    max_wall_seconds: int = 3600
+    max_cost_usd: float | None = None
+    max_parallel_candidates: int = 1
+    max_reviews: int = 1
+    max_repairs: int = 2
+    allow_challenger: bool = False
+
+    @classmethod
+    def from_mapping(cls, value: dict[str, Any] | None) -> BudgetEnvelope:
+        return cls(**(value or {}))
+
+
 class JobState(StrEnum):
     QUEUED = "QUEUED"
     RUNNING = "RUNNING"
@@ -40,6 +70,9 @@ class Job:
     state: JobState = JobState.QUEUED
     worktree: Path | None = None
     baseline_commit: str | None = None
+    complexity: str = "STANDARD"
+    risk: str = "MEDIUM"
+    budget: BudgetEnvelope = field(default_factory=BudgetEnvelope)
 
 
 @dataclass(slots=True)

@@ -4,13 +4,13 @@ import os
 import re
 import stat
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-from .domain import Candidate
+from .domain import Candidate, ProviderCredential
 
 DEFAULT_CONFIG = Path("~/.config/poormans-code/config.toml").expanduser()
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -33,8 +33,10 @@ class PMCConfig:
     research_model: str = "gemini-3-flash-preview"
     research_api_key_env: str = "GEMINI_API_KEY"
     research_max_queries_per_attempt: int = 5
-    toolchains: dict[str, dict[str, Any]] = None  # type: ignore[assignment]
-    candidates: list[Candidate] = None  # type: ignore[assignment]
+    toolchains: dict[str, dict[str, Any]] = field(default_factory=dict)
+    candidates: list[Candidate] = field(default_factory=list)
+    provider_credentials: dict[str, list[ProviderCredential]] = field(default_factory=dict)
+    require_model_conformance: bool = False
 
 
 def _expand(value: str) -> Path:
@@ -84,6 +86,26 @@ def load_config(path: Path | None = None) -> PMCConfig:
     core = raw.get("pmc", {})
     research = raw.get("research", {})
     candidates = [Candidate.from_mapping(x) for x in raw.get("candidates", [])]
+    provider_credentials: dict[str, list[ProviderCredential]] = {}
+    for provider, provider_cfg in raw.get("providers", {}).items():
+        provider_credentials[str(provider)] = [
+            ProviderCredential(
+                id=str(item["id"]),
+                provider=str(provider),
+                api_key_env=str(item["api_key_env"]),
+                enabled=bool(item.get("enabled", True)),
+                quota_scope_id=(
+                    str(item["quota_scope_id"])
+                    if item.get("quota_scope_id")
+                    else None
+                ),
+                quota_scope_confidence=str(
+                    item.get("quota_scope_confidence", "UNKNOWN")
+                ),
+                concurrency_limit=int(item.get("concurrency_limit", 1)),
+            )
+            for item in provider_cfg.get("credentials", [])
+        ]
     cfg = PMCConfig(
         db_path=_expand(core.get("db_path", "~/.local/share/poormans-code/pmc.db")),
         runs_dir=_expand(core.get("runs_dir", "~/.local/share/poormans-code/runs")),
@@ -106,6 +128,10 @@ def load_config(path: Path | None = None) -> PMCConfig:
         ),
         toolchains={str(k): dict(v) for k, v in raw.get("toolchains", {}).items()},
         candidates=candidates,
+        provider_credentials=provider_credentials,
+        require_model_conformance=bool(
+            core.get("require_model_conformance", False)
+        ),
     )
     for p in (cfg.db_path.parent, cfg.runs_dir, cfg.worktrees_dir):
         p.mkdir(parents=True, exist_ok=True)

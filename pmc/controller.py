@@ -9,11 +9,14 @@ import subprocess
 import threading
 import time
 import uuid
-from dataclasses import asdict
+from dataclasses import asdict, replace
 
 from .accounting import ModelRequestAccounting
-from .capabilities import CapabilityRegistry
-from .capabilities import infer_required_capabilities, repository_is_skeletal
+from .capabilities import (
+    CapabilityRegistry,
+    infer_required_capabilities,
+    repository_is_skeletal,
+)
 from .config import PMCConfig, load_repo_config_at
 from .context import build_context_bundle
 from .db import Database
@@ -111,6 +114,9 @@ class Controller:
     def __init__(self, cfg: PMCConfig):
         self.cfg = cfg
         self.db = Database(cfg.db_path)
+        self.db.register_provider_credentials(
+            [credential for pool in cfg.provider_credentials.values() for credential in pool]
+        )
         self.worktrees = WorktreeManager(cfg.worktrees_dir)
         self.capabilities = CapabilityRegistry(self.db, cfg.toolchains)
         self.scheduler = Scheduler(
@@ -118,6 +124,7 @@ class Controller:
             cfg.exploration_rate,
             cfg.min_samples_per_candidate,
             self.capabilities,
+            cfg.require_model_conformance,
         )
         self.reporter = Reporter(cfg.runs_dir, cfg.artifact_max_bytes)
         self.owner = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
@@ -229,7 +236,12 @@ class Controller:
         retry_exclude: set[str] = set()
         retry_same: str | None = None
 
-        while total_attempts < self.cfg.max_attempts:
+        run_started = time.monotonic()
+        max_attempts = min(job.budget.max_attempts, 1 + job.budget.max_repairs)
+        while total_attempts < max_attempts:
+            if time.monotonic() - run_started >= job.budget.max_wall_seconds:
+                failures.append("job wall-clock budget exhausted")
+                break
             attempt_no = total_attempts + 1
             exclude = set(retry_exclude)
             retry_exclude.clear()
@@ -321,6 +333,18 @@ class Controller:
                             return JobState.BLOCKED
                         raise
             if not persisted_decision:
+                providers = {
+                    c.provider for c in self.cfg.candidates if c.provider
+                }
+                decision.snapshot.update({
+                    "provider_capacity": {
+                        provider: self.db.provider_capacity(provider)
+                        for provider in sorted(providers)
+                    },
+                    "budget": asdict(job.budget),
+                    "complexity": job.complexity,
+                    "risk": job.risk,
+                })
                 self.db.record_decision(job.id, attempt_no, decision)
             candidate = decision.candidate
             self.db.register_candidate(candidate)
@@ -328,9 +352,19 @@ class Controller:
             # Bash accounts for every model turn. Other adapters retain a single
             # attempt-level reservation until their APIs expose turn boundaries.
             reservation_id = None
+            credential_reservation = None
             if candidate.executor != "bash":
+                if candidate.provider:
+                    ok, reason = self.db.provider_availability(candidate.provider)
+                    if ok and reason != "legacy candidate credential":
+                        credential_reservation = self.db.reserve_provider_credential(
+                            candidate.provider, job.id, 0,
+                            int(candidate.extra.get("max_tokens", 4096)),
+                        )
                 reservation_id = self.db.reserve_quota(
-                    candidate.name, job.id, int(candidate.extra.get("max_tokens", 4096))
+                    candidate.name, job.id, int(candidate.extra.get("max_tokens", 4096)),
+                    credential_reservation["credential_id"] if credential_reservation else None,
+                    credential_reservation["quota_scope_id"] if credential_reservation else None,
                 )
             prompt_feedback = "\n\n".join(x for x in [prior_feedback, *failures] if x)
             context_bundle = build_context_bundle(
@@ -343,9 +377,16 @@ class Controller:
                 prompt_feedback,
                 context=context_bundle.content,
             )
+            execution_candidate = replace(
+                candidate,
+                api_key_env=(
+                    credential_reservation["api_key_env"]
+                    if credential_reservation else candidate.api_key_env
+                ),
+            )
             req = ExecutionRequest(
                 job,
-                candidate,
+                execution_candidate,
                 job.worktree,
                 prompt,
                 attempt_no,
@@ -399,7 +440,8 @@ class Controller:
             )
             if candidate.executor == "bash":
                 req.accounting = ModelRequestAccounting(
-                    self.db, job_id=job.id, attempt_id=attempt_id, candidate=candidate
+                    self.db, job_id=job.id, attempt_id=attempt_id, candidate=candidate,
+                    budget=job.budget,
                 )
                 if self.cfg.research_enabled:
                     req.research = ResearchService(
@@ -446,6 +488,11 @@ class Controller:
                         cost_usd=0,
                         payload={},
                     )
+                if credential_reservation:
+                    self.db.reconcile_provider_credential(
+                        credential_reservation["reservation_id"],
+                        status_code=None, actual_tokens=0, headers={},
+                    )
                 self.db.set_state(job.id, JobState.RETRY)
                 total_attempts += 1
                 continue
@@ -466,6 +513,13 @@ class Controller:
                         outcome=Outcome.EXECUTOR_CRASH,
                     )
             duration = time.monotonic() - started
+            if credential_reservation:
+                self.db.reconcile_provider_credential(
+                    credential_reservation["reservation_id"],
+                    status_code=(401 if result.outcome == Outcome.PROVIDER_FAILURE and "401" in (result.error or "") else None),
+                    actual_tokens=(result.input_tokens or 0) + (result.output_tokens or 0),
+                    headers=dict(result.raw_metrics.get("rate_headers") or {}),
+                )
             result.accounting_level = {
                 "bash": "per_model_request",
                 "openhands": "aggregate",
@@ -628,7 +682,7 @@ class Controller:
                 self.db.set_state(job.id, JobState.RETRY)
                 continue
 
-            if self.cfg.review_enabled:
+            if self.cfg.review_enabled and job.budget.max_reviews > 0:
                 self.db.set_state(job.id, JobState.REVIEWING)
                 reviewer_pool = [
                     c

@@ -9,6 +9,22 @@ same_candidate_retries = 2
 review_enabled = false
 lease_ttl_seconds = 300
 verifier_sandbox = "bwrap"
+require_model_conformance = true
+
+[[providers.groq.credentials]]
+id = "groq-1"
+api_key_env = "GROQ_API_KEY"
+quota_scope_confidence = "UNKNOWN"
+
+[[providers.gemini.credentials]]
+id = "gemini-1"
+api_key_env = "GEMINI_API_KEY"
+quota_scope_confidence = "UNKNOWN"
+
+[[providers.jules.credentials]]
+id = "jules-1"
+api_key_env = "JULES_API_KEY"
+quota_scope_confidence = "UNKNOWN"
 
 [research]
 enabled = false
@@ -32,7 +48,6 @@ executor = "bash"
 role = "builder"
 model = "openai/gpt-oss-20b"
 base_url = "https://api.groq.com/openai/v1"
-api_key_env = "GROQ_API_KEY"
 quota_group = "groq"
 max_turns = 20
 sandbox = "bwrap"
@@ -48,7 +63,6 @@ executor = "bash"
 role = "builder"
 model = "gemini-3-flash-preview"
 base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
-api_key_env = "GEMINI_API_KEY"
 quota_group = "gemini"
 max_turns = 20
 sandbox = "bwrap"
@@ -89,7 +103,6 @@ provider = "jules"
 enabled = false
 executor = "jules"
 role = "builder"
-api_key_env = "JULES_API_KEY"
 # "auto" derives sources/github/OWNER/REPO from each job repository's origin.
 # Pin an explicit Jules source only for unusual deployments.
 source = "auto"

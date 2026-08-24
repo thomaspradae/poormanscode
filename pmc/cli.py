@@ -95,15 +95,23 @@ def cmd_submit(args) -> int:
         constraints["no_new_dependencies"] = True
     if args.allowed_path:
         constraints["allowed_paths"] = args.allowed_path
+    from .budget import characterize, envelope_for
+    task_type = args.task_type or classify(args.request)
+    inferred_complexity, inferred_risk = characterize(args.request, task_type, args.priority)
+    complexity = args.complexity or inferred_complexity
+    risk = args.risk or inferred_risk
     job = Job(
         id=job_id,
         repo=repo,
         request=args.request,
         base_branch=args.base_branch,
         priority=args.priority,
-        task_type=args.task_type or classify(args.request),
+        task_type=task_type,
         acceptance=args.acceptance or [],
         constraints=constraints,
+        complexity=complexity,
+        risk=risk,
+        budget=envelope_for(complexity, risk, args.budget),
     )
     ctl.db.create_job(job)
     print(job_id)
@@ -484,6 +492,32 @@ def cmd_candidates(args) -> int:
     return 0
 
 
+def cmd_models_list(args) -> int:
+    ctl = _controller(args)
+    for candidate in ctl.cfg.candidates:
+        row = ctl.db.model_conformance(candidate)
+        status = row["status"] if row else "UNKNOWN"
+        provider = candidate.provider or "local"
+        print(f"{candidate.name:32} {status:12} {provider:12} {candidate.model or candidate.executor}")
+    return 0
+
+
+def cmd_models_smoke(args) -> int:
+    from .conformance import smoke_candidate
+    ctl = _controller(args)
+    selected = set(args.candidates or [])
+    candidates = [c for c in ctl.cfg.candidates if c.enabled and (not selected or c.name in selected)]
+    unknown = selected - {c.name for c in candidates}
+    if unknown:
+        raise SystemExit("unknown/disabled candidates: " + ", ".join(sorted(unknown)))
+    failed = False
+    for candidate in candidates:
+        result = smoke_candidate(ctl.db, candidate)
+        print(f"{result['candidate']}: {result['status']} generation={result['generation']} tool={result['tool']}")
+        failed |= result["status"] != "AVAILABLE"
+    return 2 if failed else 0
+
+
 def cmd_capabilities(args) -> int:
     ctl = _controller(args)
     snapshot = ctl.capabilities.local
@@ -581,6 +615,21 @@ def cmd_doctor(args) -> int:
         )
         if missing:
             ok = False
+        if c.provider:
+            pool_ok, pool_reason = ctl.db.provider_availability(c.provider)
+            print(
+                f"candidate {c.name} provider pool: "
+                f"{'OK' if pool_ok else 'UNAVAILABLE ' + pool_reason}"
+            )
+            ok &= pool_ok
+        if ctl.cfg.require_model_conformance:
+            conformance = ctl.db.model_conformance(c)
+            status = conformance["status"] if conformance else "UNKNOWN"
+            print(f"candidate {c.name} conformance: {status}")
+            if c.enabled and status != "AVAILABLE":
+                # Degraded/unknown candidates are safely excluded from routing;
+                # report them without making the whole control plane unhealthy.
+                print(f"candidate {c.name}: excluded until a smoke test passes")
         if c.executor == "bash" and c.sandbox in {"none", "guarded"}:
             print(f"candidate {c.name}: UNSAFE sandbox={c.sandbox}")
             ok = False
@@ -719,6 +768,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--base-branch", default="main")
     s.add_argument("--priority", type=int, choices=range(0, 5), default=2)
     s.add_argument("--task-type")
+    s.add_argument("--complexity", choices=["TRIVIAL", "STANDARD", "DIFFICULT"])
+    s.add_argument("--risk", choices=["LOW", "MEDIUM", "HIGH", "CRITICAL"])
+    s.add_argument("--budget", choices=["trivial", "standard", "difficult", "high-risk"])
     s.add_argument("--acceptance", action="append")
     s.add_argument("--max-files", type=int)
     s.add_argument("--max-lines", type=int)
@@ -827,6 +879,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("candidates")
     s.set_defaults(func=cmd_candidates)
+
+    s = sub.add_parser("models")
+    model_sub = s.add_subparsers(dest="models_command", required=True)
+    ml = model_sub.add_parser("list")
+    ml.set_defaults(func=cmd_models_list)
+    ms = model_sub.add_parser("smoke")
+    ms.add_argument("candidates", nargs="*")
+    ms.set_defaults(func=cmd_models_smoke)
 
     s = sub.add_parser("capabilities")
     s.set_defaults(func=cmd_capabilities)

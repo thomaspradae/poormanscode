@@ -3,6 +3,26 @@
 Rule: anything affecting learning must be observable and versioned. Anything
 affecting acceptance must remain outside worker authority.
 
+## Unified provider capacity and job budgets
+
+- [x] Candidates own quality history; credentials are interchangeable quota lanes
+- [x] Provider credential registry stores secret references only, with health,
+  cooldown, concurrency, quota-scope identity and conservative confidence
+- [x] Atomic per-model-request credential selection, reservation, reconciliation,
+  authentication quarantine, and least-utilized lane selection
+- [x] Provider capacity gates candidates without adding credentials to candidate identity
+- [x] `pmc models list` and `pmc models smoke` persist generation/native-tool
+  conformance and optionally gate production scheduling
+- [x] Complexity and semantic risk are classified separately with human overrides
+- [x] Job-owned budget envelopes cap attempts, requests, tokens, wall time, cost,
+  reviews, repairs, parallel candidates and challengers
+- [ ] Human attention and stable post-acceptance outcomes (Phase 4)
+- [ ] Deliberate planner/reviewer/challenger allocation from information value (Phase 5)
+
+Invariants: candidates own performance history; credentials own quota state;
+providers aggregate capacity; jobs own spending limits; verification owns truth;
+humans own acceptance.
+
 ## P0 — required for production project #1
 
 - [x] Reproducible install, canonical paths, migrations, production-path doctor
