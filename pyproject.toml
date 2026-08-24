@@ -22,6 +22,7 @@ dev = ["pytest>=8", "ruff>=0.6"]
 
 [project.scripts]
 pmc = "pmc.cli:main"
+pmc-add-keys = "pmc.add_keys:main"
 
 [tool.setuptools.packages.find]
 include = ["pmc*"]
