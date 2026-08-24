@@ -191,12 +191,35 @@ class Scheduler:
         def fits(c: Candidate) -> bool:
             if c.executor == "jules" and job.constraints.get("_feature_dependencies"):
                 return False
+            # BashExecutor is intentionally a narrow, low-overhead executor.  It is
+            # not a general software-engineering runtime: production experience
+            # showed that difficult/multi-file work burns turns without converging.
+            # A job may opt in explicitly for a controlled experiment, but the
+            # default is to block instead of silently wasting its attempt budget.
+            if c.executor == "bash" and not c.extra.get(
+                "allow_complex_tasks", False
+            ):
+                mature_task_types = {
+                    "FEATURE",
+                    "ARCHITECTURAL",
+                    "DEPENDENCY_API",
+                    "INTEGRATION",
+                    "UI",
+                }
+                if job.complexity == "DIFFICULT" or job.task_type in mature_task_types:
+                    return False
+            complexities = c.extra.get("complexities")
+            if complexities and job.complexity not in complexities:
+                return False
+            risks = c.extra.get("risks")
+            if risks and job.risk not in risks:
+                return False
             task_types = c.extra.get("task_types")
             if task_types and job.task_type not in task_types:
                 return False
-            if c.extra.get("first_attempt_only", False) and attempt_no > 1:
-                return False
-            return True
+            return not (
+                c.extra.get("first_attempt_only", False) and attempt_no > 1
+            )
 
         unavailable: dict[str, str] = {}
         pool = []

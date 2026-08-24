@@ -98,6 +98,9 @@ api_key_env = "GROQ_API_KEY"
 quota_group = "groq"
 resource_group = "openhands-host-1"
 resource_concurrency = 1
+max_turns = 50
+complexities = ["STANDARD", "DIFFICULT"]
+task_types = ["FEATURE", "ARCHITECTURAL", "DEPENDENCY_API", "INTEGRATION", "UI", "BUG_FIX"]
 # server_url = "http://100.x.y.z:8000"   # optional OpenHands Agent Server over Tailscale
 
 [[candidates]]

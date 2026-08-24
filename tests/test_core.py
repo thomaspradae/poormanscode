@@ -3,9 +3,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from pmc.config import PMCConfig
 from pmc.db import Database
-from pmc.domain import Candidate, Job, JobState
+from pmc.domain import Candidate, Job
 from pmc.gitops import WorktreeManager
 from pmc.scheduler import Scheduler
 from pmc.verifier import verify
@@ -70,6 +69,39 @@ def test_scheduler_forces_cold_start_then_can_explore(tmp_path: Path):
     d = s.choose(job, candidates, attempt_no=1)
     assert d.mode == "cold_start"
     assert d.candidate.name in {"a", "b"}
+
+
+def test_difficult_feature_never_silently_falls_back_to_bash(tmp_path: Path):
+    db = Database(tmp_path / "pmc.db")
+    job = Job(
+        "PMC-000099",
+        tmp_path,
+        "build a multi-file feature",
+        task_type="FEATURE",
+        complexity="DIFFICULT",
+    )
+    candidates = [
+        Candidate(name="bash", executor="bash"),
+        Candidate(name="jules", executor="jules"),
+    ]
+    decision = Scheduler(db, 0.2, 2).choose(job, candidates)
+    assert decision.candidate.name == "jules"
+    assert decision.unavailable["bash"] == "task/profile constraint"
+
+
+def test_explicit_experiment_can_allow_bash_on_complex_work(tmp_path: Path):
+    db = Database(tmp_path / "pmc.db")
+    job = Job(
+        "PMC-000100",
+        tmp_path,
+        "controlled benchmark",
+        task_type="FEATURE",
+        complexity="DIFFICULT",
+    )
+    bash = Candidate.from_mapping(
+        {"name": "bash", "executor": "bash", "allow_complex_tasks": True}
+    )
+    assert Scheduler(db, 0.2, 2).choose(job, [bash]).candidate.name == "bash"
 
 
 def test_feedback_attaches_to_ready_attempt(tmp_path: Path):

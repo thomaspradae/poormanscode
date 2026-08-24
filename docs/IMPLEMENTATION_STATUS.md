@@ -4,6 +4,22 @@ PMC already implements the schema/persistence contract, operator CLI, isolated G
 worktrees, deterministic verification, retries with failure evidence, scheduling,
 audit reports, human acceptance, leases, and Bash/OpenHands/Jules adapters.
 
+## Executor policy
+
+- [x] Treat BashExecutor as a narrow executor for small, deterministic work. By
+  default it is ineligible for difficult jobs and FEATURE, ARCHITECTURAL,
+  DEPENDENCY_API, INTEGRATION, and UI tasks. A candidate must opt in with
+  `allow_complex_tasks = true` for a controlled experiment.
+- [x] Use a mature coding-agent runtime for general software engineering. Jules is
+  production-available for GitHub-backed jobs. OpenHands SDK 1.43 is installed and
+  the adapter uses bounded iterations plus native stuck detection.
+- [ ] Do not enable an OpenHands production candidate until a remote Agent Server
+  is deployed behind an enforceable workspace/network boundary and the candidate
+  passes a real file-edit, test, timeout, and cleanup conformance canary.
+- [ ] Add per-model-request accounting callbacks for OpenHands. Its current SDK
+  metrics are explicitly recorded as aggregate rather than fake request-level
+  precision.
+
 ## P0 substrate
 
 - [x] Provision a dedicated `pmc-worker` identity for the restricted-user backend.

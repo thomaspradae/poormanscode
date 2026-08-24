@@ -14,9 +14,9 @@ class OpenHandsExecutor:
 
     def _imports(self):
         try:
-            from pydantic import SecretStr
             from openhands.sdk import LLM, Conversation, Workspace
             from openhands.tools.preset.default import get_default_agent
+            from pydantic import SecretStr
 
             return SecretStr, LLM, Conversation, Workspace, get_default_agent
         except ImportError as exc:
@@ -93,10 +93,17 @@ class OpenHandsExecutor:
                         ),
                     )
                 conversation = Conversation(
-                    agent=agent, workspace=str(request.worktree)
+                    agent=agent,
+                    workspace=str(request.worktree),
+                    max_iteration_per_run=c.max_turns,
+                    stuck_detection=True,
+                    visualizer=None,
                 )
-                conversation.send_message(request.prompt)
-                conversation.run()
+                try:
+                    conversation.send_message(request.prompt)
+                    conversation.run()
+                finally:
+                    conversation.close()
             else:
                 # Remote Agent Server path. The controller ships a clean snapshot,
                 # runs the agent remotely, then applies only the resulting Git patch locally.
@@ -140,12 +147,21 @@ class OpenHandsExecutor:
                         f"The repository for this task is at {remote_dir}. Begin every shell/file operation there.\n\n"
                         + request.prompt
                     )
-                    conversation = Conversation(agent=agent, workspace=workspace)
-                    conversation.send_message(remote_prompt)
-                    conversation.run()
-                    diff = workspace.execute_command(
-                        f"cd {remote_dir} && git diff --binary HEAD --"
-                    ).stdout
+                    conversation = Conversation(
+                        agent=agent,
+                        workspace=workspace,
+                        max_iteration_per_run=c.max_turns,
+                        stuck_detection=True,
+                        visualizer=None,
+                    )
+                    try:
+                        conversation.send_message(remote_prompt)
+                        conversation.run()
+                        diff = workspace.execute_command(
+                            f"cd {remote_dir} && git diff --binary HEAD --"
+                        ).stdout
+                    finally:
+                        conversation.close()
                     if diff.strip():
                         from ..gitops import WorktreeManager
 
@@ -160,6 +176,7 @@ class OpenHandsExecutor:
                 output_tokens=out_tok,
                 cost_usd=cost,
                 raw_metrics={**raw, "accounting": "sdk-aggregate"},
+                accounting_level="aggregate",
             )
         except Exception as exc:
             in_tok, out_tok, cost, raw = self._metrics(llm)
@@ -171,4 +188,5 @@ class OpenHandsExecutor:
                 cost_usd=cost,
                 raw_metrics={**raw, "accounting": "sdk-aggregate"},
                 outcome=Outcome.EXECUTOR_FAILURE,
+                accounting_level="aggregate",
             )
