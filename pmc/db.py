@@ -884,14 +884,22 @@ class Database:
             ).fetchone()
         return dict(row)
 
-    def job_model_request_totals(self, job_id: str) -> dict[str, Any]:
+    def job_model_request_totals(
+        self, job_id: str, *, since_latest_feedback: bool = False
+    ) -> dict[str, Any]:
         with self.connect() as conn:
             row = conn.execute(
                 """SELECT COUNT(*) requests,
                 COALESCE(SUM(COALESCE(actual_input_tokens,estimated_input_tokens)),0) input_tokens,
                 COALESCE(SUM(COALESCE(actual_output_tokens,estimated_output_tokens)),0) output_tokens,
                 COALESCE(SUM(COALESCE(actual_cost_usd,estimated_cost_usd)),0) cost_usd
-                FROM model_requests WHERE job_id=?""", (job_id,)
+                FROM model_requests WHERE job_id=? AND (
+                    ?=0 OR started_at > COALESCE(
+                        (SELECT MAX(created_at) FROM human_feedback WHERE job_id=?),
+                        ''
+                    )
+                )""",
+                (job_id, int(since_latest_feedback), job_id),
             ).fetchone()
         return dict(row)
 

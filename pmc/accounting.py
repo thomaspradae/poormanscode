@@ -44,7 +44,9 @@ class ModelRequestAccounting:
                 )
         estimated_input = max(1, serialized_chars // 4)
         estimated_cost = self.candidate.monetary_cost_hint or None
-        totals = self.db.job_model_request_totals(self.job_id)
+        totals = self.db.job_model_request_totals(
+            self.job_id, since_latest_feedback=True
+        )
         b = self.budget
         if b:
             if totals["requests"] >= b.max_model_requests:
