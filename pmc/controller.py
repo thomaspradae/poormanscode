@@ -31,7 +31,7 @@ from .retry import RetryAction, policy_for
 from .reviewer import ReviewerService
 from .sandbox import resource_snapshot
 from .scheduler import NoAvailableCandidate, Scheduler
-from .verifier import verify
+from .verifier import select_verifier_runtime, verify
 from .versioning import (
     JOB_CONTRACT_VERSION,
     PROMPT_PROFILE_VERSION,
@@ -145,7 +145,21 @@ class Controller:
         if dependency_commits:
             from .gitops import git, resolve_commit
 
+            already_present: list[str] = []
             for commit in dependency_commits:
+                if (
+                    git(
+                        wt,
+                        "merge-base",
+                        "--is-ancestor",
+                        commit,
+                        "HEAD",
+                        check=False,
+                    ).returncode
+                    == 0
+                ):
+                    already_present.append(commit)
+                    continue
                 result = git(wt, "cherry-pick", commit, check=False)
                 if result.returncode != 0:
                     git(wt, "cherry-pick", "--abort", check=False)
@@ -156,7 +170,11 @@ class Controller:
             self.db.event(
                 "DEPENDENCIES_INTEGRATED",
                 job_id=job.id,
-                payload={"commits": dependency_commits, "baseline": baseline},
+                payload={
+                    "commits": dependency_commits,
+                    "already_present": already_present,
+                    "baseline": baseline,
+                },
             )
         if self.cfg.verifier_sandbox == "restricted-user":
             if not shutil.which("setfacl"):
@@ -208,6 +226,70 @@ class Controller:
     def run_job(self, job_id: str, forced_candidate: str | None = None) -> JobState:
         with _LeaseHeartbeat(self.db, job_id, self.owner, self.cfg.lease_ttl_seconds):
             return self._run_job_locked(job_id, forced_candidate)
+
+    def reverify_job(self, job_id: str) -> JobState:
+        """Re-run acceptance gates for the latest produced patch without recoding."""
+        job = self.db.get_job(job_id)
+        if not job.worktree or not job.worktree.exists() or not job.baseline_commit:
+            raise RuntimeError(f"{job.id} has no preserved worktree to re-verify")
+        detail = self.db.job_detail(job_id)
+        attempts = detail["attempts"]
+        if not attempts:
+            raise RuntimeError(f"{job.id} has no attempt to re-verify")
+        attempt = attempts[-1]
+        candidate = next(
+            (c for c in self.cfg.candidates if c.name == attempt["candidate"]), None
+        )
+        if candidate is None:
+            raise RuntimeError(f"candidate is no longer configured: {attempt['candidate']}")
+        repo_cfg = load_repo_config_at(job.repo, job.baseline_commit)
+        if repo_cfg.get("toolchain") == "unity":
+            repo_cfg["unity_toolchain"] = dict(self.cfg.toolchains.get("unity", {}))
+        sandbox, verifier_config, source = select_verifier_runtime(
+            repo_cfg,
+            self.cfg.toolchains,
+            candidate.extra,
+            self.cfg.verifier_sandbox,
+        )
+        attempt_id = int(attempt["id"])
+        self.db.event(
+            "REVERIFICATION_STARTED",
+            job_id=job.id,
+            attempt_id=attempt_id,
+            payload={
+                "sandbox": sandbox,
+                "source": source,
+                "toolchain": repo_cfg.get("toolchain"),
+                "remote_host": verifier_config.get("remote_host"),
+                "remote_instance": verifier_config.get("remote_instance"),
+            },
+        )
+        result = verify(
+            job,
+            job.worktree,
+            repo_cfg,
+            sandbox,
+            verifier_config,
+        )
+        self.db.record_verification(attempt_id, result)
+        self.reporter.record_verification(job.id, int(attempt["attempt_no"]), result)
+        if result.ok:
+            self.db.mark_attempt_ready_after_reverification(attempt_id)
+            self.db.set_state(job.id, JobState.READY)
+            self.db.event(
+                "REVERIFICATION_PASSED", job_id=job.id, attempt_id=attempt_id
+            )
+            self._write_event_audit(job.id)
+            return JobState.READY
+        self.db.set_state(job.id, JobState.BLOCKED)
+        self.db.event(
+            "REVERIFICATION_FAILED",
+            job_id=job.id,
+            attempt_id=attempt_id,
+            payload={"failure": result.short_failure()},
+        )
+        self._write_event_audit(job.id)
+        return JobState.BLOCKED
 
     def _run_job_locked(
         self, job_id: str, forced_candidate: str | None = None
@@ -690,15 +772,34 @@ class Controller:
             self.worktrees.normalize_worker_commits(job.worktree, job.baseline_commit)
             self.db.set_state(job.id, JobState.VERIFYING)
             self.db.event("VERIFICATION_STARTED", job_id=job.id, attempt_id=attempt_id)
-            verifier_sandbox = str(
-                candidate.extra.get("verifier_sandbox", self.cfg.verifier_sandbox)
+            verifier_sandbox, verifier_config, verifier_source = (
+                select_verifier_runtime(
+                    repo_cfg,
+                    self.cfg.toolchains,
+                    candidate.extra,
+                    self.cfg.verifier_sandbox,
+                )
+            )
+            self.db.event(
+                "VERIFIER_RESOURCE_SELECTED",
+                job_id=job.id,
+                attempt_id=attempt_id,
+                payload={
+                    "sandbox": verifier_sandbox,
+                    "source": verifier_source,
+                    "toolchain": repo_cfg.get("toolchain"),
+                    "resource_class": verifier_config.get("resource_class"),
+                    "remote_host": verifier_config.get("remote_host"),
+                    "remote_instance": verifier_config.get("remote_instance"),
+                    "network_policy": "none",
+                },
             )
             v = verify(
                 job,
                 job.worktree,
                 repo_cfg,
                 verifier_sandbox,
-                candidate.extra,
+                verifier_config,
             )
             self.db.record_verification(attempt_id, v)
             self.reporter.record_verification(job.id, attempt_no, v)

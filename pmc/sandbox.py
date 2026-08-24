@@ -395,7 +395,10 @@ class RemoteLxdSandbox(Sandbox):
     def _sync_to_remote(self, worktree: Path) -> None:
         remote = self._workspace(worktree)
         prepare = (
-            f"lxc exec {shlex.quote(self.instance)} -- mkdir -p {shlex.quote(remote)}"
+            f"lxc exec {shlex.quote(self.instance)} -- /bin/bash -lc "
+            + shlex.quote(
+                f"rm -rf {shlex.quote(remote)} && mkdir -p {shlex.quote(remote)}"
+            )
         )
         subprocess.run(self._ssh(prepare), check=True, capture_output=True, text=True)
         tar = subprocess.Popen(

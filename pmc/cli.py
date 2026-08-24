@@ -14,7 +14,6 @@ from pathlib import Path
 from .classifier import classify
 from .config import DEFAULT_CONFIG, load_config
 from .controller import Controller, LeaseBusy
-from .db import Database
 from .domain import Job, JobState
 from .foreman import propose_plan, validate_plan
 
@@ -352,6 +351,12 @@ def cmd_inspect(args) -> int:
     return 0
 
 
+def cmd_reverify(args) -> int:
+    state = _controller(args).reverify_job(args.job_id)
+    print(state.value)
+    return 0 if state == JobState.READY else 2
+
+
 def cmd_cancel(args) -> int:
     ctl = _controller(args)
     ctl.cancel(args.job_id)
@@ -631,7 +636,6 @@ def cmd_doctor(args) -> int:
         c.enabled and c.executor == "openhands" for c in ctl.cfg.candidates
     )
     try:
-        import openhands.sdk  # type: ignore
 
         print("OpenHands SDK: OK")
     except Exception:
@@ -801,7 +805,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("repo")
     s.add_argument("request")
     s.add_argument("--base-branch", default="main")
-    s.add_argument("--priority", type=int, choices=range(0, 5), default=2)
+    s.add_argument("--priority", type=int, choices=range(5), default=2)
     s.add_argument("--task-type")
     s.add_argument("--complexity", choices=["TRIVIAL", "STANDARD", "DIFFICULT"])
     s.add_argument("--risk", choices=["LOW", "MEDIUM", "HIGH", "CRITICAL"])
@@ -882,6 +886,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--repair-seconds", type=float)
     s.add_argument("--human-changed-lines", type=int)
     s.set_defaults(func=cmd_reject)
+
+    s = sub.add_parser(
+        "reverify", help="re-run verification for the latest preserved attempt"
+    )
+    s.add_argument("job_id")
+    s.set_defaults(func=cmd_reverify)
 
     s = sub.add_parser("record-manual")
     s.add_argument("tool", help="e.g. codex, claude-code, hand-written")

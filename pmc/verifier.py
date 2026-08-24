@@ -23,6 +23,26 @@ SECRET_PATTERNS = [
 ]
 
 
+def select_verifier_runtime(
+    repo_cfg: dict[str, Any],
+    toolchains: dict[str, dict[str, Any]],
+    candidate_extra: dict[str, Any],
+    default_sandbox: str,
+) -> tuple[str, dict[str, Any], str]:
+    """Select verifier placement from controller-owned configuration."""
+    toolchain = str(repo_cfg.get("toolchain") or "").strip()
+    profile = dict(toolchains.get(toolchain, {})) if toolchain else {}
+    if profile.get("verifier_sandbox"):
+        return str(profile["verifier_sandbox"]), profile, f"toolchain:{toolchain}"
+    if candidate_extra.get("verifier_sandbox"):
+        return (
+            str(candidate_extra["verifier_sandbox"]),
+            dict(candidate_extra),
+            "candidate",
+        )
+    return default_sandbox, {}, "controller-default"
+
+
 def _run(
     name: str,
     command: str,

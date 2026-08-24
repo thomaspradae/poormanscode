@@ -42,6 +42,15 @@ max_queries_per_attempt = 5
 editor_path = "/home/YOU/Unity/Hub/Editor/6000.x/Editor/Unity"
 version = "6000.x"
 
+# Optional controller-owned placement for Node verification. Repository files
+# name the toolchain but cannot choose the machine or weaken its sandbox.
+# [toolchains.node]
+# verifier_sandbox = "remote-lxd"
+# resource_class = "ofi1-lxd-node24"
+# remote_host = "uace-ofi-01"
+# remote_instance = "pmc-node-worker"
+# remote_seed_node_modules = "/opt/pmc-node-cache/garage-v2/node_modules"
+
 # Candidate examples. Enable only resources you actually have.
 
 [[candidates]]

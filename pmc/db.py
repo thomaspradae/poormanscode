@@ -1770,6 +1770,27 @@ class Database:
                 ),
             )
 
+    def mark_attempt_ready_after_reverification(self, attempt_id: int) -> None:
+        """Promote an existing patch after an infrastructure-only re-verification."""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT job_id FROM attempts WHERE id=?", (attempt_id,)
+            ).fetchone()
+            if not row:
+                raise KeyError(f"unknown attempt {attempt_id}")
+            conn.execute(
+                """UPDATE attempts
+                   SET status='READY', outcome='SUCCESS', error=NULL
+                   WHERE id=?""",
+                (attempt_id,),
+            )
+        self.event(
+            "ATTEMPT_REVERIFIED",
+            job_id=row["job_id"],
+            attempt_id=attempt_id,
+            payload={"status": "READY", "outcome": "SUCCESS"},
+        )
+
     def record_review(self, attempt_id: int, reviewer: str | None, review: Any) -> None:
         with self.connect() as conn:
             conn.execute(
