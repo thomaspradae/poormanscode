@@ -104,3 +104,20 @@ def test_two_gemini_keys_start_at_two_and_skip_collisions(tmp_path: Path):
 
     assert added == ["GEMINI_API_KEY_3", "GEMINI_API_KEY_4"]
     assert "gemini-secret" not in output.getvalue()
+
+
+def test_single_groq_key_skips_existing_second_key(tmp_path: Path):
+    path = tmp_path / "secrets.env"
+    path.write_text("GROQ_API_KEY_2=preserved\n")
+    path.chmod(0o600)
+    output = io.StringIO()
+
+    added = add_provider_keys(
+        path,
+        reader=lambda _: "new-groq-secret",
+        output=output,
+        requests=(("GROQ_API_KEY", "Additional Groq key", 1, 2),),
+    )
+
+    assert added == ["GROQ_API_KEY_3"]
+    assert "new-groq-secret" not in output.getvalue()

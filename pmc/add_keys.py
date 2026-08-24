@@ -148,3 +148,17 @@ def gemini_main() -> int:
         print(f"Credential collection failed: {exc}")
         return 2
     return 0
+
+
+def groq_main() -> int:
+    try:
+        add_provider_keys(
+            requests=(("GROQ_API_KEY", "Additional Groq key", 1, 2),)
+        )
+    except (EOFError, KeyboardInterrupt):
+        print("\nCancelled. No credentials were changed.")
+        return 130
+    except ValueError as exc:
+        print(f"Credential collection failed: {exc}")
+        return 2
+    return 0

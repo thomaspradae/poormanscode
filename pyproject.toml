@@ -25,6 +25,7 @@ pmc = "pmc.cli:main"
 pmc-add-keys = "pmc.add_keys:main"
 pmc-add-nvidia-key = "pmc.add_keys:nvidia_main"
 pmc-add-gemini-keys = "pmc.add_keys:gemini_main"
+pmc-add-groq-key = "pmc.add_keys:groq_main"
 
 [tool.setuptools.packages.find]
 include = ["pmc*"]
