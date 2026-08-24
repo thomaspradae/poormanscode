@@ -1640,6 +1640,19 @@ class Database:
             ).fetchone()
         return int(row["n"])
 
+    def attempt_count_since_latest_feedback(self, job_id: str) -> int:
+        """Count attempts in the current human-directed repair cycle."""
+        with self.connect() as conn:
+            row = conn.execute(
+                """SELECT COUNT(*) n FROM attempts
+                   WHERE job_id=? AND started_at > COALESCE(
+                       (SELECT MAX(created_at) FROM human_feedback WHERE job_id=?),
+                       ''
+                   )""",
+                (job_id, job_id),
+            ).fetchone()
+        return int(row["n"])
+
     def begin_attempt(
         self,
         job_id: str,

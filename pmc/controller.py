@@ -235,6 +235,7 @@ class Controller:
             repo_cfg["unity_toolchain"] = dict(self.cfg.toolchains.get("unity", {}))
         prior_feedback = self.db.feedback_text(job.id)
         total_attempts = self.db.attempt_count(job.id)
+        cycle_attempts = self.db.attempt_count_since_latest_feedback(job.id)
         failures: list[str] = []
         used: list[str] = []
         retry_exclude: set[str] = set()
@@ -250,7 +251,7 @@ class Controller:
 
         run_started = time.monotonic()
         max_attempts = min(job.budget.max_attempts, 1 + job.budget.max_repairs)
-        while total_attempts < max_attempts:
+        while cycle_attempts < max_attempts:
             if time.monotonic() - run_started >= job.budget.max_wall_seconds:
                 failures.append("job wall-clock budget exhausted")
                 break
@@ -284,8 +285,8 @@ class Controller:
                     persisted_decision.get("policy_version") or "unknown",
                     json.loads(persisted_decision.get("snapshot_json") or "{}"),
                 )
-            elif (forced_candidate and total_attempts == 0) or retry_same:
-                selected_name = forced_candidate if total_attempts == 0 else retry_same
+            elif (forced_candidate and cycle_attempts == 0) or retry_same:
+                selected_name = forced_candidate if cycle_attempts == 0 else retry_same
                 retry_same = None
                 matches = [
                     c
@@ -301,7 +302,7 @@ class Controller:
                 candidate0 = matches[0]
                 mode = (
                     "forced"
-                    if forced_candidate and total_attempts == 0
+                    if forced_candidate and cycle_attempts == 0
                     else "retry_same"
                 )
                 decision = SchedulerDecision(candidate0, mode, 0.0, mode)
@@ -561,6 +562,7 @@ class Controller:
                     )
                 self.db.set_state(job.id, JobState.RETRY)
                 total_attempts += 1
+                cycle_attempts += 1
                 continue
             started = time.monotonic()
             with _ResourceHeartbeat(
@@ -643,6 +645,7 @@ class Controller:
                 job.id, attempt_no, candidate, decision, result
             )
             total_attempts += 1
+            cycle_attempts += 1
             if not result.ok:
                 outcome = result.outcome or (
                     Outcome.PROVIDER_FAILURE

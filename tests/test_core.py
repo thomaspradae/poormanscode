@@ -87,6 +87,24 @@ def test_feedback_attaches_to_ready_attempt(tmp_path: Path):
     assert stats[0]["accepted_attempts"] == 1
 
 
+def test_human_feedback_starts_a_fresh_bounded_attempt_cycle(tmp_path: Path):
+    db = Database(tmp_path / "pmc.db")
+    job = Job("PMC-000001", tmp_path, "task")
+    db.create_job(job)
+    candidate = Candidate(name="a", executor="bash")
+    db.begin_attempt(job.id, 1, candidate, "forced", 0)
+    assert db.attempt_count(job.id) == 1
+    assert db.attempt_count_since_latest_feedback(job.id) == 1
+
+    db.add_feedback(job.id, "REJECT", "finish the repair")
+
+    assert db.attempt_count(job.id) == 1
+    assert db.attempt_count_since_latest_feedback(job.id) == 0
+    db.begin_attempt(job.id, 2, candidate, "forced", 0)
+    assert db.attempt_count(job.id) == 2
+    assert db.attempt_count_since_latest_feedback(job.id) == 1
+
+
 def test_verification_policy_is_loadable_from_immutable_baseline(tmp_path: Path):
     from pmc.config import load_repo_config_at
 
