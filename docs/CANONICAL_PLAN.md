@@ -16,8 +16,13 @@ affecting acceptance must remain outside worker authority.
 - [x] Complexity and semantic risk are classified separately with human overrides
 - [x] Job-owned budget envelopes cap attempts, requests, tokens, wall time, cost,
   reviews, repairs, parallel candidates and challengers
-- [ ] Human attention and stable post-acceptance outcomes (Phase 4)
-- [ ] Deliberate planner/reviewer/challenger allocation from information value (Phase 5)
+- [x] Human review/repair time, human edit burden, no-edit acceptance, and stable
+  post-acceptance outcomes with `pmc attention` / `pmc outcome`
+- [x] Auditable risk-, verification-, and uncertainty-driven planner, independent
+  reviewer, and challenger-opinion allocation bounded by each job envelope
+- [x] Contextual Thompson routing after a configurable evidence threshold, using
+  stable human outcomes by task type, complexity, risk, and attempt phase; every
+  decision records seed, contextual observations, uncertainty, and propensity
 
 Invariants: candidates own performance history; credentials own quota state;
 providers aggregate capacity; jobs own spending limits; verification owns truth;
@@ -76,9 +81,11 @@ humans own acceptance.
 
 ## P3 — empirical router evolution
 
-- [ ] Contextual candidate estimates and contextual bandit routing
-- [ ] Information-value-aware exploration
-- [ ] Human-attention economics and stable-outcome metrics
+- [x] Contextual candidate estimates and contextual Thompson routing with a
+  sparse-data epsilon/cold-start fallback
+- [x] Information-value-aware allocation driven by contextual uncertainty,
+  semantic risk, and verification strength
+- [x] Human-attention economics and stable-outcome metrics
 - [ ] Manual-agent baselines and role-specific benchmarks
 
 ## P4 — complete software factory

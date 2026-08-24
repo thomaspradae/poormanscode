@@ -341,6 +341,14 @@ def cmd_inspect(args) -> int:
         print("\nHUMAN FEEDBACK")
         for f in d["feedback"]:
             print(f"{f['verdict']}: {f['feedback'] or ''}")
+    if d["intelligence_allocations"]:
+        print("\nEXTRA INTELLIGENCE")
+        for item in d["intelligence_allocations"]:
+            print(f"{item['role']} {item['candidate'] or '-'}: {item['state']} — {item['reason']}")
+    if d["post_acceptance_outcomes"]:
+        print("\nPOST-ACCEPTANCE OUTCOMES")
+        for item in d["post_acceptance_outcomes"]:
+            print(f"{item['outcome']}: {item['details'] or ''}")
     return 0
 
 
@@ -369,14 +377,17 @@ def cmd_diff(args) -> int:
 
 def cmd_accept(args) -> int:
     ctl = _controller(args)
-    commit = ctl.accept(args.job_id, args.message)
+    commit = ctl.accept(args.job_id, args.message, review_seconds=args.review_seconds,
+                        human_changed_lines=args.human_changed_lines)
     print(commit)
     return 0
 
 
 def cmd_reject(args) -> int:
     ctl = _controller(args)
-    ctl.reject(args.job_id, args.feedback)
+    ctl.reject(args.job_id, args.feedback, review_seconds=args.review_seconds,
+               repair_seconds=args.repair_seconds,
+               human_changed_lines=args.human_changed_lines)
     print("RETRY")
     return 0
 
@@ -461,6 +472,30 @@ def cmd_efficiency(args) -> int:
         print(
             f"{row['candidate']:<30} {row['attempts']:>8} {row['accepted']:>8} {row['success_rate']:>8.1%} {median:>10}"
         )
+    return 0
+
+
+def cmd_attention(args) -> int:
+    rows = _controller(args).db.attention_stats()
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    print(f"{'CANDIDATE':<32} {'JOBS':>5} {'STABLE':>7} {'REVIEW S':>10} {'REPAIR S':>10} {'NO EDIT':>8}")
+    for row in rows:
+        no_edit = row['no_edit_rate']
+        print(f"{row['candidate']:<32} {row['jobs']:>5} {row['stable_accepted'] or 0:>7} "
+              f"{row['avg_review_seconds'] or 0:>10.1f} {row['avg_repair_seconds'] or 0:>10.1f} "
+              f"{(100 * no_edit if no_edit is not None else 0):>7.1f}%")
+    return 0
+
+
+def cmd_outcome(args) -> int:
+    ctl = _controller(args)
+    ctl.db.record_post_acceptance_outcome(
+        args.job_id, args.outcome, details=args.details,
+        repair_seconds=args.repair_seconds, changed_lines=args.human_changed_lines,
+    )
+    print(args.outcome)
     return 0
 
 
@@ -836,11 +871,16 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("accept")
     s.add_argument("job_id")
     s.add_argument("--message")
+    s.add_argument("--review-seconds", type=float)
+    s.add_argument("--human-changed-lines", type=int)
     s.set_defaults(func=cmd_accept)
 
     s = sub.add_parser("reject")
     s.add_argument("job_id")
     s.add_argument("feedback")
+    s.add_argument("--review-seconds", type=float)
+    s.add_argument("--repair-seconds", type=float)
+    s.add_argument("--human-changed-lines", type=int)
     s.set_defaults(func=cmd_reject)
 
     s = sub.add_parser("record-manual")
@@ -872,6 +912,18 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("efficiency")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_efficiency)
+
+    s = sub.add_parser("attention")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_attention)
+
+    s = sub.add_parser("outcome")
+    s.add_argument("job_id")
+    s.add_argument("outcome", choices=["STABLE", "REOPENED", "REVERTED", "REGRESSION", "HOTFIX", "HUMAN_CORRECTION"])
+    s.add_argument("--details")
+    s.add_argument("--repair-seconds", type=float)
+    s.add_argument("--human-changed-lines", type=int)
+    s.set_defaults(func=cmd_outcome)
 
     s = sub.add_parser("export")
     s.add_argument("output")

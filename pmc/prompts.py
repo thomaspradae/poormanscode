@@ -49,7 +49,7 @@ def builder_prompt(
 
 def reviewer_prompt(job: Job, diff_text: str, verification_summary: str) -> str:
     return f"""You are an independent code reviewer. You did not author this patch.
-Do not modify the repository. Review only against the ticket, acceptance criteria, correctness,
+Do not modify project files; the only permitted write is PMC_REVIEW.json. Review only against the ticket, acceptance criteria, correctness,
 backwards compatibility, security, and unjustified scope. Mechanical tests are reported separately.
 Write a file named PMC_REVIEW.json containing exactly a JSON object with keys:
 verdict (ACCEPT or REJECT), summary (string), findings (array of strings).

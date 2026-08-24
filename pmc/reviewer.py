@@ -20,6 +20,7 @@ class ReviewerService:
         candidate: Candidate,
         attempt_no: int,
         verification_summary: str,
+        accounting=None,
     ) -> ReviewResult:
         diff = WorktreeManager(worktree.parent).diff(
             worktree, job.baseline_commit or "HEAD"
@@ -38,6 +39,7 @@ class ReviewerService:
                 worktree=review_dir,
                 prompt=reviewer_prompt(job, diff, verification_summary),
                 attempt_no=attempt_no,
+                accounting=accounting,
             )
             result = build_executor(candidate.executor).run(req)
             output = review_dir / "PMC_REVIEW.json"

@@ -37,6 +37,9 @@ class PMCConfig:
     candidates: list[Candidate] = field(default_factory=list)
     provider_credentials: dict[str, list[ProviderCredential]] = field(default_factory=dict)
     require_model_conformance: bool = False
+    router_policy: str = "contextual_thompson"
+    contextual_min_observations: int = 50
+    bandit_simulations: int = 256
 
 
 def _expand(value: str) -> Path:
@@ -132,6 +135,9 @@ def load_config(path: Path | None = None) -> PMCConfig:
         require_model_conformance=bool(
             core.get("require_model_conformance", False)
         ),
+        router_policy=str(core.get("router_policy", "contextual_thompson")),
+        contextual_min_observations=int(core.get("contextual_min_observations", 50)),
+        bandit_simulations=int(core.get("bandit_simulations", 256)),
     )
     for p in (cfg.db_path.parent, cfg.runs_dir, cfg.worktrees_dir):
         p.mkdir(parents=True, exist_ok=True)

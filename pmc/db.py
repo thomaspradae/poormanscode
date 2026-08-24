@@ -267,6 +267,19 @@ CREATE TABLE IF NOT EXISTS model_conformance (
     prompt_version TEXT, details_json TEXT NOT NULL DEFAULT '{}', checked_at TEXT NOT NULL,
     PRIMARY KEY(candidate,version)
 );
+CREATE TABLE IF NOT EXISTS post_acceptance_outcomes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL REFERENCES jobs(id),
+    attempt_id INTEGER REFERENCES attempts(id), outcome TEXT NOT NULL,
+    details TEXT, human_repair_seconds REAL, human_changed_lines INTEGER,
+    occurred_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_post_accept_job ON post_acceptance_outcomes(job_id,occurred_at);
+CREATE TABLE IF NOT EXISTS intelligence_allocations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL REFERENCES jobs(id),
+    attempt_id INTEGER, role TEXT NOT NULL, candidate TEXT, reason TEXT NOT NULL,
+    uncertainty REAL, state TEXT NOT NULL, result_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL, finished_at TEXT
+);
 """
 
 
@@ -305,6 +318,14 @@ class Database:
                 "quota_scope_id": "TEXT",
             },
             "model_requests": {"credential_id": "TEXT"},
+            "human_feedback": {
+                "review_started_at": "TEXT",
+                "review_finished_at": "TEXT",
+                "human_review_seconds": "REAL",
+                "human_repair_seconds": "REAL",
+                "human_changed_lines": "INTEGER",
+                "accepted_without_human_edit": "INTEGER",
+            },
         }
         for table, columns in additions.items():
             existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
@@ -633,6 +654,7 @@ class Database:
         details: dict[str, Any], status: str | None = None,
     ) -> None:
         status = status or ("AVAILABLE" if generation_ok and tool_ok else "QUARANTINED")
+        from .versioning import PROMPT_PROFILE_VERSION
         with self.connect() as conn:
             conn.execute(
                 """INSERT INTO model_conformance(candidate,version,status,generation_ok,tool_ok,
@@ -650,19 +672,25 @@ class Database:
                     int(tool_ok),
                     0 if status == "AVAILABLE" else 1,
                     candidate.tool_profile,
-                    candidate.prompt_profile,
+                    PROMPT_PROFILE_VERSION,
                     json.dumps(details, default=str),
                     utcnow(),
                 ),
             )
 
     def model_conformance(self, candidate: Any) -> dict[str, Any] | None:
+        from .versioning import PROMPT_PROFILE_VERSION
         with self.connect() as conn:
             row = conn.execute(
                 "SELECT * FROM model_conformance WHERE candidate=? AND version=?",
                 (candidate.name, candidate.version),
             ).fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        result = dict(row)
+        if result.get("prompt_version") != PROMPT_PROFILE_VERSION:
+            result["status"] = "STALE"
+        return result
 
     def reserve_quota(self, candidate: str, job_id: str, estimated_tokens: int,
                       credential_id: str | None = None,
@@ -846,13 +874,13 @@ class Database:
             },
         )
 
-    def model_request_totals(self, attempt_id: int) -> dict[str, Any]:
+    def model_request_totals(self, attempt_id: int, candidate: str | None = None) -> dict[str, Any]:
         with self.connect() as conn:
             row = conn.execute(
                 """SELECT COUNT(*) requests,COALESCE(SUM(actual_input_tokens),0) input_tokens,
                 COALESCE(SUM(actual_output_tokens),0) output_tokens,SUM(actual_cost_usd) cost_usd
-                FROM model_requests WHERE attempt_id=?""",
-                (attempt_id,),
+                FROM model_requests WHERE attempt_id=? AND (? IS NULL OR candidate=?)""",
+                (attempt_id, candidate, candidate),
             ).fetchone()
         return dict(row)
 
@@ -1773,6 +1801,156 @@ class Database:
                 ),
             )
 
+    def record_human_metrics(
+        self, job_id: str, attempt_id: int, *, review_seconds: float | None = None,
+        repair_seconds: float | None = None, changed_lines: int | None = None,
+        accepted_without_edit: bool | None = None,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """UPDATE human_feedback SET human_review_seconds=COALESCE(?,human_review_seconds),
+                human_repair_seconds=COALESCE(?,human_repair_seconds),
+                human_changed_lines=COALESCE(?,human_changed_lines),
+                accepted_without_human_edit=COALESCE(?,accepted_without_human_edit),
+                review_finished_at=? WHERE job_id=? AND attempt_id=?""",
+                (review_seconds, repair_seconds, changed_lines,
+                 int(accepted_without_edit) if accepted_without_edit is not None else None,
+                 utcnow(), job_id, attempt_id),
+            )
+
+    def record_post_acceptance_outcome(
+        self, job_id: str, outcome: str, *, details: str | None = None,
+        repair_seconds: float | None = None, changed_lines: int | None = None,
+    ) -> None:
+        allowed = {"STABLE", "REOPENED", "REVERTED", "REGRESSION", "HOTFIX", "HUMAN_CORRECTION"}
+        if outcome not in allowed:
+            raise ValueError(f"invalid post-acceptance outcome: {outcome}")
+        if self.get_job(job_id).state != JobState.ACCEPTED:
+            raise RuntimeError("post-acceptance outcomes require an ACCEPTED job")
+        attempt_id = self.latest_ready_attempt_id(job_id)
+        with self.connect() as conn:
+            conn.execute(
+                """INSERT INTO post_acceptance_outcomes
+                (job_id,attempt_id,outcome,details,human_repair_seconds,human_changed_lines,occurred_at)
+                VALUES(?,?,?,?,?,?,?)""",
+                (job_id, attempt_id, outcome, details, repair_seconds, changed_lines, utcnow()),
+            )
+        self.event(outcome if outcome != "REGRESSION" else "REGRESSION_FOUND",
+                   job_id=job_id, attempt_id=attempt_id,
+                   payload={"details": details, "human_repair_seconds": repair_seconds,
+                            "human_changed_lines": changed_lines})
+
+    def begin_intelligence_allocation(
+        self, job_id: str, attempt_id: int | None, role: str, candidate: str | None,
+        reason: str, uncertainty: float | None,
+    ) -> int:
+        with self.connect() as conn:
+            cur = conn.execute(
+                """INSERT INTO intelligence_allocations
+                (job_id,attempt_id,role,candidate,reason,uncertainty,state,created_at)
+                VALUES(?,?,?,?,?,?,'STARTED',?)""",
+                (job_id, attempt_id, role, candidate, reason, uncertainty, utcnow()),
+            )
+        allocation_id = int(cur.lastrowid)
+        self.event("INTELLIGENCE_ALLOCATED", job_id=job_id, attempt_id=attempt_id,
+                   payload={"allocation_id": allocation_id, "role": role,
+                            "candidate": candidate, "reason": reason,
+                            "uncertainty": uncertainty})
+        return allocation_id
+
+    def finish_intelligence_allocation(self, allocation_id: int, state: str,
+                                       result: dict[str, Any]) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """UPDATE intelligence_allocations SET state=?,result_json=?,finished_at=?
+                WHERE id=?""", (state, json.dumps(result, default=str), utcnow(), allocation_id)
+            )
+
+    def update_attempt_context(self, attempt_id: int, content_hash: str,
+                               manifest: dict[str, Any]) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE attempts SET context_hash=?,context_manifest_json=? WHERE id=?",
+                (content_hash, json.dumps(manifest, default=str), attempt_id),
+            )
+
+    def contextual_candidate_stats(self, job: Job, role: str, phase: str,
+                                   repo_specific: bool = True) -> list[dict[str, Any]]:
+        """Stable human outcomes for the exact context, excluding infrastructure failures."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT a.candidate,COUNT(*) observations,
+                SUM(CASE WHEN hf.verdict='ACCEPT' AND EXISTS (
+                    SELECT 1 FROM post_acceptance_outcomes po WHERE po.job_id=j.id
+                    AND po.outcome='STABLE'
+                ) AND NOT EXISTS (
+                    SELECT 1 FROM post_acceptance_outcomes po WHERE po.job_id=j.id
+                    AND po.outcome IN ('REOPENED','REVERTED','REGRESSION','HOTFIX','HUMAN_CORRECTION')
+                ) THEN 1 ELSE 0 END) stable_successes,
+                AVG(COALESCE(hf.human_review_seconds,0)+COALESCE(hf.human_repair_seconds,0)) human_seconds,
+                AVG(COALESCE(a.duration_seconds,0)) latency_seconds,
+                AVG(COALESCE(a.cost_usd,0)) cost_usd
+                FROM attempts a JOIN jobs j ON j.id=a.job_id
+                JOIN human_feedback hf ON hf.attempt_id=a.id AND hf.verdict IN ('ACCEPT','REJECT')
+                WHERE a.role=? AND j.task_type=? AND j.complexity=? AND j.risk=?
+                AND (?=0 OR j.repo=?)
+                AND (?='all' OR (?='first' AND a.attempt_no=1) OR (?='repair' AND a.attempt_no>1))
+                AND COALESCE(a.outcome,'') NOT IN
+                ('PROVIDER_FAILURE','RATE_LIMIT','RESOURCE_FAILURE','EXECUTOR_FAILURE','EXECUTOR_CRASH','TIMEOUT','CANCELLED')
+                AND (hf.verdict='REJECT' OR EXISTS (
+                    SELECT 1 FROM post_acceptance_outcomes mature WHERE mature.job_id=j.id
+                ))
+                GROUP BY a.candidate""",
+                (role, job.task_type, job.complexity, job.risk,
+                 int(repo_specific), str(job.repo), phase, phase, phase),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def human_observation_count(self, role: str = "builder") -> int:
+        with self.connect() as conn:
+            if role != "builder":
+                return int(conn.execute(
+                    """SELECT COUNT(*) FROM intelligence_allocations ia
+                    JOIN human_feedback hf ON hf.job_id=ia.job_id
+                    WHERE LOWER(ia.role)=LOWER(?) AND ia.state IN ('SUCCEEDED','REJECTED')
+                    AND (hf.verdict='REJECT' OR EXISTS (
+                        SELECT 1 FROM post_acceptance_outcomes po WHERE po.job_id=ia.job_id
+                    ))""", (role,)
+                ).fetchone()[0])
+            return int(conn.execute(
+                """SELECT COUNT(*) FROM attempts a JOIN human_feedback hf ON hf.attempt_id=a.id
+                WHERE a.role=? AND (hf.verdict='REJECT' OR (
+                    hf.verdict='ACCEPT' AND EXISTS (
+                        SELECT 1 FROM post_acceptance_outcomes po WHERE po.job_id=a.job_id
+                    )))""", (role,)
+            ).fetchone()[0])
+
+    def contextual_role_stats(self, job: Job, role: str) -> list[dict[str, Any]]:
+        """Outcome attribution for planner/reviewer/challenger candidate selection."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT ia.candidate,COUNT(*) observations,
+                SUM(CASE WHEN LOWER(ia.role)='reviewer'
+                    AND UPPER(COALESCE(json_extract(ia.result_json,'$.verdict'),''))=hf.verdict
+                    THEN 1 WHEN LOWER(ia.role)!='reviewer' AND hf.verdict='ACCEPT' AND EXISTS (
+                    SELECT 1 FROM post_acceptance_outcomes stable
+                    WHERE stable.job_id=ia.job_id AND stable.outcome='STABLE'
+                ) AND NOT EXISTS (
+                    SELECT 1 FROM post_acceptance_outcomes bad WHERE bad.job_id=ia.job_id
+                    AND bad.outcome IN ('REOPENED','REVERTED','REGRESSION','HOTFIX','HUMAN_CORRECTION')
+                ) THEN 1 ELSE 0 END) stable_successes,
+                0.0 human_seconds,0.0 latency_seconds,0.0 cost_usd
+                FROM intelligence_allocations ia JOIN jobs j ON j.id=ia.job_id
+                JOIN human_feedback hf ON hf.job_id=ia.job_id
+                WHERE LOWER(ia.role)=LOWER(?) AND ia.state IN ('SUCCEEDED','REJECTED')
+                AND j.task_type=? AND j.complexity=? AND j.risk=?
+                AND (hf.verdict='REJECT' OR EXISTS (
+                    SELECT 1 FROM post_acceptance_outcomes mature WHERE mature.job_id=ia.job_id
+                )) GROUP BY ia.candidate""",
+                (role, job.task_type, job.complexity, job.risk),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def feedback_text(self, job_id: str) -> str:
         with self.connect() as conn:
             rows = conn.execute(
@@ -1933,6 +2111,38 @@ class Database:
             )
         return result
 
+    def attention_stats(self) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT a.candidate,COUNT(DISTINCT a.job_id) jobs,
+                SUM(CASE WHEN hf.verdict='ACCEPT' THEN 1 ELSE 0 END) accepted,
+                SUM(CASE WHEN hf.verdict='ACCEPT' AND EXISTS (
+                    SELECT 1 FROM post_acceptance_outcomes stable WHERE stable.job_id=a.job_id
+                    AND stable.outcome='STABLE'
+                ) AND NOT EXISTS (
+                    SELECT 1 FROM post_acceptance_outcomes po WHERE po.job_id=a.job_id
+                    AND po.outcome IN ('REOPENED','REVERTED','REGRESSION','HOTFIX','HUMAN_CORRECTION')
+                ) THEN 1 ELSE 0 END) stable_accepted,
+                AVG(hf.human_review_seconds) avg_review_seconds,
+                AVG(hf.human_repair_seconds) avg_repair_seconds,
+                AVG(hf.human_changed_lines) avg_human_changed_lines,
+                AVG(CASE WHEN hf.accepted_without_human_edit=1 THEN 1.0 ELSE 0.0 END) no_edit_rate,
+                COALESCE((SELECT SUM(COALESCE(mr.actual_cost_usd,0))
+                    FROM model_requests mr WHERE EXISTS (
+                        SELECT 1 FROM attempts owner WHERE owner.job_id=mr.job_id
+                        AND owner.role='builder' AND owner.candidate=a.candidate
+                    )),0) total_cost,
+                COALESCE((SELECT SUM(COALESCE(po.human_repair_seconds,0))
+                    FROM post_acceptance_outcomes po WHERE EXISTS (
+                        SELECT 1 FROM attempts owner WHERE owner.job_id=po.job_id
+                        AND owner.role='builder' AND owner.candidate=a.candidate
+                    )),0) post_acceptance_repair_seconds,
+                AVG(a.duration_seconds) avg_attempt_seconds
+                FROM attempts a LEFT JOIN human_feedback hf ON hf.attempt_id=a.id
+                WHERE a.role='builder' AND a.finished_at IS NOT NULL GROUP BY a.candidate"""
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def active_count_many(self, candidate_names: list[str]) -> int:
         if not candidate_names:
             return 0
@@ -2019,6 +2229,14 @@ class Database:
                 WHERE a.job_id=? ORDER BY a.attempt_no""",
                 (job_id,),
             ).fetchall()
+            allocations = conn.execute(
+                "SELECT * FROM intelligence_allocations WHERE job_id=? ORDER BY id",
+                (job_id,),
+            ).fetchall()
+            outcomes = conn.execute(
+                "SELECT * FROM post_acceptance_outcomes WHERE job_id=? ORDER BY id",
+                (job_id,),
+            ).fetchall()
         if not job:
             raise KeyError(job_id)
         return {
@@ -2026,6 +2244,8 @@ class Database:
             "attempts": [dict(x) for x in attempts],
             "verifications": [dict(x) for x in verifications],
             "reviews": [dict(x) for x in reviews],
+            "intelligence_allocations": [dict(x) for x in allocations],
+            "post_acceptance_outcomes": [dict(x) for x in outcomes],
             "feedback": [dict(x) for x in feedback],
         }
 

@@ -23,6 +23,7 @@ from .db import Database
 from .domain import AttemptStatus, ExecutionRequest, ExecutionResult, JobState, Outcome
 from .executors import build_executor
 from .gitops import WorktreeManager
+from .intelligence import advisory_call, allocate_intelligence
 from .prompts import builder_prompt
 from .reporting import Reporter
 from .research import ResearchService
@@ -125,6 +126,9 @@ class Controller:
             cfg.min_samples_per_candidate,
             self.capabilities,
             cfg.require_model_conformance,
+            cfg.router_policy,
+            cfg.contextual_min_observations,
+            cfg.bandit_simulations,
         )
         self.reporter = Reporter(cfg.runs_dir, cfg.artifact_max_bytes)
         self.owner = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
@@ -235,6 +239,14 @@ class Controller:
         used: list[str] = []
         retry_exclude: set[str] = set()
         retry_same: str | None = None
+        contextual_rows = self.db.contextual_candidate_stats(job, "builder", "all")
+        observations = sum(int(row["observations"]) for row in contextual_rows)
+        verification_strong = bool(repo_cfg.get("test")) and bool(
+            repo_cfg.get("build") or repo_cfg.get("lint") or repo_cfg.get("typecheck")
+        )
+        intelligence_plan = allocate_intelligence(
+            job, verification_strong=verification_strong, observations=observations
+        )
 
         run_started = time.monotonic()
         max_attempts = min(job.budget.max_attempts, 1 + job.budget.max_repairs)
@@ -344,6 +356,7 @@ class Controller:
                     "budget": asdict(job.budget),
                     "complexity": job.complexity,
                     "risk": job.risk,
+                    "intelligence_plan": asdict(intelligence_plan),
                 })
                 self.db.record_decision(job.id, attempt_no, decision)
             candidate = decision.candidate
@@ -438,6 +451,56 @@ class Controller:
                 context_hash=context_bundle.content_hash,
                 context_manifest=context_bundle.manifest,
             )
+            planner_pool = [
+                c for c in self.cfg.candidates
+                if c.role == "planner" and c.name != candidate.name
+            ]
+            planner_advice: list[str] = []
+            for planner_index in range(min(intelligence_plan.planners, len(planner_pool))):
+                allocation_id = None
+                try:
+                    planner_decision = self.scheduler.choose(
+                        job, planner_pool, role="planner", attempt_no=attempt_no,
+                        exclude={x.name for x in planner_pool[:planner_index]},
+                    )
+                    planner = planner_decision.candidate
+                    allocation_id = self.db.begin_intelligence_allocation(
+                        job.id, attempt_id, "PLANNER", planner.name,
+                        intelligence_plan.reason, intelligence_plan.uncertainty,
+                    )
+                    accounting = ModelRequestAccounting(
+                        self.db, job_id=job.id, attempt_id=attempt_id,
+                        candidate=planner, budget=job.budget,
+                    )
+                    advice = advisory_call(
+                        planner, accounting,
+                        "Provide a concise implementation plan and identify hidden risks. "
+                        "Do not write code.\n\n" + prompt,
+                    )
+                    planner_advice.append(advice)
+                    self.db.finish_intelligence_allocation(
+                        allocation_id, "SUCCEEDED", {"advice": advice}
+                    )
+                except Exception as exc:
+                    if allocation_id is not None:
+                        self.db.finish_intelligence_allocation(
+                            allocation_id, "FAILED", {"error": str(exc)}
+                        )
+            if planner_advice:
+                prompt += "\n\nINDEPENDENT PLANNING ADVICE:\n" + "\n\n---\n\n".join(planner_advice)
+                req.prompt = prompt
+                augmented_manifest = dict(context_bundle.manifest)
+                augmented_manifest["planner_advice_hash"] = stable_hash(planner_advice)
+                self.db.update_attempt_context(
+                    attempt_id, stable_hash({"base": context_bundle.content_hash,
+                                             "planner_advice": planner_advice}),
+                    augmented_manifest,
+                )
+                self.reporter.text(
+                    job.id, f"attempt-{attempt_no:02d}-prompt.txt", prompt + "\n"
+                )
+                self.reporter.json(job.id, f"attempt-{attempt_no:02d}-planning.json",
+                                   {"advice": planner_advice, "reason": intelligence_plan.reason})
             if candidate.executor == "bash":
                 req.accounting = ModelRequestAccounting(
                     self.db, job_id=job.id, attempt_id=attempt_id, candidate=candidate,
@@ -539,7 +602,7 @@ class Controller:
                     payload=result.raw_metrics,
                 )
             elif candidate.executor == "bash":
-                totals = self.db.model_request_totals(attempt_id)
+                totals = self.db.model_request_totals(attempt_id, candidate.name)
                 result.raw_metrics["model_request_totals"] = totals
                 recorded = totals["input_tokens"] + totals["output_tokens"]
                 reported = (result.input_tokens or 0) + (result.output_tokens or 0)
@@ -682,7 +745,43 @@ class Controller:
                 self.db.set_state(job.id, JobState.RETRY)
                 continue
 
-            if self.cfg.review_enabled and job.budget.max_reviews > 0:
+            challenger_advice = ""
+            challenger_pool = [
+                c for c in self.cfg.candidates
+                if c.role == "challenger" and c.name != candidate.name
+            ]
+            if intelligence_plan.challenger and challenger_pool:
+                challenger_decision = self.scheduler.choose(
+                    job, challenger_pool, role="challenger", attempt_no=attempt_no
+                )
+                challenger = challenger_decision.candidate
+                allocation_id = self.db.begin_intelligence_allocation(
+                    job.id, attempt_id, "CHALLENGER", challenger.name,
+                    intelligence_plan.reason, intelligence_plan.uncertainty,
+                )
+                try:
+                    challenger_accounting = ModelRequestAccounting(
+                        self.db, job_id=job.id, attempt_id=attempt_id,
+                        candidate=challenger, budget=job.budget,
+                    )
+                    challenger_advice = advisory_call(
+                        challenger, challenger_accounting,
+                        "Act as an independent challenger. Inspect this verified diff and identify "
+                        "a materially better solution or serious hidden defect. Be concise; do not edit.\n\n"
+                        + self.worktrees.diff(job.worktree, job.baseline_commit),
+                    )
+                    self.db.finish_intelligence_allocation(
+                        allocation_id, "SUCCEEDED", {"opinion": challenger_advice}
+                    )
+                    self.reporter.json(job.id, f"attempt-{attempt_no:02d}-challenger.json",
+                                       {"candidate": challenger.name, "opinion": challenger_advice})
+                except Exception as exc:
+                    self.db.finish_intelligence_allocation(
+                        allocation_id, "FAILED", {"error": str(exc)}
+                    )
+
+            automatic_review = intelligence_plan.reviewers > 0
+            if (self.cfg.review_enabled or automatic_review) and job.budget.max_reviews > 0:
                 self.db.set_state(job.id, JobState.REVIEWING)
                 reviewer_pool = [
                     c
@@ -690,38 +789,56 @@ class Controller:
                     if c.role == "reviewer" and c.name != candidate.name
                 ]
                 if reviewer_pool:
-                    review_decision = self.scheduler.choose(
-                        job, reviewer_pool, role="reviewer", attempt_no=attempt_no
+                    rejected_review = None
+                    reviewer_used: set[str] = set()
+                    review_count = min(
+                        intelligence_plan.reviewers or 1,
+                        job.budget.max_reviews, len(reviewer_pool),
                     )
-                    review = ReviewerService().review(
-                        job=job,
-                        worktree=job.worktree,
-                        candidate=review_decision.candidate,
-                        attempt_no=attempt_no,
-                        verification_summary=self._verification_summary(v),
-                    )
-                    self.db.record_review(
-                        attempt_id, review_decision.candidate.name, review
-                    )
-                    self.reporter.record_review(job.id, attempt_no, review)
-                    if not review.ok:
+                    for _ in range(review_count):
+                        review_decision = self.scheduler.choose(
+                            job, reviewer_pool, role="reviewer", attempt_no=attempt_no,
+                            exclude=reviewer_used,
+                        )
+                        reviewer_used.add(review_decision.candidate.name)
+                        allocation_id = self.db.begin_intelligence_allocation(
+                            job.id, attempt_id, "REVIEWER", review_decision.candidate.name,
+                            intelligence_plan.reason, intelligence_plan.uncertainty,
+                        )
+                        review_accounting = ModelRequestAccounting(
+                            self.db, job_id=job.id, attempt_id=attempt_id,
+                            candidate=review_decision.candidate, budget=job.budget,
+                        )
+                        review = ReviewerService().review(
+                            job=job, worktree=job.worktree,
+                            candidate=review_decision.candidate, attempt_no=attempt_no,
+                            verification_summary=self._verification_summary(v)
+                            + ("\nCHALLENGER OPINION:\n" + challenger_advice if challenger_advice else ""),
+                            accounting=review_accounting,
+                        )
+                        self.db.finish_intelligence_allocation(
+                            allocation_id, "SUCCEEDED" if review.ok else "REJECTED",
+                            {"verdict": review.verdict, "summary": review.summary,
+                             "findings": review.findings},
+                        )
+                        self.db.record_review(attempt_id, review_decision.candidate.name, review)
+                        self.reporter.json(
+                            job.id, f"review-{attempt_no:02d}-{len(reviewer_used)}.json", review
+                        )
+                        if not review.ok:
+                            rejected_review = review
+                            break
+                    if rejected_review:
                         self.db.finish_attempt(
-                            attempt_id,
-                            AttemptStatus.REVIEW_FAILED.value,
-                            result,
-                            duration,
-                            outcome=Outcome.REVIEW_FAILURE.value,
+                            attempt_id, AttemptStatus.REVIEW_FAILED.value, result,
+                            duration, outcome=Outcome.REVIEW_FAILURE.value,
                         )
                         failures.append(
                             f"Attempt {attempt_no} independent review rejected:\n"
-                            + review.summary
-                            + "\n"
-                            + "\n".join(review.findings)
+                            + rejected_review.summary + "\n"
+                            + "\n".join(rejected_review.findings)
                         )
-                        if (
-                            used.count(candidate.name)
-                            <= self.cfg.same_candidate_retries
-                        ):
+                        if used.count(candidate.name) <= self.cfg.same_candidate_retries:
                             retry_same = candidate.name
                         else:
                             retry_exclude.add(candidate.name)
@@ -771,7 +888,9 @@ class Controller:
             self.db.update_job(job)
             self.reporter.record_job(job)
 
-    def accept(self, job_id: str, message: str | None = None) -> str:
+    def accept(self, job_id: str, message: str | None = None, *,
+               review_seconds: float | None = None,
+               human_changed_lines: int | None = None) -> str:
         job = self.db.get_job(job_id)
         if job.state != JobState.READY:
             raise RuntimeError(f"{job.id} must be READY_FOR_REVIEW, not {job.state}")
@@ -787,21 +906,37 @@ class Controller:
         if ready_attempt is None:
             raise RuntimeError("job has no READY attempt to accept")
         self.db.complete_acceptance(job.id, ready_attempt, commit)
+        self.db.record_human_metrics(
+            job.id, ready_attempt, review_seconds=review_seconds,
+            changed_lines=human_changed_lines,
+            accepted_without_edit=(human_changed_lines == 0)
+            if human_changed_lines is not None else None,
+        )
         job.state = JobState.ACCEPTED
         self.reporter.summary(job, commit=commit)
         self._write_event_audit(job.id)
         return commit
 
-    def reject(self, job_id: str, feedback: str) -> None:
+    def reject(self, job_id: str, feedback: str, *,
+               review_seconds: float | None = None,
+               repair_seconds: float | None = None,
+               human_changed_lines: int | None = None) -> None:
         job = self.db.get_job(job_id)
         if job.state not in {JobState.READY, JobState.FAILED, JobState.RETRY}:
             raise RuntimeError(f"cannot reject job in state {job.state}")
+        ready_attempt = self.db.latest_ready_attempt_id(job.id)
         self.db.add_feedback(
             job.id,
             "REJECT",
             feedback,
-            attempt_id=self.db.latest_ready_attempt_id(job.id),
+            attempt_id=ready_attempt,
         )
+        if ready_attempt is not None:
+            self.db.record_human_metrics(
+                job.id, ready_attempt, review_seconds=review_seconds,
+                repair_seconds=repair_seconds, changed_lines=human_changed_lines,
+                accepted_without_edit=False,
+            )
         self.db.event(
             "HUMAN_REJECTED",
             job_id=job.id,

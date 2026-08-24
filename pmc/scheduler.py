@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import math
 import random
 from dataclasses import dataclass
@@ -32,12 +33,75 @@ class Scheduler:
         min_samples: int,
         capability_registry=None,
         require_model_conformance: bool = False,
+        router_policy: str = "contextual_thompson",
+        contextual_min_observations: int = 50,
+        bandit_simulations: int = 256,
     ):
         self.db = db
         self.exploration_rate = exploration_rate
         self.min_samples = min_samples
         self.capability_registry = capability_registry
         self.require_model_conformance = require_model_conformance
+        self.router_policy = router_policy
+        self.contextual_min_observations = contextual_min_observations
+        self.bandit_simulations = bandit_simulations
+
+    def _contextual_thompson(
+        self, job: Job, pool: list[Candidate], unavailable: dict[str, str],
+        role: str, phase: str, attempt_no: int,
+    ) -> SchedulerDecision:
+        rows = (
+            self.db.contextual_candidate_stats(job, role, phase, repo_specific=True)
+            if role == "builder" else self.db.contextual_role_stats(job, role)
+        )
+        context_level = "repo"
+        if not rows and role == "builder":
+            rows = self.db.contextual_candidate_stats(job, role, phase, repo_specific=False)
+            context_level = "cross_repo"
+        stats = {r["candidate"]: r for r in rows}
+        seed_text = f"{job.id}:{attempt_no}:{role}:{SCHEDULER_POLICY_VERSION}"
+        seed = int(hashlib.sha256(seed_text.encode()).hexdigest()[:16], 16)
+        rng = random.Random(seed)
+        capacity = {
+            provider: self.db.provider_capacity(provider)
+            for provider in {c.provider for c in pool if c.provider}
+        }
+
+        def draw(candidate: Candidate) -> float:
+            row = stats.get(candidate.name, {})
+            n = int(row.get("observations") or 0)
+            wins = int(row.get("stable_successes") or 0)
+            quality = rng.betavariate(1 + wins, 1 + max(0, n - wins))
+            attention = min(0.20, float(row.get("human_seconds") or 0) / 3600)
+            latency = min(0.10, math.log1p(float(row.get("latency_seconds") or 0)) / 120)
+            cost = min(0.20, float(row.get("cost_usd") or candidate.monetary_cost_hint or 0) / 2)
+            provider_capacity = capacity.get(candidate.provider or "", {})
+            scarcity = 0.05 if provider_capacity and provider_capacity.get("available_concurrency", 0) <= 1 else 0
+            return quality - attention - latency - cost - scarcity
+
+        wins = {candidate.name: 0 for candidate in pool}
+        for _ in range(max(32, self.bandit_simulations)):
+            best = max(pool, key=draw)
+            wins[best.name] += 1
+        sampled = [(draw(candidate), candidate) for candidate in pool]
+        chosen_score, chosen = max(sampled, key=lambda item: item[0])
+        simulations = max(32, self.bandit_simulations)
+        probability = (wins[chosen.name] + 1) / (simulations + len(pool))
+        row = stats.get(chosen.name, {})
+        uncertainty = 1 / math.sqrt(2 + int(row.get("observations") or 0))
+        return SchedulerDecision(
+            chosen, "contextual_thompson", chosen_score,
+            "contextual stable-outcome Thompson sample",
+            [c.name for c in pool], unavailable, probability,
+            SCHEDULER_POLICY_VERSION,
+            {"seed": seed, "simulations": simulations,
+             "context": {"task_type": job.task_type, "complexity": job.complexity,
+                         "risk": job.risk, "phase": phase, "repo": str(job.repo),
+                         "level": context_level},
+             "propensities": {name: (count + 1) / (simulations + len(pool))
+                              for name, count in wins.items()},
+             "uncertainty": uncertainty, "context_stats": stats},
+        )
 
     def available(
         self, c: Candidate, universe: list[Candidate] | None = None
@@ -175,6 +239,13 @@ class Scheduler:
                     )
 
         phase = "first" if attempt_no == 1 else "repair"
+        if (
+            self.router_policy == "contextual_thompson"
+            and self.db.human_observation_count(role) >= self.contextual_min_observations
+        ):
+            return self._contextual_thompson(
+                job, pool, unavailable, role, phase, attempt_no
+            )
         stats = self._stats_map(role, job.task_type, phase)
         under_sampled = [
             c
@@ -183,10 +254,9 @@ class Scheduler:
             and int(stats.get(c.name, {}).get("attempts", 0)) < self.min_samples
         ]
         if under_sampled:
-            c = min(
-                under_sampled,
-                key=lambda x: int(stats.get(x.name, {}).get("attempts", 0)),
-            )
+            minimum = min(int(stats.get(x.name, {}).get("attempts", 0)) for x in under_sampled)
+            least_sampled = [x for x in under_sampled if int(stats.get(x.name, {}).get("attempts", 0)) == minimum]
+            c = random.choice(least_sampled)
             return SchedulerDecision(
                 c,
                 "cold_start",

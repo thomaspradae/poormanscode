@@ -10,6 +10,9 @@ review_enabled = false
 lease_ttl_seconds = 300
 verifier_sandbox = "bwrap"
 require_model_conformance = true
+router_policy = "contextual_thompson"
+contextual_min_observations = 50
+bandit_simulations = 256
 
 [[providers.groq.credentials]]
 id = "groq-1"
@@ -118,13 +121,37 @@ max_concurrency = 3
 # authors do not review themselves when alternatives exist.
 [[candidates]]
 name = "gemini-reviewer"
+provider = "gemini"
 enabled = false
 executor = "bash"
 role = "reviewer"
 model = "gemini-3-flash-preview"
 base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
-api_key_env = "GEMINI_API_KEY"
 quota_group = "gemini"
 max_turns = 8
+sandbox = "bwrap"
+network = false
+
+[[candidates]]
+name = "gemini-planner"
+provider = "gemini"
+enabled = false
+executor = "bash"
+role = "planner"
+model = "gemini-3-flash-preview"
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+max_turns = 4
+sandbox = "bwrap"
+network = false
+
+[[candidates]]
+name = "groq-challenger"
+provider = "groq"
+enabled = false
+executor = "bash"
+role = "challenger"
+model = "openai/gpt-oss-20b"
+base_url = "https://api.groq.com/openai/v1"
+max_turns = 4
 sandbox = "bwrap"
 network = false
