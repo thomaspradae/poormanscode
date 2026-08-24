@@ -97,6 +97,125 @@ def test_bash_executes_native_shell_tool(tmp_path, monkeypatch):
     assert result.summary == "finished"
 
 
+def test_bash_executes_textual_shell_tool_for_local_models(tmp_path, monkeypatch):
+    candidate = Candidate(
+        name="local",
+        executor="bash",
+        model="m",
+        base_url="http://unused",
+        max_turns=2,
+        sandbox="guarded",
+        network=True,
+    )
+    request = ExecutionRequest(
+        Job("PMC-1", tmp_path, "task"), candidate, tmp_path, "task", 1
+    )
+    replies = iter(
+        [
+            ChatReply(
+                json.dumps(
+                    {"name": "shell", "arguments": {"command": "pwd"}}
+                )
+            ),
+            ChatReply('{"action":"done","summary":"finished"}'),
+        ]
+    )
+    monkeypatch.setattr(
+        "pmc.executors.bash.OpenAICompatibleClient.chat",
+        lambda *args, **kwargs: next(replies),
+    )
+    commands = []
+    monkeypatch.setattr(
+        BashExecutor,
+        "_command",
+        lambda self, request, command: (
+            commands.append(command)
+            or subprocess.CompletedProcess(["bash"], 0, "/repo\n", "")
+        ),
+    )
+
+    result = BashExecutor().run(request)
+
+    assert result.ok
+    assert commands == ["pwd"]
+
+
+def test_bash_accepts_native_json_completion_tool(tmp_path, monkeypatch):
+    candidate = Candidate(
+        name="test",
+        executor="bash",
+        model="m",
+        base_url="http://unused",
+        max_turns=1,
+        sandbox="guarded",
+        network=True,
+    )
+    request = ExecutionRequest(
+        Job("PMC-1", tmp_path, "task"), candidate, tmp_path, "task", 1
+    )
+    monkeypatch.setattr(
+        "pmc.executors.bash.OpenAICompatibleClient.chat",
+        lambda *args, **kwargs: ChatReply(
+            "",
+            tool_calls=[
+                {
+                    "id": "done-1",
+                    "type": "function",
+                    "function": {
+                        "name": "JSON",
+                        "arguments": json.dumps(
+                            {"action": "done", "summary": "finished"}
+                        ),
+                    },
+                }
+            ],
+        ),
+    )
+
+    result = BashExecutor().run(request)
+
+    assert result.ok
+    assert result.summary == "finished"
+
+
+def test_bash_retries_provider_server_error(tmp_path, monkeypatch):
+    candidate = Candidate(
+        name="test",
+        executor="bash",
+        model="m",
+        base_url="http://unused",
+        max_turns=1,
+        sandbox="guarded",
+        network=True,
+        extra={"server_error_retries": 1},
+    )
+    request = ExecutionRequest(
+        Job("PMC-1", tmp_path, "task"), candidate, tmp_path, "task", 1
+    )
+    replies = iter(
+        [
+            ProviderError(500, "temporary", {}),
+            ChatReply('{"action":"done","summary":"finished"}'),
+        ]
+    )
+
+    def chat(*args, **kwargs):
+        value = next(replies)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    sleeps = []
+    monkeypatch.setattr("pmc.executors.bash.OpenAICompatibleClient.chat", chat)
+    monkeypatch.setattr("pmc.executors.bash.time.sleep", sleeps.append)
+
+    result = BashExecutor().run(request)
+
+    assert result.ok
+    assert sleeps == [1.0]
+    assert result.raw_metrics["turns"][0]["provider_server_error"] == 500
+
+
 def test_bash_honors_retry_after_within_attempt(tmp_path, monkeypatch):
     candidate = Candidate(
         name="test",

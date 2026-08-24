@@ -47,6 +47,22 @@ RESEARCH_TOOL = {
         },
     },
 }
+DONE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "JSON",
+        "description": "Report that the ticket is complete after all required shell work and verification finished.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["done"]},
+                "summary": {"type": "string"},
+            },
+            "required": ["action", "summary"],
+            "additionalProperties": False,
+        },
+    },
+}
 
 
 class UnsafeCommand(RuntimeError):
@@ -135,12 +151,14 @@ class BashExecutor:
         protocol_errors = 0
         format_errors = 0
         rate_retries = int(c.extra.get("rate_limit_retries", 3))
+        server_retries = int(c.extra.get("server_error_retries", 2))
         tool_protocol_retries = int(c.extra.get("tool_protocol_retries", 2))
         command_counts: dict[str, int] = {}
         no_progress_turns = 0
         last_diff = ""
         for turn in range(c.max_turns):
             rate_try = 0
+            server_try = 0
             tool_protocol_try = 0
             while True:
                 ticket = None
@@ -154,8 +172,11 @@ class BashExecutor:
                         messages=messages,
                         temperature=float(c.extra.get("temperature", 0.0)),
                         max_tokens=int(c.extra.get("max_tokens", 4096)),
-                        extra_body=c.extra.get("request_extra"),
-                        tools=[SHELL_TOOL]
+                        extra_body={
+                            "parallel_tool_calls": False,
+                            **dict(c.extra.get("request_extra") or {}),
+                        },
+                        tools=[SHELL_TOOL, DONE_TOOL]
                         + ([RESEARCH_TOOL] if request.research else []),
                     )
                     if ticket:
@@ -173,6 +194,19 @@ class BashExecutor:
                             delay = 1.0
                         transcript.append(
                             {"turn": turn + 1, "rate_limited": True, "wait": delay}
+                        )
+                        time.sleep(delay)
+                        continue
+                    if 500 <= exc.status_code < 600 and server_try < server_retries:
+                        server_try += 1
+                        delay = float(min(2 ** (server_try - 1), 8))
+                        transcript.append(
+                            {
+                                "turn": turn + 1,
+                                "provider_server_error": exc.status_code,
+                                "retry": server_try,
+                                "wait": delay,
+                            }
                         )
                         time.sleep(delay)
                         continue
@@ -253,7 +287,17 @@ class BashExecutor:
                     arguments = json.loads(call["function"]["arguments"])
                     tool_name = call["function"]["name"]
                     if tool_name == "shell":
-                        action = {"action": "bash", "command": arguments["command"]}
+                        command = arguments.get("command") or arguments.get("cmd")
+                        if command is None and len(arguments) == 1:
+                            command = next(iter(arguments.values()))
+                        if not isinstance(command, str):
+                            raise KeyError("command")
+                        action = {"action": "bash", "command": command}
+                    elif tool_name == "JSON":
+                        action = {
+                            "action": arguments.get("action"),
+                            "summary": arguments.get("summary"),
+                        }
                     elif tool_name == "research" and request.research:
                         action = {"action": "research", "query": arguments["query"]}
                     else:
@@ -268,6 +312,13 @@ class BashExecutor:
                 messages.append({"role": "assistant", "content": reply.content})
                 try:
                     action = _extract_json(reply.content)
+                    if action.get("name") == "shell" and "action" not in action:
+                        arguments = action.get("arguments", {})
+                        if isinstance(arguments, str):
+                            arguments = json.loads(arguments)
+                        command = arguments.get("command") or arguments.get("cmd")
+                        if isinstance(command, str):
+                            action = {"action": "bash", "command": command}
                 except Exception as exc:  # noqa: BLE001 - report parser failure to model
                     protocol_errors += 1
                     obs = f"Protocol error: use the shell tool or return the done JSON. Parser error: {exc}"
@@ -297,7 +348,7 @@ class BashExecutor:
                     observation = json.dumps(
                         {"answer": researched.text, "sources": researched.sources}
                     )
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - research failures are observations
                     observation = f"research error: {type(exc).__name__}: {exc}"
                 transcript.append({"turn": turn + 1, "research": action["query"]})
                 messages.append(
