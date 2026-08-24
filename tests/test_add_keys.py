@@ -6,7 +6,19 @@ from pathlib import Path
 
 import pytest
 
-from pmc.add_keys import add_provider_keys
+from pmc.add_keys import add_provider_keys, planned_names
+
+
+def test_default_additional_names_follow_requested_numbering():
+    assert [name for name, _ in planned_names("")] == [
+        "MISTRAL_API_KEY_1",
+        "MISTRAL_API_KEY_2",
+        "MISTRAL_API_KEY_3",
+        "GROQ_API_KEY_2",
+        "NVIDIA_API_KEY_1",
+        "JULES_API_KEY_2",
+        "JULES_API_KEY_3",
+    ]
 
 
 def test_add_keys_preserves_existing_values_and_avoids_collisions(tmp_path: Path):
@@ -28,8 +40,8 @@ def test_add_keys_preserves_existing_values_and_avoids_collisions(tmp_path: Path
         "MISTRAL_API_KEY_3",
         "GROQ_API_KEY_2",
         "NVIDIA_API_KEY_1",
-        "JULES_API_KEY_1",
         "JULES_API_KEY_3",
+        "JULES_API_KEY_4",
     ]
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert "existing-groq" not in output.getvalue()

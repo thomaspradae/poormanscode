@@ -13,14 +13,16 @@ _ASSIGNMENT = re.compile(
     r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=", re.MULTILINE
 )
 _REQUESTS = (
-    ("MISTRAL_API_KEY", "Mistral key", 3),
-    ("GROQ_API_KEY", "Additional Groq key", 1),
-    ("NVIDIA_API_KEY", "NVIDIA key", 1),
-    ("JULES_API_KEY", "Additional Jules key", 2),
+    ("MISTRAL_API_KEY", "Mistral key", 3, 1),
+    ("GROQ_API_KEY", "Additional Groq key", 1, 2),
+    ("NVIDIA_API_KEY", "NVIDIA key", 1, 1),
+    ("JULES_API_KEY", "Additional Jules key", 2, 2),
 )
 
 
-def _next_names(existing: set[str], base: str, count: int) -> list[str]:
+def _next_names(
+    existing: set[str], base: str, count: int, first_number: int
+) -> list[str]:
     used = {
         int(match.group(1))
         for name in existing
@@ -30,7 +32,7 @@ def _next_names(existing: set[str], base: str, count: int) -> list[str]:
     if base in existing:
         used.add(1)
     names: list[str] = []
-    number = 1
+    number = first_number
     while len(names) < count:
         if number not in used:
             names.append(f"{base}_{number}")
@@ -42,8 +44,8 @@ def _next_names(existing: set[str], base: str, count: int) -> list[str]:
 def planned_names(contents: str) -> list[tuple[str, str]]:
     existing = set(_ASSIGNMENT.findall(contents))
     planned: list[tuple[str, str]] = []
-    for base, label, count in _REQUESTS:
-        names = _next_names(existing, base, count)
+    for base, label, count, first_number in _REQUESTS:
+        names = _next_names(existing, base, count, first_number)
         for index, name in enumerate(names, 1):
             prompt = label if count == 1 else f"{label} {index}"
             planned.append((name, prompt))
