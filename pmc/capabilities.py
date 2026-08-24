@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import shutil
 import socket
 from dataclasses import dataclass
@@ -81,11 +82,11 @@ def infer_required_capabilities(request: str, *, skeletal: bool = False) -> list
             required.add("scaffolder:vite")
     if any(term in text for term in ("browser test", "screenshot", "playwright")):
         required.add("browser")
-    if any(term in text for term in ("rust", "cargo")):
+    if re.search(r"\b(?:rust|cargo)\b", text):
         required.update({"rustc", "cargo"})
         if skeletal:
             required.add("scaffolder:cargo-init")
-    if any(term in text for term in (".net", "dotnet", "c# api", "asp.net")):
+    if re.search(r"(?:\b(?:dotnet|asp\.net)\b|(?<!\w)\.net\b|c# api)", text):
         required.add("dotnet")
         if skeletal:
             required.add("scaffolder:dotnet-new")

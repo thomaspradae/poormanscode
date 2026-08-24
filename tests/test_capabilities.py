@@ -45,3 +45,12 @@ def test_declared_remote_capability_is_eligible(tmp_path: Path):
         {"name": "remote", "executor": "bash", "capabilities": ["unity-editor"]}
     )
     assert scheduler.choose(job, [candidate]).candidate.name == "remote"
+
+
+def test_trustworthy_next_site_does_not_require_rust():
+    required = infer_required_capabilities(
+        "Build a trustworthy local Next.js website", skeletal=True
+    )
+    assert "rustc" not in required
+    assert "cargo" not in required
+    assert {"node", "npm", "scaffolder:create-next-app"} <= set(required)
