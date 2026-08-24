@@ -937,7 +937,12 @@ class Controller:
                repair_seconds: float | None = None,
                human_changed_lines: int | None = None) -> None:
         job = self.db.get_job(job_id)
-        if job.state not in {JobState.READY, JobState.FAILED, JobState.RETRY}:
+        if job.state not in {
+            JobState.READY,
+            JobState.FAILED,
+            JobState.RETRY,
+            JobState.BLOCKED,
+        }:
             raise RuntimeError(f"cannot reject job in state {job.state}")
         ready_attempt = self.db.latest_ready_attempt_id(job.id)
         self.db.add_feedback(
