@@ -12,7 +12,6 @@ from .domain import CommandResult, Job, VerificationResult
 from .gitops import git, intent_to_add_untracked
 from .sandbox import SandboxLimits, build_sandbox, scrubbed_environment
 
-
 SECRET_PATTERNS = [
     re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
@@ -38,10 +37,11 @@ def _run(
     file_bytes: int | None = 512 * 1024**2,
     address_space_bytes: int | None = None,
     processes: int = 128,
+    sandbox_config: dict[str, Any] | None = None,
 ) -> CommandResult:
     started = time.monotonic()
     try:
-        sandbox = build_sandbox(sandbox_name)
+        sandbox = build_sandbox(sandbox_name, sandbox_config)
         # Verifiers do not receive secrets. Use no-network when enforceable;
         # otherwise explicitly run with full network rather than overclaiming.
         network = force_network or not sandbox.supports_network_policy("none")
@@ -153,7 +153,11 @@ def _unity_report_result(worktree: Path, mode: str) -> CommandResult:
 
 
 def verify(
-    job: Job, worktree: Path, repo_cfg: dict[str, Any], sandbox_name: str = "guarded"
+    job: Job,
+    worktree: Path,
+    repo_cfg: dict[str, Any],
+    sandbox_name: str = "guarded",
+    sandbox_config: dict[str, Any] | None = None,
 ) -> VerificationResult:
     baseline = job.baseline_commit
     if not baseline:
@@ -191,7 +195,16 @@ def verify(
     for name in ("test", "lint", "typecheck", "build", "hidden_test"):
         command = repo_cfg.get(name)
         if command:
-            commands.append(_run(name, str(command), worktree, timeout, sandbox_name))
+            commands.append(
+                _run(
+                    name,
+                    str(command),
+                    worktree,
+                    timeout,
+                    sandbox_name,
+                    sandbox_config=sandbox_config,
+                )
+            )
     for name, command in profile_commands.items():
         report_mode = {
             "unity_editmode": "editmode",

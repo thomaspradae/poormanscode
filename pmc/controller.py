@@ -684,7 +684,16 @@ class Controller:
             self.worktrees.normalize_worker_commits(job.worktree, job.baseline_commit)
             self.db.set_state(job.id, JobState.VERIFYING)
             self.db.event("VERIFICATION_STARTED", job_id=job.id, attempt_id=attempt_id)
-            v = verify(job, job.worktree, repo_cfg, self.cfg.verifier_sandbox)
+            verifier_sandbox = str(
+                candidate.extra.get("verifier_sandbox", self.cfg.verifier_sandbox)
+            )
+            v = verify(
+                job,
+                job.worktree,
+                repo_cfg,
+                verifier_sandbox,
+                candidate.extra,
+            )
             self.db.record_verification(attempt_id, v)
             self.reporter.record_verification(job.id, attempt_no, v)
             if not v.ok:

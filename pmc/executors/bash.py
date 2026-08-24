@@ -122,7 +122,7 @@ class BashExecutor:
             workspace_files=int(c.extra.get("workspace_files", 50_000)),
             artifact_bytes=int(c.extra.get("artifact_mb", 512)) * 1024**2,
         )
-        sandbox = build_sandbox(c.sandbox)
+        sandbox = build_sandbox(c.sandbox, c.extra)
         policy = c.effective_network_policy
         if not sandbox.supports_network_policy(policy):
             raise RuntimeError(

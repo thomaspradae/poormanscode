@@ -671,7 +671,7 @@ def cmd_doctor(args) -> int:
         if c.executor == "bash":
             from .sandbox import build_sandbox
 
-            sandbox = build_sandbox(c.sandbox)
+            sandbox = build_sandbox(c.sandbox, c.extra)
             policy = c.effective_network_policy
             if not sandbox.supports_network_policy(policy):
                 print(

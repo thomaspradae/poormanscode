@@ -27,6 +27,31 @@ def test_guarded_sandbox_enforces_file_size_limit(tmp_path: Path):
     assert result.returncode != 0
 
 
+def test_remote_lxd_requires_safe_controller_owned_configuration(tmp_path: Path):
+    with pytest.raises(RuntimeError, match="safe remote_host"):
+        build_sandbox(
+            "remote-lxd",
+            {"remote_host": "ofi1; touch /tmp/bad", "remote_instance": "worker"},
+        )
+    with pytest.raises(RuntimeError, match="remote seed"):
+        build_sandbox(
+            "remote-lxd",
+            {
+                "remote_host": "ofi1",
+                "remote_instance": "worker",
+                "remote_seed_node_modules": "/home/user/node_modules",
+            },
+        )
+
+
+def test_remote_lxd_supports_only_no_network():
+    sandbox = build_sandbox(
+        "remote-lxd", {"remote_host": "ofi1", "remote_instance": "worker"}
+    )
+    assert sandbox.supports_network_policy("none")
+    assert not sandbox.supports_network_policy("full")
+
+
 @pytest.mark.skipif(
     subprocess.run(["id", "pmc-worker"], capture_output=True, check=False).returncode
     != 0,

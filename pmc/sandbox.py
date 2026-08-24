@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import base64
 import os
-import signal
+import re
+import shlex
 import shutil
+import signal
 import subprocess
+import tempfile
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -353,8 +357,114 @@ class ContainerSandbox(Sandbox):
         return [*args, "/bin/bash", "-lc", command]
 
 
-class RemoteSandbox(Sandbox):
-    name = "remote"
+class RemoteLxdSandbox(Sandbox):
+    """Run untrusted commands in a credential-free LXD container over SSH."""
+
+    name = "remote-lxd"
+    network_policies = frozenset({"none"})
+
+    def __init__(self, config: dict[str, Any] | None = None):
+        config = config or {}
+        self.host = str(config.get("remote_host", ""))
+        self.instance = str(config.get("remote_instance", ""))
+        self.seed_node_modules = str(config.get("remote_seed_node_modules", ""))
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", self.host):
+            raise RuntimeError("remote-lxd requires a safe remote_host")
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", self.instance):
+            raise RuntimeError("remote-lxd requires a safe remote_instance")
+        if self.seed_node_modules and not self.seed_node_modules.startswith(
+            "/opt/pmc-node-cache/"
+        ):
+            raise RuntimeError("remote seed must be under /opt/pmc-node-cache")
+
+    def _workspace(self, worktree: Path) -> str:
+        suffix = re.sub(r"[^A-Za-z0-9_.-]", "-", worktree.name)
+        return f"/workspace/{suffix}"
+
+    def _ssh(self, remote_command: str) -> list[str]:
+        return [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            self.host,
+            remote_command,
+        ]
+
+    def _sync_to_remote(self, worktree: Path) -> None:
+        remote = self._workspace(worktree)
+        prepare = (
+            f"lxc exec {shlex.quote(self.instance)} -- mkdir -p {shlex.quote(remote)}"
+        )
+        subprocess.run(self._ssh(prepare), check=True, capture_output=True, text=True)
+        tar = subprocess.Popen(
+            [
+                "tar",
+                "-C",
+                str(worktree),
+                "--exclude=.git",
+                "--exclude=node_modules",
+                "--exclude=.next",
+                "-cf",
+                "-",
+                ".",
+            ],
+            stdout=subprocess.PIPE,
+        )
+        extract = (
+            f"lxc exec {shlex.quote(self.instance)} -- "
+            f"tar -C {shlex.quote(remote)} -xf -"
+        )
+        receive = subprocess.run(
+            self._ssh(extract), stdin=tar.stdout, capture_output=True, check=False
+        )
+        assert tar.stdout is not None
+        tar.stdout.close()
+        tar_code = tar.wait()
+        if tar_code or receive.returncode:
+            raise RuntimeError("failed to synchronize worktree to remote sandbox")
+        if self.seed_node_modules:
+            seed = (
+                f"lxc exec {shlex.quote(self.instance)} -- /bin/bash -lc "
+                + shlex.quote(
+                    f"test -e {shlex.quote(remote)}/node_modules || "
+                    f"cp -a {shlex.quote(self.seed_node_modules)} "
+                    f"{shlex.quote(remote)}/node_modules"
+                )
+            )
+            subprocess.run(
+                self._ssh(seed), check=True, capture_output=True, text=True
+            )
+
+    def _sync_from_remote(self, worktree: Path) -> None:
+        remote = self._workspace(worktree)
+        archive = (
+            f"lxc exec {shlex.quote(self.instance)} -- tar -C {shlex.quote(remote)} "
+            "--exclude=.git --exclude=node_modules --exclude=.next -cf - ."
+        )
+        with tempfile.TemporaryDirectory(prefix="pmc-remote-sync-") as temp:
+            receive = subprocess.Popen(self._ssh(archive), stdout=subprocess.PIPE)
+            extract = subprocess.run(
+                ["tar", "-C", temp, "-xf", "-"],
+                stdin=receive.stdout,
+                capture_output=True,
+                check=False,
+            )
+            assert receive.stdout is not None
+            receive.stdout.close()
+            receive_code = receive.wait()
+            if receive_code or extract.returncode:
+                raise RuntimeError("failed to synchronize remote sandbox result")
+            for child in worktree.iterdir():
+                if child.name in {".git", "node_modules", ".next"}:
+                    continue
+                if child.is_dir() and not child.is_symlink():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink()
+            for child in Path(temp).iterdir():
+                shutil.move(str(child), worktree / child.name)
 
     def command(
         self,
@@ -365,7 +475,62 @@ class RemoteSandbox(Sandbox):
         readonly_bindings=(),
         writable_bindings=(),
     ) -> list[str]:
-        raise RuntimeError("remote sandboxes are executor-managed")
+        if network:
+            raise RuntimeError("remote-lxd worker network must remain disabled")
+        remote = self._workspace(worktree)
+        encoded = base64.b64encode(command.encode()).decode("ascii")
+        invoke = (
+            f"lxc exec {shlex.quote(self.instance)} "
+            "--env PATH=/usr/local/bin:/usr/bin:/bin "
+            "--env HOME=/tmp/pmc-home "
+            f"--cwd {shlex.quote(remote)} -- /bin/bash -lc "
+            f"{shlex.quote(f'echo {encoded} | base64 -d | /bin/bash')}"
+        )
+        return self._ssh(invoke)
+
+    def run(
+        self,
+        worktree: Path,
+        command: str,
+        *,
+        env: dict[str, str],
+        network: bool,
+        limits: SandboxLimits,
+        readonly_paths=(),
+        readonly_bindings=(),
+        writable_bindings=(),
+    ) -> subprocess.CompletedProcess[str]:
+        if network or readonly_paths or readonly_bindings or writable_bindings:
+            return subprocess.CompletedProcess(
+                [], 78, "", "PMC_POLICY_FAILURE: unsupported remote-lxd policy\n"
+            )
+        self._sync_to_remote(worktree)
+        limited = (
+            f"ulimit -t {limits.cpu_seconds}; ulimit -f "
+            f"{max(1, (limits.file_bytes or 512 * 1024**2) // 512)}; "
+            f"timeout --signal=TERM --kill-after=2 {limits.wall_seconds}s "
+            f"/bin/bash -lc {shlex.quote(command)}"
+        )
+        args = self.command(worktree, limited, False)
+        proc = subprocess.run(
+            args,
+            text=True,
+            capture_output=True,
+            env=scrubbed_environment(),
+            timeout=limits.wall_seconds + 15,
+            check=False,
+        )
+        self._sync_from_remote(worktree)
+        after_bytes, after_files = workspace_usage(worktree)
+        if after_bytes > limits.workspace_bytes or after_files > limits.workspace_files:
+            return subprocess.CompletedProcess(
+                args,
+                75,
+                proc.stdout,
+                proc.stderr
+                + f"\nPMC_RESOURCE_LIMIT:WORKSPACE_LIMIT bytes={after_bytes} files={after_files}\n",
+            )
+        return proc
 
 
 class GuardedSandbox(Sandbox):
@@ -384,13 +549,13 @@ class GuardedSandbox(Sandbox):
         return ["/bin/bash", "-lc", command]
 
 
-def build_sandbox(name: str) -> Sandbox:
+def build_sandbox(name: str, config: dict[str, Any] | None = None) -> Sandbox:
     if name == "bwrap":
         return ContainerSandbox()
     if name == "restricted-user":
         return RestrictedUserSandbox()
     if name in {"none", "guarded"}:
         return GuardedSandbox()
-    if name == "remote":
-        return RemoteSandbox()
+    if name in {"remote", "remote-lxd"}:
+        return RemoteLxdSandbox(config)
     raise RuntimeError(f"unknown sandbox mode: {name}")

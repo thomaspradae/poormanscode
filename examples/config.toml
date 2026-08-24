@@ -59,6 +59,37 @@ capabilities = ["python", "node", "npm"] # declare remote/special capabilities e
 request_extra = { parallel_tool_calls = false, reasoning_effort = "low" }
 tool_protocol_retries = 2
 
+# Example of a credential-free remote toolchain worker. The controller makes
+# model requests locally; only shell commands cross SSH into the no-network LXD
+# container. Use a shared resource_group to prevent concurrent jobs from
+# colliding in a single worker instance.
+[[candidates]]
+name = "groq-oss120-ofi1-node"
+version = "1"
+provider = "groq"
+enabled = false
+executor = "bash"
+role = "builder"
+model = "openai/gpt-oss-120b"
+base_url = "https://api.groq.com/openai/v1"
+max_turns = 30
+sandbox = "remote-lxd"
+network = false
+resource_class = "ofi1-lxd-node24"
+resource_group = "ofi1-lxd-node"
+resource_concurrency = 1
+capabilities = ["node", "npm", "scaffolder:create-next-app"]
+remote_host = "uace-ofi-01"
+remote_instance = "pmc-node-worker"
+remote_seed_node_modules = "/opt/pmc-node-cache/garage/node_modules"
+verifier_sandbox = "remote-lxd"
+command_timeout = 600
+memory_mb = 4096
+workspace_mb = 4096
+workspace_files = 100000
+request_extra = { parallel_tool_calls = false, reasoning_effort = "low" }
+tool_protocol_retries = 2
+
 [[candidates]]
 name = "gemini-flash-bash"
 enabled = false
