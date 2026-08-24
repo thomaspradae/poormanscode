@@ -35,8 +35,11 @@ SHELL_TOOL = {
                     "description": "The bash command to execute (preferred field).",
                 },
                 "cmd": {
-                    "type": "string",
-                    "description": "Compatibility alias for command.",
+                    "description": "Compatibility alias; an array runs commands in order.",
+                    "oneOf": [
+                        {"type": "string"},
+                        {"type": "array", "items": {"type": "string"}},
+                    ],
                 },
             },
             "additionalProperties": False,
@@ -76,6 +79,14 @@ DONE_TOOL = {
 
 class UnsafeCommand(RuntimeError):
     pass
+
+
+def _normalize_shell_command(value: Any) -> str | None:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list) and value and all(isinstance(x, str) for x in value):
+        return "\n".join(value)
+    return None
 
 
 def _clean_child_env() -> dict[str, str]:
@@ -303,10 +314,14 @@ class BashExecutor:
                     arguments = json.loads(call["function"]["arguments"])
                     tool_name = call["function"]["name"]
                     if tool_name == "shell":
-                        command = arguments.get("command") or arguments.get("cmd")
+                        command = _normalize_shell_command(
+                            arguments.get("command") or arguments.get("cmd")
+                        )
                         if command is None and len(arguments) == 1:
-                            command = next(iter(arguments.values()))
-                        if not isinstance(command, str):
+                            command = _normalize_shell_command(
+                                next(iter(arguments.values()))
+                            )
+                        if command is None:
                             raise KeyError("command")
                         action = {"action": "bash", "command": command}
                     elif tool_name == "JSON":
@@ -332,8 +347,10 @@ class BashExecutor:
                         arguments = action.get("arguments", {})
                         if isinstance(arguments, str):
                             arguments = json.loads(arguments)
-                        command = arguments.get("command") or arguments.get("cmd")
-                        if isinstance(command, str):
+                        command = _normalize_shell_command(
+                            arguments.get("command") or arguments.get("cmd")
+                        )
+                        if command is not None:
                             action = {"action": "bash", "command": command}
                 except Exception as exc:  # noqa: BLE001 - report parser failure to model
                     protocol_errors += 1

@@ -4,7 +4,13 @@ import subprocess
 import pytest
 
 from pmc.domain import Candidate, ExecutionRequest, Job, Outcome
-from pmc.executors.bash import BashExecutor, UnsafeCommand, _extract_json, _guard
+from pmc.executors.bash import (
+    BashExecutor,
+    UnsafeCommand,
+    _extract_json,
+    _guard,
+    _normalize_shell_command,
+)
 from pmc.providers import ChatReply
 from pmc.providers.openai_compat import ProviderError
 
@@ -18,6 +24,12 @@ def test_extract_json_with_noise():
 def test_guard_blocks_commit():
     with pytest.raises(UnsafeCommand):
         _guard("git commit -am nope")
+
+
+def test_groq_cmd_array_is_normalized_to_ordered_shell_script():
+    assert _normalize_shell_command(["pwd", "npm test"]) == "pwd\nnpm test"
+    assert _normalize_shell_command([]) is None
+    assert _normalize_shell_command(["pwd", 42]) is None
 
 
 @pytest.mark.parametrize(
