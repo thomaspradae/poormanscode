@@ -14,6 +14,23 @@ class JulesExecutor:
     name = "jules"
     BASE = "https://jules.googleapis.com/v1alpha"
 
+    @staticmethod
+    def _http_error(exc: httpx.HTTPStatusError) -> str:
+        """Return provider diagnostics without headers, request data, or secrets."""
+        response = exc.response
+        detail = ""
+        try:
+            body = response.json()
+            error = body.get("error", {}) if isinstance(body, dict) else {}
+            if isinstance(error, dict):
+                status = error.get("status")
+                message = error.get("message")
+                detail = " ".join(str(x) for x in (status, message) if x)
+        except (ValueError, TypeError):
+            pass
+        suffix = f": {detail}" if detail else ""
+        return f"Jules HTTP {response.status_code}{suffix}"
+
     def _client(self, env_name: str) -> httpx.Client:
         key = os.getenv(env_name)
         if not key:
@@ -154,6 +171,13 @@ class JulesExecutor:
                         or bool(remote_base and remote_base.startswith(local_base)),
                     },
                 )
+        except httpx.HTTPStatusError as exc:
+            return ExecutionResult(
+                False,
+                error=self._http_error(exc),
+                outcome=Outcome.PROVIDER_FAILURE,
+                raw_metrics={"accounting": "unknown"},
+            )
         except Exception as exc:  # noqa: BLE001 - normalize provider/transport failures
             return ExecutionResult(
                 False,

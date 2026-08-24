@@ -3,6 +3,7 @@ from pathlib import Path
 from pmc.domain import Candidate, ExecutionRequest, ExecutionResult, Job
 from pmc.executors import build_executor
 from pmc.executors.openhands import OpenHandsExecutor
+from pmc.executors.jules import JulesExecutor
 
 
 def test_all_registered_executors_share_result_contract():
@@ -71,3 +72,23 @@ def test_openhands_uses_bounded_stuck_detecting_conversation(tmp_path: Path):
     assert calls["message"] == "do it"
     assert calls["ran"] is True
     assert calls["closed"] is True
+
+
+def test_jules_http_error_excludes_request_headers_and_key():
+    import httpx
+
+    request = httpx.Request(
+        "POST",
+        "https://jules.googleapis.com/v1alpha/sessions",
+        headers={"x-goog-api-key": "must-never-appear"},
+    )
+    response = httpx.Response(
+        404,
+        request=request,
+        json={"error": {"status": "NOT_FOUND", "message": "Source was not found"}},
+    )
+    error = JulesExecutor._http_error(
+        httpx.HTTPStatusError("failure", request=request, response=response)
+    )
+    assert error == "Jules HTTP 404: NOT_FOUND Source was not found"
+    assert "must-never-appear" not in error
