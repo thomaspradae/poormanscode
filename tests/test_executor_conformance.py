@@ -74,6 +74,58 @@ def test_openhands_uses_bounded_stuck_detecting_conversation(tmp_path: Path):
     assert calls["closed"] is True
 
 
+def test_openhands_passes_nonnative_tool_setting_to_llm(tmp_path: Path):
+    calls: dict[str, object] = {}
+
+    class FakeLLM:
+        def __init__(self, **kwargs):
+            calls["llm"] = kwargs
+
+    class FakeConversation:
+        def __init__(self, **_kwargs):
+            pass
+
+        def send_message(self, _message):
+            pass
+
+        def run(self):
+            pass
+
+        def close(self):
+            pass
+
+    executor = OpenHandsExecutor()
+    executor._imports = lambda: (
+        lambda value: value,
+        FakeLLM,
+        FakeConversation,
+        object,
+        lambda **kwargs: "agent",
+    )
+    candidate = Candidate.from_mapping(
+        {
+            "name": "gemini-openhands-nonnative",
+            "executor": "openhands",
+            "model": "gemini-3.7-flash",
+            "openhands_model": "openai/gemini-3.7-flash",
+            "native_tool_calling": False,
+            "allow_local_unsandboxed": True,
+        }
+    )
+    request = ExecutionRequest(
+        Job("PMC-X", tmp_path, "task"), candidate, tmp_path, "do it", 1
+    )
+
+    result = executor.run(request)
+
+    assert result.ok
+    assert calls["llm"] == {
+        "model": "openai/gemini-3.7-flash",
+        "usage_id": "pmc:PMC-X",
+        "native_tool_calling": False,
+    }
+
+
 def test_openhands_remote_workspace_uses_server_credential(monkeypatch, tmp_path: Path):
     import subprocess
 

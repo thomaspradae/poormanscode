@@ -80,6 +80,8 @@ class OpenHandsExecutor:
         # model id. Keep the adapter override candidate-local and observable.
         llm_model = c.extra.get("openhands_model") or c.model
         kwargs: dict[str, Any] = {"model": llm_model, "usage_id": f"pmc:{request.job.id}"}
+        if "native_tool_calling" in c.extra:
+            kwargs["native_tool_calling"] = bool(c.extra["native_tool_calling"])
         if key:
             kwargs["api_key"] = SecretStr(key)
         if c.base_url:
