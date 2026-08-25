@@ -31,6 +31,32 @@ def smoke_candidate(db: Database, candidate: Candidate) -> dict[str, Any]:
             generation_ok = isinstance(response.json().get("sources", []), list)
             tool_ok = generation_ok
             details["kind"] = "external-executor-api"
+        elif c.executor == "openhands" and c.base_url and c.model:
+            # OpenHands keeps model inference in the PMC controller and uses the
+            # remote Agent Server only for workspace/tool execution.  Smoke both
+            # halves independently so a provider can be generation-ready while
+            # a worker remains quarantined if its workspace endpoint is broken.
+            client = OpenAICompatibleClient(c.base_url, c.api_key_env, timeout=90)
+            reply = client.chat(
+                model=c.model,
+                messages=[{"role": "user", "content": "Reply with exactly PMC_SMOKE_OK"}],
+                temperature=0,
+                max_tokens=256,
+            )
+            generation_ok = "PMC_SMOKE_OK" in (reply.content or "")
+            if c.server_url:
+                from openhands.sdk import Workspace
+
+                server_key = (
+                    os.getenv(c.server_api_key_env)
+                    if c.server_api_key_env
+                    else None
+                )
+                workspace = Workspace(host=c.server_url, api_key=server_key)
+                result = workspace.execute_command("printf PMC_OPENHANDS_TOOL_OK")
+                tool_ok = "PMC_OPENHANDS_TOOL_OK" in (result.stdout or "")
+            details["kind"] = "controller-llm-remote-workspace"
+            details["request_ids_present"] = bool(reply.request_id)
         elif c.executor == "bash" and c.base_url and c.model:
             client = OpenAICompatibleClient(c.base_url, c.api_key_env, timeout=90)
             reply = client.chat(
@@ -71,7 +97,7 @@ def smoke_candidate(db: Database, candidate: Candidate) -> dict[str, Any]:
             details["request_ids_present"] = bool(reply.request_id or tool_reply.request_id)
         else:
             details["error"] = "unsupported executor for conformance smoke"
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - smoke must quarantine any adapter failure
         details["error"] = f"{type(exc).__name__}: {exc}"
         transient = isinstance(exc, ProviderError) and (
             exc.status_code == 429 or exc.status_code >= 500
