@@ -75,7 +75,11 @@ class OpenHandsExecutor:
         if not c.model:
             return ExecutionResult(False, error="openhands executor requires model")
         key = os.getenv(c.api_key_env) if c.api_key_env else None
-        kwargs: dict[str, Any] = {"model": c.model, "usage_id": f"pmc:{request.job.id}"}
+        # LiteLLM needs an explicit provider prefix for Gemini/OpenAI-compatible
+        # endpoints, while PMC's provider conformance uses the endpoint-native
+        # model id. Keep the adapter override candidate-local and observable.
+        llm_model = c.extra.get("openhands_model") or c.model
+        kwargs: dict[str, Any] = {"model": llm_model, "usage_id": f"pmc:{request.job.id}"}
         if key:
             kwargs["api_key"] = SecretStr(key)
         if c.base_url:
