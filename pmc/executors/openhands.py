@@ -107,7 +107,12 @@ class OpenHandsExecutor:
             else:
                 # Remote Agent Server path. The controller ships a clean snapshot,
                 # runs the agent remotely, then applies only the resulting Git patch locally.
-                workspace = Workspace(host=c.server_url)
+                server_key = (
+                    os.getenv(c.server_api_key_env)
+                    if c.server_api_key_env
+                    else None
+                )
+                workspace = Workspace(host=c.server_url, api_key=server_key)
                 remote_dir = f"/tmp/pmc-{request.job.id.lower()}-{request.attempt_no}"
                 with tempfile.TemporaryDirectory() as td:
                     archive = Path(td) / "repo.tar"

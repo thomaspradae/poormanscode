@@ -74,6 +74,79 @@ def test_openhands_uses_bounded_stuck_detecting_conversation(tmp_path: Path):
     assert calls["closed"] is True
 
 
+def test_openhands_remote_workspace_uses_server_credential(monkeypatch, tmp_path: Path):
+    import subprocess
+
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    calls: dict[str, object] = {}
+
+    class FakeSecret:
+        def __init__(self, value):
+            self.value = value
+
+    class FakeLLM:
+        def __init__(self, **kwargs):
+            calls["llm"] = kwargs
+
+    class FakeWorkspace:
+        def __init__(self, **kwargs):
+            calls["workspace"] = kwargs
+
+        def file_upload(self, *_args):
+            pass
+
+        def execute_command(self, command):
+            class Result:
+                stdout = ""
+
+            calls.setdefault("commands", []).append(command)
+            return Result()
+
+    class FakeConversation:
+        def __init__(self, **kwargs):
+            calls["conversation"] = kwargs
+
+        def send_message(self, _message):
+            pass
+
+        def run(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setenv("OPENHANDS_SESSION_KEY", "session-only")
+    executor = OpenHandsExecutor()
+    executor._imports = lambda: (
+        FakeSecret,
+        FakeLLM,
+        FakeConversation,
+        FakeWorkspace,
+        lambda **kwargs: "agent",
+    )
+    candidate = Candidate.from_mapping(
+        {
+            "name": "openhands-remote",
+            "executor": "openhands",
+            "model": "provider/model",
+            "api_key_env": "MODEL_KEY",
+            "server_url": "http://ofi1.example:8010",
+            "server_api_key_env": "OPENHANDS_SESSION_KEY",
+        }
+    )
+    request = ExecutionRequest(
+        Job("PMC-X", tmp_path, "task"), candidate, tmp_path, "do it", 1
+    )
+
+    result = executor.run(request)
+
+    assert result.ok
+    assert calls["workspace"] == {
+        "host": "http://ofi1.example:8010",
+        "api_key": "session-only",
+    }
+
+
 def test_jules_http_error_excludes_request_headers_and_key():
     import httpx
 

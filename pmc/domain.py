@@ -101,6 +101,7 @@ class Candidate:
     network_policy: str | None = None
     source: str | None = None
     server_url: str | None = None
+    server_api_key_env: str | None = None
     monetary_cost_hint: float = 0.0
     extra: dict[str, Any] = field(default_factory=dict)
 
