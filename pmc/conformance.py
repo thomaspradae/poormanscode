@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import tempfile
+import uuid
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 import httpx
 
 from .db import Database
-from .domain import Candidate
+from .domain import Candidate, ExecutionRequest, Job, Outcome
 from .executors.bash import SHELL_TOOL, _extract_json
 from .providers import OpenAICompatibleClient, ProviderError
 
@@ -18,6 +22,7 @@ def smoke_candidate(db: Database, candidate: Candidate) -> dict[str, Any]:
     c = replace(candidate, api_key_env=key_env or candidate.api_key_env)
     details: dict[str, Any] = {"provider": c.provider, "model": c.model}
     generation_ok = tool_ok = False
+    transient = False
     try:
         if c.executor == "jules":
             # Jules is an external task executor, so validate its authenticated
@@ -31,6 +36,50 @@ def smoke_candidate(db: Database, candidate: Candidate) -> dict[str, Any]:
             generation_ok = isinstance(response.json().get("sources", []), list)
             tool_ok = generation_ok
             details["kind"] = "external-executor-api"
+        elif c.executor == "openhands" and c.extra.get("agent_kind") == "acp":
+            # ACP providers own both inference and tools. Validate the actual
+            # agent protocol by making it write a sentinel in a disposable Git
+            # workspace; a direct provider completion cannot prove this path.
+            from .executors.openhands import OpenHandsExecutor
+
+            with tempfile.TemporaryDirectory(prefix="pmc-acp-smoke-") as td:
+                worktree = Path(td)
+                subprocess.run(["git", "init", "-q", str(worktree)], check=True)
+                subprocess.run(
+                    ["git", "-C", str(worktree), "config", "user.email", "pmc@localhost"],
+                    check=True,
+                )
+                subprocess.run(
+                    ["git", "-C", str(worktree), "config", "user.name", "PMC"],
+                    check=True,
+                )
+                subprocess.run(
+                    ["git", "-C", str(worktree), "commit", "--allow-empty", "-qm", "baseline"],
+                    check=True,
+                )
+                job = Job(f"PMC-SMOKE-{uuid.uuid4().hex[:8]}", worktree, "ACP smoke")
+                result = OpenHandsExecutor().run(
+                    ExecutionRequest(
+                        job,
+                        c,
+                        worktree,
+                        "Create a file named PMC_ACP_SMOKE.txt containing exactly PMC_ACP_TOOL_OK and finish.",
+                        1,
+                    )
+                )
+                generation_ok = result.ok
+                sentinel = worktree / "PMC_ACP_SMOKE.txt"
+                tool_ok = sentinel.exists() and sentinel.read_text().strip() == "PMC_ACP_TOOL_OK"
+                if not result.ok:
+                    details["error"] = result.error
+                    transient = result.outcome in {
+                        Outcome.RATE_LIMIT,
+                        Outcome.PROVIDER_FAILURE,
+                        Outcome.RESOURCE_FAILURE,
+                        Outcome.TIMEOUT,
+                    }
+                details["kind"] = "acp-agent-file-write"
+                details["accounting"] = result.accounting_level
         elif c.executor == "openhands" and c.base_url and c.model:
             # OpenHands keeps model inference in the PMC controller and uses the
             # remote Agent Server only for workspace/tool execution.  Smoke both
@@ -97,13 +146,11 @@ def smoke_candidate(db: Database, candidate: Candidate) -> dict[str, Any]:
             details["request_ids_present"] = bool(reply.request_id or tool_reply.request_id)
         else:
             details["error"] = "unsupported executor for conformance smoke"
-    except Exception as exc:  # noqa: BLE001 - smoke must quarantine any adapter failure
+    except Exception as exc:  # smoke must quarantine any adapter failure
         details["error"] = f"{type(exc).__name__}: {exc}"
         transient = isinstance(exc, ProviderError) and (
             exc.status_code == 429 or exc.status_code >= 500
         )
-    else:
-        transient = False
     db.set_model_conformance(
         candidate, generation_ok=generation_ok, tool_ok=tool_ok, details=details,
         status=("DEGRADED" if transient else None),

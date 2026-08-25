@@ -1,0 +1,13 @@
+{
+  "security": {
+    "blockGitExtensions": true,
+    "disableAlwaysAllow": true,
+    "disableYoloMode": true,
+    "environmentVariableRedaction": {
+      "blocked": [
+        "GEMINI_API_KEY"
+      ],
+      "enabled": true
+    }
+  }
+}

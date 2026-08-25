@@ -671,9 +671,19 @@ class Controller:
                     )
             duration = time.monotonic() - started
             if credential_reservation:
+                provider_status = result.raw_metrics.get("provider_status")
                 self.db.reconcile_provider_credential(
                     credential_reservation["reservation_id"],
-                    status_code=(401 if result.outcome == Outcome.PROVIDER_FAILURE and "401" in (result.error or "") else None),
+                    status_code=(
+                        int(provider_status)
+                        if provider_status is not None
+                        else (
+                            401
+                            if result.outcome == Outcome.PROVIDER_FAILURE
+                            and "401" in (result.error or "")
+                            else None
+                        )
+                    ),
                     actual_tokens=(result.input_tokens or 0) + (result.output_tokens or 0),
                     headers=dict(result.raw_metrics.get("rate_headers") or {}),
                 )

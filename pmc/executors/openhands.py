@@ -1,12 +1,68 @@
 from __future__ import annotations
 
 import os
+import re
 import tarfile
 import tempfile
 from pathlib import Path
 from typing import Any
 
 from ..domain import ExecutionRequest, ExecutionResult, Outcome
+
+
+def _provider_failure(exc: Exception) -> tuple[Outcome, int | None, dict[str, str]]:
+    """Classify provider failures crossing the remote OpenHands boundary.
+
+    Agent Server exceptions are frequently reconstructed as generic SDK errors,
+    so preserve structured HTTP information when present and use the message only
+    as a conservative fallback. Credential values are never included.
+    """
+    message = str(exc)
+    response = getattr(exc, "response", None)
+    status = getattr(exc, "status_code", None) or getattr(response, "status_code", None)
+    if status is None:
+        match = re.search(
+            r"(?:HTTP(?: status)?\s*|status(?:_code)?[=: ]+)(\d{3})",
+            message,
+            re.IGNORECASE,
+        )
+        if match:
+            status = int(match.group(1))
+        elif re.search(r"\b429\b|RateLimit(?:Error|ed)", message, re.IGNORECASE):
+            status = 429
+        elif re.search(
+            r"\b401\b|Unauthenticated|AuthenticationError", message, re.IGNORECASE
+        ):
+            status = 401
+        elif re.search(r"\b403\b|PermissionDenied", message, re.IGNORECASE):
+            status = 403
+    try:
+        status = int(status) if status is not None else None
+    except (TypeError, ValueError):
+        status = None
+
+    source_headers = getattr(response, "headers", None) or getattr(exc, "headers", None) or {}
+    headers = {
+        str(key).lower(): str(value)
+        for key, value in dict(source_headers).items()
+        if str(key).lower().startswith("x-ratelimit-")
+        or str(key).lower() in {"retry-after", "request-id", "x-request-id"}
+    }
+    quota_exhausted = bool(
+        re.search(r"(?:quota.*exhaust|exhaust.*quota|quota exceeded)", message, re.IGNORECASE)
+    )
+    if status == 429 or quota_exhausted:
+        if quota_exhausted and "retry-after" not in headers:
+            # Some ACP agents wrap a provider's daily-quota response as HTTP
+            # 500 and omit reset metadata. Avoid immediately selecting the
+            # same credential again while retaining a finite re-canary path.
+            headers["retry-after"] = "3600"
+        return Outcome.RATE_LIMIT, 429, headers
+    if status in {401, 403} or (status is not None and status >= 500):
+        return Outcome.PROVIDER_FAILURE, status, headers
+    if "thought_signature" in message or "tool call" in message.lower():
+        return Outcome.PROTOCOL_FAILURE, status, headers
+    return Outcome.EXECUTOR_FAILURE, status, headers
 
 
 class OpenHandsExecutor:
@@ -23,6 +79,27 @@ class OpenHandsExecutor:
             raise RuntimeError(
                 "OpenHands executor is not installed. Run: pip install -e '.[openhands]'"
             ) from exc
+
+    def _acp_agent(self, candidate: Any):
+        try:
+            from openhands.sdk.agent import ACPAgent
+        except ImportError as exc:
+            raise RuntimeError(
+                "OpenHands ACP support is unavailable; install a current openhands-sdk"
+            ) from exc
+
+        command = candidate.extra.get("acp_command")
+        if not isinstance(command, list) or not all(
+            isinstance(part, str) and part for part in command
+        ):
+            raise RuntimeError("OpenHands ACP candidate requires acp_command as a string list")
+        return ACPAgent(
+            acp_command=command,
+            acp_server=candidate.extra.get("acp_server"),
+            acp_model=candidate.extra.get("acp_model"),
+            acp_session_mode=candidate.extra.get("acp_session_mode"),
+            acp_isolate_data_dir=True,
+        )
 
     def _metrics(
         self, llm: Any
@@ -86,8 +163,15 @@ class OpenHandsExecutor:
             kwargs["api_key"] = SecretStr(key)
         if c.base_url:
             kwargs["base_url"] = c.base_url
-        llm = LLM(**kwargs)
-        agent = get_default_agent(llm=llm, cli_mode=True)
+        if c.extra.get("agent_kind") == "acp":
+            agent = self._acp_agent(c)
+            llm = agent.llm
+            secret_name = c.extra.get("acp_api_key_env")
+            conversation_secrets = {secret_name: key} if key and secret_name else None
+        else:
+            llm = LLM(**kwargs)
+            agent = get_default_agent(llm=llm, cli_mode=True)
+            conversation_secrets = None
         try:
             if not c.server_url:
                 if not c.extra.get("allow_local_unsandboxed", False):
@@ -104,6 +188,7 @@ class OpenHandsExecutor:
                     max_iteration_per_run=c.max_turns,
                     stuck_detection=True,
                     visualizer=None,
+                    secrets=conversation_secrets,
                 )
                 try:
                     conversation.send_message(request.prompt)
@@ -152,7 +237,7 @@ class OpenHandsExecutor:
                         f"rm -rf {remote_dir} && mkdir -p {remote_dir} && "
                         f"tar -xf {remote_tar} -C {remote_dir} && "
                         f"cd {remote_dir} && git init -q && git config user.email pmc@localhost && "
-                        f"git config user.name PMC && git add -A && git commit -qm baseline"
+                        f"git config user.name PMC && git add -A && git commit --allow-empty -qm baseline"
                     )
                     remote_prompt = (
                         f"The repository for this task is at {remote_dir}. Begin every shell/file operation there.\n\n"
@@ -164,12 +249,13 @@ class OpenHandsExecutor:
                         max_iteration_per_run=c.max_turns,
                         stuck_detection=True,
                         visualizer=None,
+                        secrets=conversation_secrets,
                     )
                     try:
                         conversation.send_message(remote_prompt)
                         conversation.run()
                         diff = workspace.execute_command(
-                            f"cd {remote_dir} && git diff --binary HEAD --"
+                            f"cd {remote_dir} && git add -A && git diff --binary --cached HEAD --"
                         ).stdout
                     finally:
                         conversation.close()
@@ -191,6 +277,11 @@ class OpenHandsExecutor:
             )
         except Exception as exc:
             in_tok, out_tok, cost, raw = self._metrics(llm)
+            outcome, provider_status, rate_headers = _provider_failure(exc)
+            if provider_status is not None:
+                raw["provider_status"] = provider_status
+            if rate_headers:
+                raw["rate_headers"] = rate_headers
             return ExecutionResult(
                 False,
                 error=f"OpenHands failed: {type(exc).__name__}: {exc}",
@@ -198,6 +289,6 @@ class OpenHandsExecutor:
                 output_tokens=out_tok,
                 cost_usd=cost,
                 raw_metrics={**raw, "accounting": "sdk-aggregate"},
-                outcome=Outcome.EXECUTOR_FAILURE,
+                outcome=outcome,
                 accounting_level="aggregate",
             )
