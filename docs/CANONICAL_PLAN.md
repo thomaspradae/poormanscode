@@ -11,8 +11,9 @@ affecting acceptance must remain outside worker authority.
 - [x] Atomic per-model-request credential selection, reservation, reconciliation,
   authentication quarantine, and least-utilized lane selection
 - [x] Provider capacity gates candidates without adding credentials to candidate identity
-- [x] `pmc models list` and `pmc models smoke` persist generation/native-tool
-  conformance and optionally gate production scheduling
+- [x] `pmc models list`, `pmc models smoke`, and cumulative L0-L4
+  `pmc models conformance` persist generation, repository inspection, editing,
+  repair, verifier, accounting, and audit evidence and gate production scheduling
 - [x] Complexity and semantic risk are classified separately with human overrides
 - [x] Job-owned budget envelopes cap attempts, requests, tokens, wall time, cost,
   reviews, repairs, parallel candidates and challengers
@@ -94,5 +95,7 @@ humans own acceptance.
 - [ ] Background jobs and idle-resource scheduling
 - [ ] Slurm/experiment executor and experiment artifacts
 - [ ] Backups, restores, integrity checks, and exports
-- [ ] Executor conformance suite and richer security policy
+- [x] OpenHands L0-L4 coding/lifecycle conformance suite and controller-side
+  credential-isolating provider gateway; broader Jules/Bash plugin conformance
+  remains incremental
 - [ ] Automated performance and experiment reporting

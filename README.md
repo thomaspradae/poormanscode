@@ -11,6 +11,7 @@ It deliberately does **not** implement one giant coding agent. Executors are rep
 - `Executor` boundary
 - `BashExecutor`: a small mini-SWE-style shell loop using any OpenAI-compatible model endpoint
 - `OpenHandsExecutor`: local OpenHands SDK execution, plus a remote Agent Server path
+  with controller-side per-request credential pooling
 - `JulesExecutor`: Jules REST session creation, polling, ChangeSet retrieval, and patch application
 - deterministic verifier: test/lint/typecheck/build/hidden-test hooks, patch/file budgets, protected paths, secret scan
 - epsilon-greedy production exploration so alternatives continue receiving real jobs
@@ -118,6 +119,18 @@ pmc stats --phase repair
 pmc stats --mode explore
 pmc export ~/pmc-attempts.csv
 ```
+
+Before enabling a new built-in OpenHands model candidate, run the production
+coding ladder:
+
+```bash
+pmc models conformance nvidia-nemotron-super-openhands
+```
+
+This proves generation, repository inspection, editing, failing-test repair, and
+the complete PMC worktree/verifier/audit lifecycle. Remote OpenHands receives an
+ephemeral gateway token, never a provider API key; PMC selects and reconciles a
+legitimate credential lane for each physical model request.
 
 The randomized `explore` slice is the preferred long-run comparison dataset. Raw aggregate success rates can be confounded because the scheduler deliberately sends different kinds of work to different candidates.
 

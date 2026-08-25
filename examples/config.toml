@@ -170,6 +170,28 @@ complexities = ["STANDARD", "DIFFICULT"]
 task_types = ["FEATURE", "ARCHITECTURAL", "DEPENDENCY_API", "INTEGRATION", "UI", "BUG_FIX"]
 # server_url = "http://100.x.y.z:8000"   # optional OpenHands Agent Server over Tailscale
 
+# OpenHands provider candidates use request-level ProviderPool accounting.
+# Keep each disabled until `pmc models conformance NAME` passes.
+[[candidates]]
+name = "nvidia-nemotron-super-openhands"
+version = "1"
+provider = "nvidia"
+enabled = false
+executor = "openhands"
+role = "builder"
+model = "nvidia/nemotron-3-super-120b-a12b"
+openhands_model = "openai/nvidia/nemotron-3-super-120b-a12b"
+base_url = "https://integrate.api.nvidia.com/v1"
+server_url = "http://100.x.y.z:8010"
+server_api_key_env = "OPENHANDS_SESSION_KEY"
+controller_gateway_host = "100.x.y.z" # controller's Tailscale IPv4
+provider_request_failovers = 2
+resource_group = "openhands-host-1"
+resource_concurrency = 1
+max_turns = 30
+sandbox = "remote-lxd"
+network = false
+
 [[candidates]]
 name = "jules"
 version = "2"

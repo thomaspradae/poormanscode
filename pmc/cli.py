@@ -95,8 +95,11 @@ def cmd_submit(args) -> int:
     if args.allowed_path:
         constraints["allowed_paths"] = args.allowed_path
     from .budget import characterize, envelope_for
+
     task_type = args.task_type or classify(args.request)
-    inferred_complexity, inferred_risk = characterize(args.request, task_type, args.priority)
+    inferred_complexity, inferred_risk = characterize(
+        args.request, task_type, args.priority
+    )
     complexity = args.complexity or inferred_complexity
     risk = args.risk or inferred_risk
     job = Job(
@@ -343,7 +346,9 @@ def cmd_inspect(args) -> int:
     if d["intelligence_allocations"]:
         print("\nEXTRA INTELLIGENCE")
         for item in d["intelligence_allocations"]:
-            print(f"{item['role']} {item['candidate'] or '-'}: {item['state']} — {item['reason']}")
+            print(
+                f"{item['role']} {item['candidate'] or '-'}: {item['state']} — {item['reason']}"
+            )
     if d["post_acceptance_outcomes"]:
         print("\nPOST-ACCEPTANCE OUTCOMES")
         for item in d["post_acceptance_outcomes"]:
@@ -382,17 +387,25 @@ def cmd_diff(args) -> int:
 
 def cmd_accept(args) -> int:
     ctl = _controller(args)
-    commit = ctl.accept(args.job_id, args.message, review_seconds=args.review_seconds,
-                        human_changed_lines=args.human_changed_lines)
+    commit = ctl.accept(
+        args.job_id,
+        args.message,
+        review_seconds=args.review_seconds,
+        human_changed_lines=args.human_changed_lines,
+    )
     print(commit)
     return 0
 
 
 def cmd_reject(args) -> int:
     ctl = _controller(args)
-    ctl.reject(args.job_id, args.feedback, review_seconds=args.review_seconds,
-               repair_seconds=args.repair_seconds,
-               human_changed_lines=args.human_changed_lines)
+    ctl.reject(
+        args.job_id,
+        args.feedback,
+        review_seconds=args.review_seconds,
+        repair_seconds=args.repair_seconds,
+        human_changed_lines=args.human_changed_lines,
+    )
     print("RETRY")
     return 0
 
@@ -485,20 +498,27 @@ def cmd_attention(args) -> int:
     if args.json:
         print(json.dumps(rows, indent=2))
         return 0
-    print(f"{'CANDIDATE':<32} {'JOBS':>5} {'STABLE':>7} {'REVIEW S':>10} {'REPAIR S':>10} {'NO EDIT':>8}")
+    print(
+        f"{'CANDIDATE':<32} {'JOBS':>5} {'STABLE':>7} {'REVIEW S':>10} {'REPAIR S':>10} {'NO EDIT':>8}"
+    )
     for row in rows:
-        no_edit = row['no_edit_rate']
-        print(f"{row['candidate']:<32} {row['jobs']:>5} {row['stable_accepted'] or 0:>7} "
-              f"{row['avg_review_seconds'] or 0:>10.1f} {row['avg_repair_seconds'] or 0:>10.1f} "
-              f"{(100 * no_edit if no_edit is not None else 0):>7.1f}%")
+        no_edit = row["no_edit_rate"]
+        print(
+            f"{row['candidate']:<32} {row['jobs']:>5} {row['stable_accepted'] or 0:>7} "
+            f"{row['avg_review_seconds'] or 0:>10.1f} {row['avg_repair_seconds'] or 0:>10.1f} "
+            f"{(100 * no_edit if no_edit is not None else 0):>7.1f}%"
+        )
     return 0
 
 
 def cmd_outcome(args) -> int:
     ctl = _controller(args)
     ctl.db.record_post_acceptance_outcome(
-        args.job_id, args.outcome, details=args.details,
-        repair_seconds=args.repair_seconds, changed_lines=args.human_changed_lines,
+        args.job_id,
+        args.outcome,
+        details=args.details,
+        repair_seconds=args.repair_seconds,
+        changed_lines=args.human_changed_lines,
     )
     print(args.outcome)
     return 0
@@ -538,23 +558,49 @@ def cmd_models_list(args) -> int:
         row = ctl.db.model_conformance(candidate)
         status = row["status"] if row else "UNKNOWN"
         provider = candidate.provider or "local"
-        print(f"{candidate.name:32} {status:12} {provider:12} {candidate.model or candidate.executor}")
+        print(
+            f"{candidate.name:32} {status:12} {provider:12} {candidate.model or candidate.executor}"
+        )
     return 0
 
 
 def cmd_models_smoke(args) -> int:
     from .conformance import smoke_candidate
+
     ctl = _controller(args)
     selected = set(args.candidates or [])
-    candidates = [c for c in ctl.cfg.candidates if c.enabled and (not selected or c.name in selected)]
+    candidates = [
+        c
+        for c in ctl.cfg.candidates
+        if c.enabled and (not selected or c.name in selected)
+    ]
     unknown = selected - {c.name for c in candidates}
     if unknown:
         raise SystemExit("unknown/disabled candidates: " + ", ".join(sorted(unknown)))
     failed = False
     for candidate in candidates:
         result = smoke_candidate(ctl.db, candidate)
-        print(f"{result['candidate']}: {result['status']} generation={result['generation']} tool={result['tool']}")
+        print(
+            f"{result['candidate']}: {result['status']} generation={result['generation']} tool={result['tool']}"
+        )
         failed |= result["status"] != "AVAILABLE"
+    return 2 if failed else 0
+
+
+def cmd_models_conformance(args) -> int:
+    from .conformance import coding_conformance
+
+    ctl = _controller(args)
+    selected = set(args.candidates)
+    candidates = [c for c in ctl.cfg.candidates if c.name in selected]
+    unknown = selected - {c.name for c in candidates}
+    if unknown:
+        raise SystemExit("unknown candidates: " + ", ".join(sorted(unknown)))
+    failed = False
+    for candidate in candidates:
+        result = coding_conformance(ctl, candidate)
+        print(json.dumps(result, indent=2, default=str))
+        failed |= not all(result["levels"].values())
     return 2 if failed else 0
 
 
@@ -636,7 +682,6 @@ def cmd_doctor(args) -> int:
         c.enabled and c.executor == "openhands" for c in ctl.cfg.candidates
     )
     try:
-
         print("OpenHands SDK: OK")
     except Exception:
         if needs_openhands:
@@ -809,7 +854,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--task-type")
     s.add_argument("--complexity", choices=["TRIVIAL", "STANDARD", "DIFFICULT"])
     s.add_argument("--risk", choices=["LOW", "MEDIUM", "HIGH", "CRITICAL"])
-    s.add_argument("--budget", choices=["trivial", "standard", "difficult", "high-risk"])
+    s.add_argument(
+        "--budget", choices=["trivial", "standard", "difficult", "high-risk"]
+    )
     s.add_argument("--acceptance", action="append")
     s.add_argument("--max-files", type=int)
     s.add_argument("--max-lines", type=int)
@@ -929,7 +976,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("outcome")
     s.add_argument("job_id")
-    s.add_argument("outcome", choices=["STABLE", "REOPENED", "REVERTED", "REGRESSION", "HOTFIX", "HUMAN_CORRECTION"])
+    s.add_argument(
+        "outcome",
+        choices=[
+            "STABLE",
+            "REOPENED",
+            "REVERTED",
+            "REGRESSION",
+            "HOTFIX",
+            "HUMAN_CORRECTION",
+        ],
+    )
     s.add_argument("--details")
     s.add_argument("--repair-seconds", type=float)
     s.add_argument("--human-changed-lines", type=int)
@@ -949,6 +1006,9 @@ def build_parser() -> argparse.ArgumentParser:
     ms = model_sub.add_parser("smoke")
     ms.add_argument("candidates", nargs="*")
     ms.set_defaults(func=cmd_models_smoke)
+    mc = model_sub.add_parser("conformance")
+    mc.add_argument("candidates", nargs="+")
+    mc.set_defaults(func=cmd_models_conformance)
 
     s = sub.add_parser("capabilities")
     s.set_defaults(func=cmd_capabilities)

@@ -13,12 +13,22 @@ audit reports, human acceptance, leases, and Bash/OpenHands/Jules adapters.
 - [x] Use a mature coding-agent runtime for general software engineering. Jules is
   production-available for GitHub-backed jobs. OpenHands SDK 1.43 is installed and
   the adapter uses bounded iterations plus native stuck detection.
-- [ ] Do not enable an OpenHands production candidate until a remote Agent Server
-  is deployed behind an enforceable workspace/network boundary and the candidate
-  passes a real file-edit, test, timeout, and cleanup conformance canary.
-- [ ] Add per-model-request accounting callbacks for OpenHands. Its current SDK
-  metrics are explicitly recorded as aggregate rather than fake request-level
-  precision.
+- [x] OpenHands Agent Server 1.43 runs as a dedicated identity in an ofi1 LXD
+  boundary. The remote workspace root is aligned with PMC's uploaded repository;
+  the previous default `workspace/project` mismatch is fixed.
+- [x] Built-in OpenHands uses an ephemeral, authenticated, Tailscale-only PMC
+  provider gateway. Provider credentials remain controller-side; every physical
+  model request reserves/reconciles one ProviderPool lane and records tokens,
+  request ID, rate headers, cost when known, failures, and bounded cooldown waits.
+- [x] `pmc models conformance NAME` runs a cumulative L0 generation → L1 inspect
+  → L2 edit → L3 failing-test repair → L4 Controller/verifier/audit gate.
+  Nemotron Super + OpenHands passed all five levels and is the first enabled
+  general-purpose OpenHands production candidate.
+- [~] Mistral Medium + OpenHands passes standalone L3 and rotates across all three
+  credential lanes, but remains quarantined because its full Controller prompt
+  exceeded the aggregate TPM pool before convergence. Groq OSS 120B reached real
+  OpenHands turns but remains gated by its single lane's 8k TPM window. Local Qwen
+  2.5 Coder 7B generated text but made no L2 tool action in 138 seconds.
 
 ## P0 substrate
 

@@ -116,7 +116,11 @@ class Controller:
         self.cfg = cfg
         self.db = Database(cfg.db_path)
         self.db.register_provider_credentials(
-            [credential for pool in cfg.provider_credentials.values() for credential in pool]
+            [
+                credential
+                for pool in cfg.provider_credentials.values()
+                for credential in pool
+            ]
         )
         self.worktrees = WorktreeManager(cfg.worktrees_dir)
         self.capabilities = CapabilityRegistry(self.db, cfg.toolchains)
@@ -248,7 +252,9 @@ class Controller:
             (c for c in self.cfg.candidates if c.name == attempt["candidate"]), None
         )
         if candidate is None:
-            raise RuntimeError(f"candidate is no longer configured: {attempt['candidate']}")
+            raise RuntimeError(
+                f"candidate is no longer configured: {attempt['candidate']}"
+            )
         repo_cfg = load_repo_config_at(job.repo, job.baseline_commit)
         if repo_cfg.get("toolchain") == "unity":
             repo_cfg["unity_toolchain"] = dict(self.cfg.toolchains.get("unity", {}))
@@ -283,9 +289,7 @@ class Controller:
         if result.ok:
             self.db.mark_attempt_ready_after_reverification(attempt_id)
             self.db.set_state(job.id, JobState.READY)
-            self.db.event(
-                "REVERIFICATION_PASSED", job_id=job.id, attempt_id=attempt_id
-            )
+            self.db.event("REVERIFICATION_PASSED", job_id=job.id, attempt_id=attempt_id)
             self._write_event_audit(job.id)
             return JobState.READY
         self.db.set_state(job.id, JobState.BLOCKED)
@@ -435,40 +439,32 @@ class Controller:
                             return JobState.BLOCKED
                         raise
             if not persisted_decision:
-                providers = {
-                    c.provider for c in self.cfg.candidates if c.provider
-                }
-                decision.snapshot.update({
-                    "provider_capacity": {
-                        provider: self.db.provider_capacity(provider)
-                        for provider in sorted(providers)
-                    },
-                    "budget": asdict(job.budget),
-                    "complexity": job.complexity,
-                    "risk": job.risk,
-                    "intelligence_plan": asdict(intelligence_plan),
-                })
+                providers = {c.provider for c in self.cfg.candidates if c.provider}
+                decision.snapshot.update(
+                    {
+                        "provider_capacity": {
+                            provider: self.db.provider_capacity(provider)
+                            for provider in sorted(providers)
+                        },
+                        "budget": asdict(job.budget),
+                        "complexity": job.complexity,
+                        "risk": job.risk,
+                        "intelligence_plan": asdict(intelligence_plan),
+                    }
+                )
                 self.db.record_decision(job.id, attempt_no, decision)
             candidate = decision.candidate
             self.db.register_candidate(candidate)
             used.append(candidate.name)
-            # Bash accounts for every model turn. Other adapters retain a single
-            # attempt-level reservation until their APIs expose turn boundaries.
+            # Bash and built-in OpenHands account for every model turn. ACP and
+            # external executors retain one attempt-level reservation because
+            # their internal request boundary is outside PMC.
             reservation_id = None
             credential_reservation = None
-            if candidate.executor != "bash":
-                if candidate.provider:
-                    ok, reason = self.db.provider_availability(candidate.provider)
-                    if ok and reason != "legacy candidate credential":
-                        credential_reservation = self.db.reserve_provider_credential(
-                            candidate.provider, job.id, 0,
-                            int(candidate.extra.get("max_tokens", 4096)),
-                        )
-                reservation_id = self.db.reserve_quota(
-                    candidate.name, job.id, int(candidate.extra.get("max_tokens", 4096)),
-                    credential_reservation["credential_id"] if credential_reservation else None,
-                    credential_reservation["quota_scope_id"] if credential_reservation else None,
-                )
+            request_accounted_executor = candidate.executor == "bash" or (
+                candidate.executor == "openhands"
+                and candidate.extra.get("agent_kind") != "acp"
+            )
             prompt_feedback = "\n\n".join(x for x in [prior_feedback, *failures] if x)
             context_bundle = build_context_bundle(
                 job.worktree,
@@ -487,7 +483,8 @@ class Controller:
                 candidate,
                 api_key_env=(
                     credential_reservation["api_key_env"]
-                    if credential_reservation else candidate.api_key_env
+                    if credential_reservation
+                    else candidate.api_key_env
                 ),
             )
             req = ExecutionRequest(
@@ -544,29 +541,77 @@ class Controller:
                 context_hash=context_bundle.content_hash,
                 context_manifest=context_bundle.manifest,
             )
+            if not request_accounted_executor:
+                if candidate.provider:
+                    ok, reason = self.db.provider_availability(candidate.provider)
+                    if ok and reason != "legacy candidate credential":
+                        credential_reservation = self.db.reserve_provider_credential(
+                            candidate.provider,
+                            job.id,
+                            attempt_id,
+                            int(candidate.extra.get("max_tokens", 4096)),
+                        )
+                reservation_id = self.db.reserve_quota(
+                    candidate.name,
+                    job.id,
+                    int(candidate.extra.get("max_tokens", 4096)),
+                    (
+                        credential_reservation["credential_id"]
+                        if credential_reservation
+                        else None
+                    ),
+                    (
+                        credential_reservation["quota_scope_id"]
+                        if credential_reservation
+                        else None
+                    ),
+                )
+                execution_candidate = replace(
+                    candidate,
+                    api_key_env=(
+                        credential_reservation["api_key_env"]
+                        if credential_reservation
+                        else candidate.api_key_env
+                    ),
+                )
+                req.candidate = execution_candidate
             planner_pool = [
-                c for c in self.cfg.candidates
+                c
+                for c in self.cfg.candidates
                 if c.role == "planner" and c.name != candidate.name
             ]
             planner_advice: list[str] = []
-            for planner_index in range(min(intelligence_plan.planners, len(planner_pool))):
+            for planner_index in range(
+                min(intelligence_plan.planners, len(planner_pool))
+            ):
                 allocation_id = None
                 try:
                     planner_decision = self.scheduler.choose(
-                        job, planner_pool, role="planner", attempt_no=attempt_no,
+                        job,
+                        planner_pool,
+                        role="planner",
+                        attempt_no=attempt_no,
                         exclude={x.name for x in planner_pool[:planner_index]},
                     )
                     planner = planner_decision.candidate
                     allocation_id = self.db.begin_intelligence_allocation(
-                        job.id, attempt_id, "PLANNER", planner.name,
-                        intelligence_plan.reason, intelligence_plan.uncertainty,
+                        job.id,
+                        attempt_id,
+                        "PLANNER",
+                        planner.name,
+                        intelligence_plan.reason,
+                        intelligence_plan.uncertainty,
                     )
                     accounting = ModelRequestAccounting(
-                        self.db, job_id=job.id, attempt_id=attempt_id,
-                        candidate=planner, budget=job.budget,
+                        self.db,
+                        job_id=job.id,
+                        attempt_id=attempt_id,
+                        candidate=planner,
+                        budget=job.budget,
                     )
                     advice = advisory_call(
-                        planner, accounting,
+                        planner,
+                        accounting,
                         "Provide a concise implementation plan and identify hidden risks. "
                         "Do not write code.\n\n" + prompt,
                     )
@@ -580,26 +625,39 @@ class Controller:
                             allocation_id, "FAILED", {"error": str(exc)}
                         )
             if planner_advice:
-                prompt += "\n\nINDEPENDENT PLANNING ADVICE:\n" + "\n\n---\n\n".join(planner_advice)
+                prompt += "\n\nINDEPENDENT PLANNING ADVICE:\n" + "\n\n---\n\n".join(
+                    planner_advice
+                )
                 req.prompt = prompt
                 augmented_manifest = dict(context_bundle.manifest)
                 augmented_manifest["planner_advice_hash"] = stable_hash(planner_advice)
                 self.db.update_attempt_context(
-                    attempt_id, stable_hash({"base": context_bundle.content_hash,
-                                             "planner_advice": planner_advice}),
+                    attempt_id,
+                    stable_hash(
+                        {
+                            "base": context_bundle.content_hash,
+                            "planner_advice": planner_advice,
+                        }
+                    ),
                     augmented_manifest,
                 )
                 self.reporter.text(
                     job.id, f"attempt-{attempt_no:02d}-prompt.txt", prompt + "\n"
                 )
-                self.reporter.json(job.id, f"attempt-{attempt_no:02d}-planning.json",
-                                   {"advice": planner_advice, "reason": intelligence_plan.reason})
-            if candidate.executor == "bash":
+                self.reporter.json(
+                    job.id,
+                    f"attempt-{attempt_no:02d}-planning.json",
+                    {"advice": planner_advice, "reason": intelligence_plan.reason},
+                )
+            if request_accounted_executor:
                 req.accounting = ModelRequestAccounting(
-                    self.db, job_id=job.id, attempt_id=attempt_id, candidate=candidate,
+                    self.db,
+                    job_id=job.id,
+                    attempt_id=attempt_id,
+                    candidate=candidate,
                     budget=job.budget,
                 )
-                if self.cfg.research_enabled:
+                if candidate.executor == "bash" and self.cfg.research_enabled:
                     req.research = ResearchService(
                         self.db,
                         job_id=job.id,
@@ -647,7 +705,9 @@ class Controller:
                 if credential_reservation:
                     self.db.reconcile_provider_credential(
                         credential_reservation["reservation_id"],
-                        status_code=None, actual_tokens=0, headers={},
+                        status_code=None,
+                        actual_tokens=0,
+                        headers={},
                     )
                 self.db.set_state(job.id, JobState.RETRY)
                 total_attempts += 1
@@ -684,14 +744,17 @@ class Controller:
                             else None
                         )
                     ),
-                    actual_tokens=(result.input_tokens or 0) + (result.output_tokens or 0),
+                    actual_tokens=(result.input_tokens or 0)
+                    + (result.output_tokens or 0),
                     headers=dict(result.raw_metrics.get("rate_headers") or {}),
                 )
-            result.accounting_level = {
-                "bash": "per_model_request",
-                "openhands": "aggregate",
-                "jules": "unknown",
-            }.get(candidate.executor, "unknown")
+            if request_accounted_executor:
+                result.accounting_level = "per_model_request"
+            elif result.accounting_level == "unknown":
+                result.accounting_level = {
+                    "openhands": "aggregate",
+                    "jules": "unknown",
+                }.get(candidate.executor, "unknown")
             result.raw_metrics.setdefault("accounting", result.accounting_level)
             if reservation_id:
                 self.db.reconcile_quota(
@@ -705,7 +768,7 @@ class Controller:
                     cost_usd=result.cost_usd,
                     payload=result.raw_metrics,
                 )
-            elif candidate.executor == "bash":
+            elif request_accounted_executor:
                 totals = self.db.model_request_totals(attempt_id, candidate.name)
                 result.raw_metrics["model_request_totals"] = totals
                 recorded = totals["input_tokens"] + totals["output_tokens"]
@@ -880,7 +943,8 @@ class Controller:
 
             challenger_advice = ""
             challenger_pool = [
-                c for c in self.cfg.candidates
+                c
+                for c in self.cfg.candidates
                 if c.role == "challenger" and c.name != candidate.name
             ]
             if intelligence_plan.challenger and challenger_pool:
@@ -889,16 +953,24 @@ class Controller:
                 )
                 challenger = challenger_decision.candidate
                 allocation_id = self.db.begin_intelligence_allocation(
-                    job.id, attempt_id, "CHALLENGER", challenger.name,
-                    intelligence_plan.reason, intelligence_plan.uncertainty,
+                    job.id,
+                    attempt_id,
+                    "CHALLENGER",
+                    challenger.name,
+                    intelligence_plan.reason,
+                    intelligence_plan.uncertainty,
                 )
                 try:
                     challenger_accounting = ModelRequestAccounting(
-                        self.db, job_id=job.id, attempt_id=attempt_id,
-                        candidate=challenger, budget=job.budget,
+                        self.db,
+                        job_id=job.id,
+                        attempt_id=attempt_id,
+                        candidate=challenger,
+                        budget=job.budget,
                     )
                     challenger_advice = advisory_call(
-                        challenger, challenger_accounting,
+                        challenger,
+                        challenger_accounting,
                         "Act as an independent challenger. Inspect this verified diff and identify "
                         "a materially better solution or serious hidden defect. Be concise; do not edit.\n\n"
                         + self.worktrees.diff(job.worktree, job.baseline_commit),
@@ -906,15 +978,20 @@ class Controller:
                     self.db.finish_intelligence_allocation(
                         allocation_id, "SUCCEEDED", {"opinion": challenger_advice}
                     )
-                    self.reporter.json(job.id, f"attempt-{attempt_no:02d}-challenger.json",
-                                       {"candidate": challenger.name, "opinion": challenger_advice})
+                    self.reporter.json(
+                        job.id,
+                        f"attempt-{attempt_no:02d}-challenger.json",
+                        {"candidate": challenger.name, "opinion": challenger_advice},
+                    )
                 except Exception as exc:
                     self.db.finish_intelligence_allocation(
                         allocation_id, "FAILED", {"error": str(exc)}
                     )
 
             automatic_review = intelligence_plan.reviewers > 0
-            if (self.cfg.review_enabled or automatic_review) and job.budget.max_reviews > 0:
+            if (
+                self.cfg.review_enabled or automatic_review
+            ) and job.budget.max_reviews > 0:
                 self.db.set_state(job.id, JobState.REVIEWING)
                 reviewer_pool = [
                     c
@@ -926,52 +1003,84 @@ class Controller:
                     reviewer_used: set[str] = set()
                     review_count = min(
                         intelligence_plan.reviewers or 1,
-                        job.budget.max_reviews, len(reviewer_pool),
+                        job.budget.max_reviews,
+                        len(reviewer_pool),
                     )
                     for _ in range(review_count):
                         review_decision = self.scheduler.choose(
-                            job, reviewer_pool, role="reviewer", attempt_no=attempt_no,
+                            job,
+                            reviewer_pool,
+                            role="reviewer",
+                            attempt_no=attempt_no,
                             exclude=reviewer_used,
                         )
                         reviewer_used.add(review_decision.candidate.name)
                         allocation_id = self.db.begin_intelligence_allocation(
-                            job.id, attempt_id, "REVIEWER", review_decision.candidate.name,
-                            intelligence_plan.reason, intelligence_plan.uncertainty,
+                            job.id,
+                            attempt_id,
+                            "REVIEWER",
+                            review_decision.candidate.name,
+                            intelligence_plan.reason,
+                            intelligence_plan.uncertainty,
                         )
                         review_accounting = ModelRequestAccounting(
-                            self.db, job_id=job.id, attempt_id=attempt_id,
-                            candidate=review_decision.candidate, budget=job.budget,
+                            self.db,
+                            job_id=job.id,
+                            attempt_id=attempt_id,
+                            candidate=review_decision.candidate,
+                            budget=job.budget,
                         )
                         review = ReviewerService().review(
-                            job=job, worktree=job.worktree,
-                            candidate=review_decision.candidate, attempt_no=attempt_no,
+                            job=job,
+                            worktree=job.worktree,
+                            candidate=review_decision.candidate,
+                            attempt_no=attempt_no,
                             verification_summary=self._verification_summary(v)
-                            + ("\nCHALLENGER OPINION:\n" + challenger_advice if challenger_advice else ""),
+                            + (
+                                "\nCHALLENGER OPINION:\n" + challenger_advice
+                                if challenger_advice
+                                else ""
+                            ),
                             accounting=review_accounting,
                         )
                         self.db.finish_intelligence_allocation(
-                            allocation_id, "SUCCEEDED" if review.ok else "REJECTED",
-                            {"verdict": review.verdict, "summary": review.summary,
-                             "findings": review.findings},
+                            allocation_id,
+                            "SUCCEEDED" if review.ok else "REJECTED",
+                            {
+                                "verdict": review.verdict,
+                                "summary": review.summary,
+                                "findings": review.findings,
+                            },
                         )
-                        self.db.record_review(attempt_id, review_decision.candidate.name, review)
+                        self.db.record_review(
+                            attempt_id, review_decision.candidate.name, review
+                        )
                         self.reporter.json(
-                            job.id, f"review-{attempt_no:02d}-{len(reviewer_used)}.json", review
+                            job.id,
+                            f"review-{attempt_no:02d}-{len(reviewer_used)}.json",
+                            review,
                         )
                         if not review.ok:
                             rejected_review = review
                             break
                     if rejected_review:
                         self.db.finish_attempt(
-                            attempt_id, AttemptStatus.REVIEW_FAILED.value, result,
-                            duration, outcome=Outcome.REVIEW_FAILURE.value,
+                            attempt_id,
+                            AttemptStatus.REVIEW_FAILED.value,
+                            result,
+                            duration,
+                            outcome=Outcome.REVIEW_FAILURE.value,
                         )
                         failures.append(
                             f"Attempt {attempt_no} independent review rejected:\n"
-                            + rejected_review.summary + "\n"
+                            + rejected_review.summary
+                            + "\n"
                             + "\n".join(rejected_review.findings)
                         )
-                        if used.count(candidate.name) <= self.cfg.same_candidate_retries:
+                        if (
+                            used.count(candidate.name)
+                            <= self.cfg.same_candidate_retries
+                        ):
                             retry_same = candidate.name
                         else:
                             retry_exclude.add(candidate.name)
@@ -1021,9 +1130,14 @@ class Controller:
             self.db.update_job(job)
             self.reporter.record_job(job)
 
-    def accept(self, job_id: str, message: str | None = None, *,
-               review_seconds: float | None = None,
-               human_changed_lines: int | None = None) -> str:
+    def accept(
+        self,
+        job_id: str,
+        message: str | None = None,
+        *,
+        review_seconds: float | None = None,
+        human_changed_lines: int | None = None,
+    ) -> str:
         job = self.db.get_job(job_id)
         if job.state != JobState.READY:
             raise RuntimeError(f"{job.id} must be READY_FOR_REVIEW, not {job.state}")
@@ -1040,20 +1154,28 @@ class Controller:
             raise RuntimeError("job has no READY attempt to accept")
         self.db.complete_acceptance(job.id, ready_attempt, commit)
         self.db.record_human_metrics(
-            job.id, ready_attempt, review_seconds=review_seconds,
+            job.id,
+            ready_attempt,
+            review_seconds=review_seconds,
             changed_lines=human_changed_lines,
             accepted_without_edit=(human_changed_lines == 0)
-            if human_changed_lines is not None else None,
+            if human_changed_lines is not None
+            else None,
         )
         job.state = JobState.ACCEPTED
         self.reporter.summary(job, commit=commit)
         self._write_event_audit(job.id)
         return commit
 
-    def reject(self, job_id: str, feedback: str, *,
-               review_seconds: float | None = None,
-               repair_seconds: float | None = None,
-               human_changed_lines: int | None = None) -> None:
+    def reject(
+        self,
+        job_id: str,
+        feedback: str,
+        *,
+        review_seconds: float | None = None,
+        repair_seconds: float | None = None,
+        human_changed_lines: int | None = None,
+    ) -> None:
         job = self.db.get_job(job_id)
         if job.state not in {
             JobState.READY,
@@ -1071,8 +1193,11 @@ class Controller:
         )
         if ready_attempt is not None:
             self.db.record_human_metrics(
-                job.id, ready_attempt, review_seconds=review_seconds,
-                repair_seconds=repair_seconds, changed_lines=human_changed_lines,
+                job.id,
+                ready_attempt,
+                review_seconds=review_seconds,
+                repair_seconds=repair_seconds,
+                changed_lines=human_changed_lines,
                 accepted_without_edit=False,
             )
         self.db.event(

@@ -1,4 +1,7 @@
 from pathlib import Path
+from types import SimpleNamespace
+
+from pydantic import BaseModel
 
 from pmc.conformance import smoke_candidate
 from pmc.db import Database
@@ -129,20 +132,88 @@ def test_openhands_passes_nonnative_tool_setting_to_llm(tmp_path: Path):
     }
 
 
+def test_openhands_pooled_llm_reserves_each_request_and_rotates_credentials(
+    monkeypatch,
+):
+    calls: list[str] = []
+
+    class FakeLLM(BaseModel):
+        api_key: str | None = None
+        num_retries: int = 5
+        stream: bool = True
+        max_output_tokens: int | None = 128
+
+        def completion(self, _messages, tools=None, **_kwargs):
+            del tools
+            calls.append(str(self.api_key))
+            if self.api_key == "lane-one":
+                error = RuntimeError("HTTP 429")
+                error.status_code = 429  # type: ignore[attr-defined]
+                raise error
+            return SimpleNamespace(
+                raw_response={
+                    "id": "request-two",
+                    "usage": {"prompt_tokens": 11, "completion_tokens": 7},
+                }
+            )
+
+    class Accounting:
+        def __init__(self):
+            self.reserved: list[int] = []
+            self.failed: list[str] = []
+            self.succeeded: list[object] = []
+
+        def reserve(self, turn, _messages, _max_output):
+            self.reserved.append(turn)
+            lane = "LANE_ONE" if turn == 1 else "LANE_TWO"
+            return SimpleNamespace(api_key_env=lane)
+
+        def fail(self, ticket, error):
+            self.failed.append(ticket.api_key_env + ":" + str(error))
+
+        def succeed(self, _ticket, reply):
+            self.succeeded.append(reply)
+
+    monkeypatch.setenv("LANE_ONE", "lane-one")
+    monkeypatch.setenv("LANE_TWO", "lane-two")
+    accounting = Accounting()
+    llm = OpenHandsExecutor()._pooled_llm(
+        FakeLLM, lambda value: value, {}, accounting, max_failovers=1
+    )
+
+    response = llm.completion([{"role": "user", "content": "edit it"}])
+
+    assert response.raw_response["id"] == "request-two"
+    assert accounting.reserved == [1, 2]
+    assert accounting.failed == ["LANE_ONE:HTTP 429"]
+    assert accounting.succeeded[0].input_tokens == 11
+    assert accounting.succeeded[0].output_tokens == 7
+    assert calls == ["lane-one", "lane-two"]
+    assert llm.num_retries == 0
+    assert llm.stream is False
+
+
 def test_openhands_classifies_remote_provider_failures():
-    assert _provider_failure(RuntimeError("litellm.RateLimitError: status 429"))[0:2] == (
+    assert _provider_failure(RuntimeError("litellm.RateLimitError: status 429"))[
+        0:2
+    ] == (
         Outcome.RATE_LIMIT,
         429,
     )
-    assert _provider_failure(RuntimeError("400 Function call is missing a thought_signature"))[0] == (
-        Outcome.PROTOCOL_FAILURE
-    )
+    assert _provider_failure(
+        RuntimeError("400 Function call is missing a thought_signature")
+    )[0] == (Outcome.PROTOCOL_FAILURE)
     outcome, status, headers = _provider_failure(
-        RuntimeError("ACPPromptError: [500] You have exhausted your daily quota on this model")
+        RuntimeError(
+            "ACPPromptError: [500] You have exhausted your daily quota on this model"
+        )
     )
     assert (outcome, status) == (Outcome.RATE_LIMIT, 429)
     assert headers["retry-after"] == "3600"
-    assert _provider_failure(RuntimeError("ordinary agent failure"))[0] == Outcome.EXECUTOR_FAILURE
+    assert (
+        _provider_failure(RuntimeError("ordinary agent failure"))[0]
+        == Outcome.EXECUTOR_FAILURE
+    )
 
 
 def test_openhands_acp_agent_receives_mapped_secret(monkeypatch, tmp_path: Path):
@@ -199,9 +270,7 @@ def test_openhands_acp_agent_receives_mapped_secret(monkeypatch, tmp_path: Path)
     result = executor.run(request)
 
     assert result.ok
-    assert calls["conversation"]["secrets"] == {
-        "GEMINI_API_KEY": "credential-value"
-    }
+    assert calls["conversation"]["secrets"] == {"GEMINI_API_KEY": "credential-value"}
 
 
 def test_acp_conformance_requires_real_file_write(monkeypatch, tmp_path: Path):
@@ -300,13 +369,17 @@ def test_openhands_remote_workspace_uses_server_credential(monkeypatch, tmp_path
     assert result.ok
     assert calls["workspace"] == {
         "host": "http://ofi1.example:8010",
+        "working_dir": "/tmp/pmc-pmc-x-1",
         "api_key": "session-only",
     }
     assert any(
         "git add -A && git diff --binary --cached HEAD --" in command
         for command in calls["commands"]
     )
-    assert any("git commit --allow-empty -qm baseline" in command for command in calls["commands"])
+    assert any(
+        "git commit --allow-empty -qm baseline" in command
+        for command in calls["commands"]
+    )
 
 
 def test_jules_http_error_excludes_request_headers_and_key():

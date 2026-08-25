@@ -529,6 +529,11 @@ class Database:
             cooldown = time.time() + float(retry_after) if retry_after else None
         except (TypeError, ValueError):
             cooldown = None
+        # A provider may omit Retry-After on 429.  Never immediately reuse the
+        # known-rate-limited lane in that case; the finite fallback permits a
+        # later health canary without pretending the key is permanently dead.
+        if status_code == 429 and cooldown is None:
+            cooldown = time.time() + 60
         if status_code in {401, 403}:
             health = "AUTH_FAILED"
         elif status_code == 429:
@@ -580,8 +585,13 @@ class Database:
                 conn.execute(
                     """UPDATE provider_credentials SET health=?,cooldown_until=?,reset_at=?,updated_at=?
                     WHERE quota_scope_id=? AND enabled=1""",
-                    (health, cooldown, headers.get("x-ratelimit-reset") or retry_after,
-                     utcnow(), row["quota_scope_id"]),
+                    (
+                        health,
+                        cooldown,
+                        headers.get("x-ratelimit-reset") or retry_after,
+                        utcnow(),
+                        row["quota_scope_id"],
+                    ),
                 )
 
     def provider_availability(self, provider: str) -> tuple[bool, str]:
@@ -608,53 +618,87 @@ class Database:
         """Return an eligible secret reference, never the secret value."""
         import os
         import time
+
         with self.connect() as conn:
             rows = conn.execute(
                 """SELECT * FROM provider_credentials WHERE provider=? AND enabled=1
                 AND health NOT IN ('AUTH_FAILED','DISABLED','QUOTA_EXHAUSTED')
-                ORDER BY consecutive_failures, credential_id""", (provider,)
+                ORDER BY consecutive_failures, credential_id""",
+                (provider,),
             ).fetchall()
         for row in rows:
-            if (not row["cooldown_until"] or row["cooldown_until"] <= time.time()) and os.getenv(row["api_key_env"]):
+            if (
+                not row["cooldown_until"] or row["cooldown_until"] <= time.time()
+            ) and os.getenv(row["api_key_env"]):
                 return str(row["api_key_env"])
         return None
 
     def provider_capacity(self, provider: str) -> dict[str, Any]:
         """Scheduler-safe aggregate; contains no secret names or values."""
         import time
+
         with self.connect() as conn:
             rows = conn.execute(
                 """SELECT credential_id,health,cooldown_until,requests_remaining,
                 tokens_remaining,reset_at,concurrency_limit,quota_scope_id,
                 quota_scope_confidence FROM provider_credentials
-                WHERE provider=? AND enabled=1""", (provider,)
+                WHERE provider=? AND enabled=1""",
+                (provider,),
             ).fetchall()
             active = conn.execute(
                 """SELECT COUNT(*) FROM credential_reservations cr
                 JOIN provider_credentials pc ON pc.credential_id=cr.credential_id
-                WHERE pc.provider=? AND cr.state='RESERVED'""", (provider,)
+                WHERE pc.provider=? AND cr.state='RESERVED'""",
+                (provider,),
             ).fetchone()[0]
         usable = sum(
-            1 for row in rows
+            1
+            for row in rows
             if row["health"] not in {"AUTH_FAILED", "DISABLED", "QUOTA_EXHAUSTED"}
             and (not row["cooldown_until"] or row["cooldown_until"] <= time.time())
         )
         return {
-            "provider": provider, "configured_credentials": len(rows),
-            "usable_credentials": usable, "active_reservations": active,
-            "available_concurrency": max(0, sum(r["concurrency_limit"] for r in rows) - active),
+            "provider": provider,
+            "configured_credentials": len(rows),
+            "usable_credentials": usable,
+            "active_reservations": active,
+            "available_concurrency": max(
+                0, sum(r["concurrency_limit"] for r in rows) - active
+            ),
             "known_requests_remaining": sum(r["requests_remaining"] or 0 for r in rows),
             "known_tokens_remaining": sum(r["tokens_remaining"] or 0 for r in rows),
-            "earliest_reset": min((r["reset_at"] for r in rows if r["reset_at"]), default=None),
+            "earliest_reset": min(
+                (r["reset_at"] for r in rows if r["reset_at"]), default=None
+            ),
             "confidence": sorted({r["quota_scope_confidence"] for r in rows}),
         }
 
+    def provider_next_available_seconds(self, provider: str) -> float | None:
+        """Return the shortest live credential cooldown for a provider."""
+        import time
+
+        with self.connect() as conn:
+            row = conn.execute(
+                """SELECT MIN(cooldown_until) FROM provider_credentials
+                WHERE provider=? AND enabled=1 AND cooldown_until>?""",
+                (provider, time.time()),
+            ).fetchone()
+        if not row or row[0] is None:
+            return None
+        return max(0.0, float(row[0]) - time.time())
+
     def set_model_conformance(
-        self, candidate: Any, *, generation_ok: bool, tool_ok: bool,
-        details: dict[str, Any], status: str | None = None,
+        self,
+        candidate: Any,
+        *,
+        generation_ok: bool,
+        tool_ok: bool,
+        details: dict[str, Any],
+        status: str | None = None,
     ) -> None:
         status = status or ("AVAILABLE" if generation_ok and tool_ok else "QUARANTINED")
         from .versioning import PROMPT_PROFILE_VERSION
+
         with self.connect() as conn:
             conn.execute(
                 """INSERT INTO model_conformance(candidate,version,status,generation_ok,tool_ok,
@@ -680,6 +724,7 @@ class Database:
 
     def model_conformance(self, candidate: Any) -> dict[str, Any] | None:
         from .versioning import PROMPT_PROFILE_VERSION
+
         with self.connect() as conn:
             row = conn.execute(
                 "SELECT * FROM model_conformance WHERE candidate=? AND version=?",
@@ -692,22 +737,38 @@ class Database:
             result["status"] = "STALE"
         return result
 
-    def reserve_quota(self, candidate: str, job_id: str, estimated_tokens: int,
-                      credential_id: str | None = None,
-                      quota_scope_id: str | None = None) -> int:
+    def reserve_quota(
+        self,
+        candidate: str,
+        job_id: str,
+        estimated_tokens: int,
+        credential_id: str | None = None,
+        quota_scope_id: str | None = None,
+    ) -> int:
         with self.connect() as conn:
             cur = conn.execute(
                 """INSERT INTO quota_reservations
                 (candidate,job_id,estimated_tokens,state,created_at,credential_id,quota_scope_id)
                 VALUES(?,?,?,'RESERVED',?,?,?)""",
-                (candidate, job_id, estimated_tokens, utcnow(), credential_id, quota_scope_id),
+                (
+                    candidate,
+                    job_id,
+                    estimated_tokens,
+                    utcnow(),
+                    credential_id,
+                    quota_scope_id,
+                ),
             )
             reservation_id = int(cur.lastrowid)
         self.event(
             "QUOTA_RESERVED",
             job_id=job_id,
-            payload={"candidate": candidate, "estimated_tokens": estimated_tokens,
-                     "credential_id": credential_id, "quota_scope_id": quota_scope_id},
+            payload={
+                "candidate": candidate,
+                "estimated_tokens": estimated_tokens,
+                "credential_id": credential_id,
+                "quota_scope_id": quota_scope_id,
+            },
         )
         return reservation_id
 
@@ -726,8 +787,11 @@ class Database:
         quota_scope_id: str | None = None,
     ) -> tuple[int, int]:
         reservation_id = self.reserve_quota(
-            candidate.name, job_id, estimated_input + estimated_output,
-            credential_id, quota_scope_id,
+            candidate.name,
+            job_id,
+            estimated_input + estimated_output,
+            credential_id,
+            quota_scope_id,
         )
         with self.connect() as conn:
             cur = conn.execute(
@@ -874,7 +938,9 @@ class Database:
             },
         )
 
-    def model_request_totals(self, attempt_id: int, candidate: str | None = None) -> dict[str, Any]:
+    def model_request_totals(
+        self, attempt_id: int, candidate: str | None = None
+    ) -> dict[str, Any]:
         with self.connect() as conn:
             row = conn.execute(
                 """SELECT COUNT(*) requests,COALESCE(SUM(actual_input_tokens),0) input_tokens,
@@ -1501,6 +1567,7 @@ class Database:
         if not row:
             raise KeyError(f"Unknown job {job_id}")
         from .domain import BudgetEnvelope
+
         return Job(
             id=row["id"],
             repo=Path(row["repo"]),
@@ -1844,8 +1911,13 @@ class Database:
             )
 
     def record_human_metrics(
-        self, job_id: str, attempt_id: int, *, review_seconds: float | None = None,
-        repair_seconds: float | None = None, changed_lines: int | None = None,
+        self,
+        job_id: str,
+        attempt_id: int,
+        *,
+        review_seconds: float | None = None,
+        repair_seconds: float | None = None,
+        changed_lines: int | None = None,
         accepted_without_edit: bool | None = None,
     ) -> None:
         with self.connect() as conn:
@@ -1855,16 +1927,36 @@ class Database:
                 human_changed_lines=COALESCE(?,human_changed_lines),
                 accepted_without_human_edit=COALESCE(?,accepted_without_human_edit),
                 review_finished_at=? WHERE job_id=? AND attempt_id=?""",
-                (review_seconds, repair_seconds, changed_lines,
-                 int(accepted_without_edit) if accepted_without_edit is not None else None,
-                 utcnow(), job_id, attempt_id),
+                (
+                    review_seconds,
+                    repair_seconds,
+                    changed_lines,
+                    int(accepted_without_edit)
+                    if accepted_without_edit is not None
+                    else None,
+                    utcnow(),
+                    job_id,
+                    attempt_id,
+                ),
             )
 
     def record_post_acceptance_outcome(
-        self, job_id: str, outcome: str, *, details: str | None = None,
-        repair_seconds: float | None = None, changed_lines: int | None = None,
+        self,
+        job_id: str,
+        outcome: str,
+        *,
+        details: str | None = None,
+        repair_seconds: float | None = None,
+        changed_lines: int | None = None,
     ) -> None:
-        allowed = {"STABLE", "REOPENED", "REVERTED", "REGRESSION", "HOTFIX", "HUMAN_CORRECTION"}
+        allowed = {
+            "STABLE",
+            "REOPENED",
+            "REVERTED",
+            "REGRESSION",
+            "HOTFIX",
+            "HUMAN_CORRECTION",
+        }
         if outcome not in allowed:
             raise ValueError(f"invalid post-acceptance outcome: {outcome}")
         if self.get_job(job_id).state != JobState.ACCEPTED:
@@ -1875,16 +1967,35 @@ class Database:
                 """INSERT INTO post_acceptance_outcomes
                 (job_id,attempt_id,outcome,details,human_repair_seconds,human_changed_lines,occurred_at)
                 VALUES(?,?,?,?,?,?,?)""",
-                (job_id, attempt_id, outcome, details, repair_seconds, changed_lines, utcnow()),
+                (
+                    job_id,
+                    attempt_id,
+                    outcome,
+                    details,
+                    repair_seconds,
+                    changed_lines,
+                    utcnow(),
+                ),
             )
-        self.event(outcome if outcome != "REGRESSION" else "REGRESSION_FOUND",
-                   job_id=job_id, attempt_id=attempt_id,
-                   payload={"details": details, "human_repair_seconds": repair_seconds,
-                            "human_changed_lines": changed_lines})
+        self.event(
+            outcome if outcome != "REGRESSION" else "REGRESSION_FOUND",
+            job_id=job_id,
+            attempt_id=attempt_id,
+            payload={
+                "details": details,
+                "human_repair_seconds": repair_seconds,
+                "human_changed_lines": changed_lines,
+            },
+        )
 
     def begin_intelligence_allocation(
-        self, job_id: str, attempt_id: int | None, role: str, candidate: str | None,
-        reason: str, uncertainty: float | None,
+        self,
+        job_id: str,
+        attempt_id: int | None,
+        role: str,
+        candidate: str | None,
+        reason: str,
+        uncertainty: float | None,
     ) -> int:
         with self.connect() as conn:
             cur = conn.execute(
@@ -1894,30 +2005,42 @@ class Database:
                 (job_id, attempt_id, role, candidate, reason, uncertainty, utcnow()),
             )
         allocation_id = int(cur.lastrowid)
-        self.event("INTELLIGENCE_ALLOCATED", job_id=job_id, attempt_id=attempt_id,
-                   payload={"allocation_id": allocation_id, "role": role,
-                            "candidate": candidate, "reason": reason,
-                            "uncertainty": uncertainty})
+        self.event(
+            "INTELLIGENCE_ALLOCATED",
+            job_id=job_id,
+            attempt_id=attempt_id,
+            payload={
+                "allocation_id": allocation_id,
+                "role": role,
+                "candidate": candidate,
+                "reason": reason,
+                "uncertainty": uncertainty,
+            },
+        )
         return allocation_id
 
-    def finish_intelligence_allocation(self, allocation_id: int, state: str,
-                                       result: dict[str, Any]) -> None:
+    def finish_intelligence_allocation(
+        self, allocation_id: int, state: str, result: dict[str, Any]
+    ) -> None:
         with self.connect() as conn:
             conn.execute(
                 """UPDATE intelligence_allocations SET state=?,result_json=?,finished_at=?
-                WHERE id=?""", (state, json.dumps(result, default=str), utcnow(), allocation_id)
+                WHERE id=?""",
+                (state, json.dumps(result, default=str), utcnow(), allocation_id),
             )
 
-    def update_attempt_context(self, attempt_id: int, content_hash: str,
-                               manifest: dict[str, Any]) -> None:
+    def update_attempt_context(
+        self, attempt_id: int, content_hash: str, manifest: dict[str, Any]
+    ) -> None:
         with self.connect() as conn:
             conn.execute(
                 "UPDATE attempts SET context_hash=?,context_manifest_json=? WHERE id=?",
                 (content_hash, json.dumps(manifest, default=str), attempt_id),
             )
 
-    def contextual_candidate_stats(self, job: Job, role: str, phase: str,
-                                   repo_specific: bool = True) -> list[dict[str, Any]]:
+    def contextual_candidate_stats(
+        self, job: Job, role: str, phase: str, repo_specific: bool = True
+    ) -> list[dict[str, Any]]:
         """Stable human outcomes for the exact context, excluding infrastructure failures."""
         with self.connect() as conn:
             rows = conn.execute(
@@ -1943,29 +2066,44 @@ class Database:
                     SELECT 1 FROM post_acceptance_outcomes mature WHERE mature.job_id=j.id
                 ))
                 GROUP BY a.candidate""",
-                (role, job.task_type, job.complexity, job.risk,
-                 int(repo_specific), str(job.repo), phase, phase, phase),
+                (
+                    role,
+                    job.task_type,
+                    job.complexity,
+                    job.risk,
+                    int(repo_specific),
+                    str(job.repo),
+                    phase,
+                    phase,
+                    phase,
+                ),
             ).fetchall()
         return [dict(row) for row in rows]
 
     def human_observation_count(self, role: str = "builder") -> int:
         with self.connect() as conn:
             if role != "builder":
-                return int(conn.execute(
-                    """SELECT COUNT(*) FROM intelligence_allocations ia
+                return int(
+                    conn.execute(
+                        """SELECT COUNT(*) FROM intelligence_allocations ia
                     JOIN human_feedback hf ON hf.job_id=ia.job_id
                     WHERE LOWER(ia.role)=LOWER(?) AND ia.state IN ('SUCCEEDED','REJECTED')
                     AND (hf.verdict='REJECT' OR EXISTS (
                         SELECT 1 FROM post_acceptance_outcomes po WHERE po.job_id=ia.job_id
-                    ))""", (role,)
-                ).fetchone()[0])
-            return int(conn.execute(
-                """SELECT COUNT(*) FROM attempts a JOIN human_feedback hf ON hf.attempt_id=a.id
+                    ))""",
+                        (role,),
+                    ).fetchone()[0]
+                )
+            return int(
+                conn.execute(
+                    """SELECT COUNT(*) FROM attempts a JOIN human_feedback hf ON hf.attempt_id=a.id
                 WHERE a.role=? AND (hf.verdict='REJECT' OR (
                     hf.verdict='ACCEPT' AND EXISTS (
                         SELECT 1 FROM post_acceptance_outcomes po WHERE po.job_id=a.job_id
-                    )))""", (role,)
-            ).fetchone()[0])
+                    )))""",
+                    (role,),
+                ).fetchone()[0]
+            )
 
     def contextual_role_stats(self, job: Job, role: str) -> list[dict[str, Any]]:
         """Outcome attribution for planner/reviewer/challenger candidate selection."""

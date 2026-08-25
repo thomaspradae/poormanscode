@@ -4,10 +4,14 @@ import os
 import re
 import tarfile
 import tempfile
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from pydantic import PrivateAttr
+
 from ..domain import ExecutionRequest, ExecutionResult, Outcome
+from ..providers.openai_compat import ChatReply
 
 
 def _provider_failure(exc: Exception) -> tuple[Outcome, int | None, dict[str, str]]:
@@ -36,12 +40,20 @@ def _provider_failure(exc: Exception) -> tuple[Outcome, int | None, dict[str, st
             status = 401
         elif re.search(r"\b403\b|PermissionDenied", message, re.IGNORECASE):
             status = 403
+        elif re.search(
+            r"ServiceUnavailable|provider credential pool unavailable|no available credential",
+            message,
+            re.IGNORECASE,
+        ):
+            status = 503
     try:
         status = int(status) if status is not None else None
     except (TypeError, ValueError):
         status = None
 
-    source_headers = getattr(response, "headers", None) or getattr(exc, "headers", None) or {}
+    source_headers = (
+        getattr(response, "headers", None) or getattr(exc, "headers", None) or {}
+    )
     headers = {
         str(key).lower(): str(value)
         for key, value in dict(source_headers).items()
@@ -49,7 +61,9 @@ def _provider_failure(exc: Exception) -> tuple[Outcome, int | None, dict[str, st
         or str(key).lower() in {"retry-after", "request-id", "x-request-id"}
     }
     quota_exhausted = bool(
-        re.search(r"(?:quota.*exhaust|exhaust.*quota|quota exceeded)", message, re.IGNORECASE)
+        re.search(
+            r"(?:quota.*exhaust|exhaust.*quota|quota exceeded)", message, re.IGNORECASE
+        )
     )
     if status == 429 or quota_exhausted:
         if quota_exhausted and "retry-after" not in headers:
@@ -92,7 +106,9 @@ class OpenHandsExecutor:
         if not isinstance(command, list) or not all(
             isinstance(part, str) and part for part in command
         ):
-            raise RuntimeError("OpenHands ACP candidate requires acp_command as a string list")
+            raise RuntimeError(
+                "OpenHands ACP candidate requires acp_command as a string list"
+            )
         return ACPAgent(
             acp_command=command,
             acp_server=candidate.extra.get("acp_server"),
@@ -146,6 +162,124 @@ class OpenHandsExecutor:
                     output_tokens = val
         return input_tokens, output_tokens, cost, raw
 
+    @staticmethod
+    def _accounting_reply(response: Any) -> ChatReply:
+        """Convert an OpenHands/LiteLLM response into PMC's ledger contract."""
+        raw = getattr(response, "raw_response", None)
+        try:
+            data = dict(raw or {})
+        except (TypeError, ValueError):
+            data = {}
+        usage = data.get("usage") or {}
+        try:
+            usage = dict(usage)
+        except (TypeError, ValueError):
+            usage = {}
+        hidden = getattr(raw, "_hidden_params", None) or {}
+        headers = hidden.get("additional_headers") or hidden.get("headers") or {}
+        rate_headers = {
+            str(key).lower(): str(value)
+            for key, value in dict(headers).items()
+            if str(key).lower().startswith("x-ratelimit-")
+            or str(key).lower() in {"retry-after", "request-id", "x-request-id"}
+        }
+        raw_cost = hidden.get("response_cost") or usage.get("cost") or data.get("cost")
+        try:
+            cost = float(raw_cost) if raw_cost is not None else None
+        except (TypeError, ValueError):
+            cost = None
+        return ChatReply(
+            content="",
+            input_tokens=usage.get("prompt_tokens") or usage.get("input_tokens"),
+            output_tokens=usage.get("completion_tokens") or usage.get("output_tokens"),
+            request_id=(
+                headers.get("x-request-id")
+                or headers.get("request-id")
+                or data.get("id")
+            ),
+            cost_usd=cost,
+            rate_headers=rate_headers,
+            raw=data,
+        )
+
+    def _pooled_llm(
+        self,
+        llm_type: Any,
+        secret_type: Any,
+        kwargs: dict[str, Any],
+        accounting: Any,
+        max_failovers: int,
+    ) -> Any:
+        """Build an LLM whose every provider call uses PMC ProviderPool.
+
+        OpenHands runs the agent/LLM loop in the controller and delegates only
+        workspace operations to Agent Server.  This wrapper therefore keeps
+        all provider credentials out of the remote worker while allowing each
+        model request to reserve and reconcile a different legitimate lane.
+        """
+        executor = self
+
+        class PooledLLM(llm_type):
+            _pmc_accounting: Any = PrivateAttr()
+            _pmc_turn: int = PrivateAttr(default=0)
+            _pmc_max_failovers: int = PrivateAttr(default=0)
+
+            def completion(self, messages, tools=None, **call_kwargs):
+                formatted = []
+                for message in messages:
+                    if hasattr(message, "model_dump"):
+                        formatted.append(message.model_dump(mode="json"))
+                    elif isinstance(message, dict):
+                        formatted.append(message)
+                    else:
+                        formatted.append({"content": str(message)})
+                max_output = int(
+                    call_kwargs.get("max_tokens")
+                    or call_kwargs.get("max_output_tokens")
+                    or self.max_output_tokens
+                    or 4096
+                )
+                last_error: Exception | None = None
+                for _ in range(self._pmc_max_failovers + 1):
+                    self._pmc_turn += 1
+                    ticket = self._pmc_accounting.reserve(
+                        self._pmc_turn, formatted, max_output
+                    )
+                    key = os.getenv(ticket.api_key_env or "")
+                    if not key:
+                        error = RuntimeError(
+                            f"credential environment variable is unavailable: {ticket.api_key_env}"
+                        )
+                        self._pmc_accounting.fail(ticket, error)
+                        raise error
+                    # Disable SDK-hidden retries: every physical provider call
+                    # must have its own PMC ledger row and reservation.
+                    clone = self.model_copy(
+                        update={"api_key": secret_type(key), "num_retries": 0}
+                    )
+                    try:
+                        response = llm_type.completion(
+                            clone, messages, tools=tools, **call_kwargs
+                        )
+                    except Exception as exc:
+                        self._pmc_accounting.fail(ticket, exc)
+                        last_error = exc
+                        _outcome, status, _headers = _provider_failure(exc)
+                        if status not in {401, 403, 429, 500, 502, 503, 504}:
+                            raise
+                        continue
+                    self._pmc_accounting.succeed(
+                        ticket, executor._accounting_reply(response)
+                    )
+                    return response
+                assert last_error is not None
+                raise last_error
+
+        pooled = PooledLLM(**{**kwargs, "num_retries": 0, "stream": False})
+        pooled._pmc_accounting = accounting
+        pooled._pmc_max_failovers = max(0, max_failovers)
+        return pooled
+
     def run(self, request: ExecutionRequest) -> ExecutionResult:
         SecretStr, LLM, Conversation, Workspace, get_default_agent = self._imports()
         c = request.candidate
@@ -156,12 +290,45 @@ class OpenHandsExecutor:
         # endpoints, while PMC's provider conformance uses the endpoint-native
         # model id. Keep the adapter override candidate-local and observable.
         llm_model = c.extra.get("openhands_model") or c.model
-        kwargs: dict[str, Any] = {"model": llm_model, "usage_id": f"pmc:{request.job.id}"}
+        kwargs: dict[str, Any] = {
+            "model": llm_model,
+            "usage_id": f"pmc:{request.job.id}",
+        }
         if "native_tool_calling" in c.extra:
             kwargs["native_tool_calling"] = bool(c.extra["native_tool_calling"])
-        if key:
+        gateway = None
+        if request.accounting is not None and c.server_url:
+            from ..provider_gateway import ProviderGateway
+
+            gateway_host = c.extra.get("controller_gateway_host")
+            if not gateway_host:
+                return ExecutionResult(
+                    False,
+                    error=(
+                        "remote request-accounted OpenHands candidate requires "
+                        "controller_gateway_host (normally the controller's Tailscale IP)"
+                    ),
+                    outcome=Outcome.POLICY_FAILURE,
+                )
+            gateway = ProviderGateway(
+                bind_host=str(gateway_host),
+                public_host=str(gateway_host),
+                upstream_base_url=c.base_url or "",
+                upstream_model=c.model,
+                accounting=request.accounting,
+                max_failovers=int(c.extra.get("provider_request_failovers", 2)),
+                max_rate_limit_wait=float(
+                    c.extra.get("provider_rate_limit_max_wait", 30)
+                ),
+                timeout=float(c.extra.get("provider_timeout", 300)),
+            ).start()
+            kwargs["api_key"] = SecretStr(gateway.token)
+            kwargs["base_url"] = gateway.base_url
+            kwargs["num_retries"] = 0
+            kwargs["stream"] = False
+        elif key and request.accounting is None:
             kwargs["api_key"] = SecretStr(key)
-        if c.base_url:
+        if c.base_url and gateway is None:
             kwargs["base_url"] = c.base_url
         if c.extra.get("agent_kind") == "acp":
             agent = self._acp_agent(c)
@@ -169,9 +336,19 @@ class OpenHandsExecutor:
             secret_name = c.extra.get("acp_api_key_env")
             conversation_secrets = {secret_name: key} if key and secret_name else None
         else:
-            llm = LLM(**kwargs)
+            if request.accounting is not None and gateway is None:
+                llm = self._pooled_llm(
+                    LLM,
+                    SecretStr,
+                    kwargs,
+                    request.accounting,
+                    int(c.extra.get("provider_request_failovers", 2)),
+                )
+            else:
+                llm = LLM(**kwargs)
             agent = get_default_agent(llm=llm, cli_mode=True)
             conversation_secrets = None
+        agent_diagnostics: dict[str, Any] = {}
         try:
             if not c.server_url:
                 if not c.extra.get("allow_local_unsandboxed", False):
@@ -199,12 +376,18 @@ class OpenHandsExecutor:
                 # Remote Agent Server path. The controller ships a clean snapshot,
                 # runs the agent remotely, then applies only the resulting Git patch locally.
                 server_key = (
-                    os.getenv(c.server_api_key_env)
-                    if c.server_api_key_env
-                    else None
+                    os.getenv(c.server_api_key_env) if c.server_api_key_env else None
                 )
-                workspace = Workspace(host=c.server_url, api_key=server_key)
                 remote_dir = f"/tmp/pmc-{request.job.id.lower()}-{request.attempt_no}"
+                # The remote agent's tool boundary must be the same directory
+                # that receives the repository snapshot. Previously Workspace
+                # defaulted to ``workspace/project`` while PMC uploaded under
+                # /tmp, leaving every agent tool pointed at an empty directory.
+                workspace = Workspace(
+                    host=c.server_url,
+                    working_dir=remote_dir,
+                    api_key=server_key,
+                )
                 with tempfile.TemporaryDirectory() as td:
                     archive = Path(td) / "repo.tar"
                     # Ship the CURRENT worktree so a remote executor can repair an earlier
@@ -254,6 +437,21 @@ class OpenHandsExecutor:
                     try:
                         conversation.send_message(remote_prompt)
                         conversation.run()
+                        try:
+                            events = list(conversation.state.events)
+                            agent_diagnostics = {
+                                "conversation_id": str(conversation.id),
+                                "event_counts": dict(
+                                    Counter(type(event).__name__ for event in events)
+                                ),
+                                "execution_status": str(
+                                    conversation.state.execution_status
+                                ),
+                            }
+                        except Exception:
+                            # Diagnostics must never turn completed coding work
+                            # into an executor failure.
+                            agent_diagnostics = {"diagnostics": "unavailable"}
                         diff = workspace.execute_command(
                             f"cd {remote_dir} && git add -A && git diff --binary --cached HEAD --"
                         ).stdout
@@ -265,18 +463,49 @@ class OpenHandsExecutor:
                         WorktreeManager(request.worktree.parent).apply_patch(
                             request.worktree, diff
                         )
-            in_tok, out_tok, cost, raw = self._metrics(llm)
+            if request.accounting is not None:
+                totals = request.accounting.db.model_request_totals(
+                    request.accounting.attempt_id, c.name
+                )
+                in_tok = int(totals["input_tokens"])
+                out_tok = int(totals["output_tokens"])
+                cost = totals["cost_usd"]
+                raw = {
+                    "model_request_totals": totals,
+                    "agent": agent_diagnostics,
+                }
+            else:
+                in_tok, out_tok, cost, raw = self._metrics(llm)
             return ExecutionResult(
                 True,
                 summary="OpenHands conversation completed; controller will verify independently",
                 input_tokens=in_tok,
                 output_tokens=out_tok,
                 cost_usd=cost,
-                raw_metrics={**raw, "accounting": "sdk-aggregate"},
-                accounting_level="aggregate",
+                raw_metrics={
+                    **raw,
+                    "accounting": (
+                        "per_model_request" if request.accounting else "sdk-aggregate"
+                    ),
+                },
+                accounting_level=(
+                    "per_model_request" if request.accounting else "aggregate"
+                ),
             )
         except Exception as exc:
-            in_tok, out_tok, cost, raw = self._metrics(llm)
+            if request.accounting is not None:
+                totals = request.accounting.db.model_request_totals(
+                    request.accounting.attempt_id, c.name
+                )
+                in_tok = int(totals["input_tokens"])
+                out_tok = int(totals["output_tokens"])
+                cost = totals["cost_usd"]
+                raw = {
+                    "model_request_totals": totals,
+                    "agent": agent_diagnostics,
+                }
+            else:
+                in_tok, out_tok, cost, raw = self._metrics(llm)
             outcome, provider_status, rate_headers = _provider_failure(exc)
             if provider_status is not None:
                 raw["provider_status"] = provider_status
@@ -288,7 +517,17 @@ class OpenHandsExecutor:
                 input_tokens=in_tok,
                 output_tokens=out_tok,
                 cost_usd=cost,
-                raw_metrics={**raw, "accounting": "sdk-aggregate"},
+                raw_metrics={
+                    **raw,
+                    "accounting": (
+                        "per_model_request" if request.accounting else "sdk-aggregate"
+                    ),
+                },
                 outcome=outcome,
-                accounting_level="aggregate",
+                accounting_level=(
+                    "per_model_request" if request.accounting else "aggregate"
+                ),
             )
+        finally:
+            if gateway is not None:
+                gateway.close()
