@@ -118,6 +118,7 @@ pmc stats --phase first
 pmc stats --phase repair
 pmc stats --mode explore
 pmc export ~/pmc-attempts.csv
+pmc context-xray PMC-000001 --composition
 ```
 
 Before enabling a new built-in OpenHands model candidate, run the production
@@ -131,6 +132,15 @@ This proves generation, repository inspection, editing, failing-test repair, and
 the complete PMC worktree/verifier/audit lifecycle. Remote OpenHands receives an
 ephemeral gateway token, never a provider API key; PMC selects and reconciles a
 legitimate credential lane for each physical model request.
+
+OpenHands context behavior is explicit per candidate. PMC records a content-free
+token X-ray for every physical request: estimated and provider-reported tokens,
+message/tool counts, tool-schema and observation composition, context growth,
+unchanged retries, condenser calls, credential lane, rate headers, and context
+occupancy when the model window is configured. The X-ray stores hashes and sizes,
+never prompts or credentials. Candidate settings `condenser_max_tokens`,
+`condenser_max_events`, and `request_token_soft_limit` distinguish working-memory
+condensation from provider throughput and cumulative job budgets.
 
 The randomized `explore` slice is the preferred long-run comparison dataset. Raw aggregate success rates can be confounded because the scheduler deliberately sends different kinds of work to different candidates.
 

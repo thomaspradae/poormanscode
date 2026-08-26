@@ -604,6 +604,61 @@ def cmd_models_conformance(args) -> int:
     return 2 if failed else 0
 
 
+def cmd_context_xray(args) -> int:
+    """Display content-free per-request context and quota diagnostics."""
+    from datetime import datetime
+
+    ctl = _controller(args)
+    rows = ctl.db.model_request_xray(args.job_id)
+    if args.json:
+        print(json.dumps(rows, indent=2, default=str))
+        return 0
+    if not rows:
+        print(f"No model requests recorded for {args.job_id}")
+        return 1
+    print(
+        f"{'TURN':>4} {'KIND':<9} {'CANDIDATE':<32} {'EST IN':>7} "
+        f"{'ACT IN':>7} {'OUT':>6} {'OCC':>7} {'COND':>5} {'LANE':<12} "
+        f"{'MSG':>4} {'TOOLS':>5} {'GROW':>7} {'SEC':>6} STATE"
+    )
+    for row in rows:
+        metrics = row["context_metrics"]
+        occupancy = metrics.get("context_occupancy")
+        occupancy_text = f"{100 * occupancy:.1f}%" if occupancy is not None else "?"
+        started, finished = row.get("started_at"), row.get("finished_at")
+        seconds = None
+        if started and finished:
+            seconds = (
+                datetime.fromisoformat(finished) - datetime.fromisoformat(started)
+            ).total_seconds()
+        print(
+            f"{row['turn_number']:>4} {row.get('request_kind') or 'agent':<9} "
+            f"{row['candidate']:<32} {row.get('estimated_input_tokens') or 0:>7} "
+            f"{row.get('actual_input_tokens') or 0:>7} "
+            f"{row.get('actual_output_tokens') or 0:>6} {occupancy_text:>7} "
+            f"{metrics.get('condensation_count_before', 0):>5} "
+            f"{(row.get('credential_id') or '-'): <12} "
+            f"{metrics.get('message_count', 0):>4} {metrics.get('tool_count', 0):>5} "
+            f"{metrics.get('growth_tokens') if metrics.get('growth_tokens') is not None else 0:>7} "
+            f"{seconds if seconds is not None else 0:>6.1f} {row['state']}"
+        )
+        if args.composition:
+            composition = metrics.get("composition", {})
+            print(
+                "     composition: "
+                + ", ".join(f"{key}={value}" for key, value in composition.items())
+            )
+            headers = row.get("rate_headers", {})
+            safe = {
+                key: value
+                for key, value in headers.items()
+                if key.startswith("x-ratelimit-") or key == "retry-after"
+            }
+            if safe:
+                print("     quota: " + ", ".join(f"{k}={v}" for k, v in safe.items()))
+    return 0
+
+
 def cmd_capabilities(args) -> int:
     ctl = _controller(args)
     snapshot = ctl.capabilities.local
@@ -730,6 +785,15 @@ def cmd_doctor(args) -> int:
                 ok = False
             else:
                 print(f"candidate {c.name}: network_policy={policy} enforceable")
+        if c.executor == "openhands" and c.extra.get("agent_kind") != "acp":
+            max_events = c.extra.get("condenser_max_events", 80)
+            max_tokens = c.extra.get("condenser_max_tokens")
+            request_limit = c.extra.get("request_token_soft_limit")
+            print(
+                f"candidate {c.name}: condenser=LLMSummarizingCondenser "
+                f"max_events={max_events} max_tokens={max_tokens or 'model-default'} "
+                f"request_soft_limit={request_limit or 'none'}"
+            )
     if ctl.cfg.research_enabled:
         present = bool(os.getenv(ctl.cfg.research_api_key_env))
         print(
@@ -1009,6 +1073,12 @@ def build_parser() -> argparse.ArgumentParser:
     mc = model_sub.add_parser("conformance")
     mc.add_argument("candidates", nargs="+")
     mc.set_defaults(func=cmd_models_conformance)
+
+    s = sub.add_parser("context-xray")
+    s.add_argument("job_id")
+    s.add_argument("--composition", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_context_xray)
 
     s = sub.add_parser("capabilities")
     s.set_defaults(func=cmd_capabilities)

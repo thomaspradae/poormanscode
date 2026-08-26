@@ -110,6 +110,7 @@ class ProviderGateway:
                 # exact endpoint-native model ID and restores it here.
                 payload["model"] = gateway.upstream_model
                 messages = payload.get("messages") or []
+                tools = payload.get("tools") or []
                 max_output = int(
                     payload.get("max_tokens")
                     or payload.get("max_completion_tokens")
@@ -125,7 +126,18 @@ class ProviderGateway:
                         gateway._turn += 1
                         turn = gateway._turn
                     try:
-                        ticket = gateway.accounting.reserve(turn, messages, max_output)
+                        try:
+                            ticket = gateway.accounting.reserve(
+                                turn, messages, max_output, tools=tools
+                            )
+                        except TypeError as exc:
+                            if "unexpected keyword argument 'tools'" not in str(exc):
+                                raise
+                            # Compatibility for executor/accounting test doubles and
+                            # third-party accounting adapters implementing v1.
+                            ticket = gateway.accounting.reserve(
+                                turn, messages, max_output
+                            )
                     except Exception as exc:  # noqa: BLE001 - accounting contract boundary
                         if last_status == 429:
                             delay = (

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
 import tarfile
 import tempfile
 from collections import Counter
@@ -12,6 +13,19 @@ from pydantic import PrivateAttr
 
 from ..domain import ExecutionRequest, ExecutionResult, Outcome
 from ..providers.openai_compat import ChatReply
+
+
+def _controller_gateway_host(configured: Any) -> str | None:
+    if configured not in {"auto", "tailscale"}:
+        return str(configured) if configured else None
+    proc = subprocess.run(
+        ["ip", "-4", "-o", "addr", "show", "dev", "tailscale0"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    match = re.search(r"\binet\s+(100\.\d+\.\d+\.\d+)/", proc.stdout)
+    return match.group(1) if match else None
 
 
 def _provider_failure(exc: Exception) -> tuple[Outcome, int | None, dict[str, str]]:
@@ -72,6 +86,12 @@ def _provider_failure(exc: Exception) -> tuple[Outcome, int | None, dict[str, st
             # same credential again while retaining a finite re-canary path.
             headers["retry-after"] = "3600"
         return Outcome.RATE_LIMIT, 429, headers
+    if re.search(
+        r"request context.*sustainable request limit|ContextCapacityExceeded",
+        message,
+        re.IGNORECASE,
+    ):
+        return Outcome.RESOURCE_FAILURE, status, headers
     if status in {401, 403} or (status is not None and status >= 500):
         return Outcome.PROVIDER_FAILURE, status, headers
     if "thought_signature" in message or "tool call" in message.lower():
@@ -242,9 +262,27 @@ class OpenHandsExecutor:
                 last_error: Exception | None = None
                 for _ in range(self._pmc_max_failovers + 1):
                     self._pmc_turn += 1
-                    ticket = self._pmc_accounting.reserve(
-                        self._pmc_turn, formatted, max_output
-                    )
+                    formatted_tools = []
+                    for tool in tools or []:
+                        if hasattr(tool, "model_dump"):
+                            formatted_tools.append(tool.model_dump(mode="json"))
+                        elif isinstance(tool, dict):
+                            formatted_tools.append(tool)
+                        else:
+                            formatted_tools.append({"tool": str(tool)})
+                    try:
+                        ticket = self._pmc_accounting.reserve(
+                            self._pmc_turn,
+                            formatted,
+                            max_output,
+                            tools=formatted_tools,
+                        )
+                    except TypeError as exc:
+                        if "unexpected keyword argument 'tools'" not in str(exc):
+                            raise
+                        ticket = self._pmc_accounting.reserve(
+                            self._pmc_turn, formatted, max_output
+                        )
                     key = os.getenv(ticket.api_key_env or "")
                     if not key:
                         error = RuntimeError(
@@ -294,13 +332,17 @@ class OpenHandsExecutor:
             "model": llm_model,
             "usage_id": f"pmc:{request.job.id}",
         }
+        if c.extra.get("max_output_tokens"):
+            kwargs["max_output_tokens"] = int(c.extra["max_output_tokens"])
         if "native_tool_calling" in c.extra:
             kwargs["native_tool_calling"] = bool(c.extra["native_tool_calling"])
         gateway = None
         if request.accounting is not None and c.server_url:
             from ..provider_gateway import ProviderGateway
 
-            gateway_host = c.extra.get("controller_gateway_host")
+            gateway_host = _controller_gateway_host(
+                c.extra.get("controller_gateway_host")
+            )
             if not gateway_host:
                 return ExecutionResult(
                     False,
@@ -310,18 +352,29 @@ class OpenHandsExecutor:
                     ),
                     outcome=Outcome.POLICY_FAILURE,
                 )
-            gateway = ProviderGateway(
-                bind_host=str(gateway_host),
-                public_host=str(gateway_host),
-                upstream_base_url=c.base_url or "",
-                upstream_model=c.model,
-                accounting=request.accounting,
-                max_failovers=int(c.extra.get("provider_request_failovers", 2)),
-                max_rate_limit_wait=float(
-                    c.extra.get("provider_rate_limit_max_wait", 30)
-                ),
-                timeout=float(c.extra.get("provider_timeout", 300)),
-            ).start()
+            try:
+                gateway = ProviderGateway(
+                    bind_host=str(gateway_host),
+                    public_host=str(gateway_host),
+                    upstream_base_url=c.base_url or "",
+                    upstream_model=c.model,
+                    accounting=request.accounting,
+                    max_failovers=int(c.extra.get("provider_request_failovers", 2)),
+                    max_rate_limit_wait=float(
+                        c.extra.get("provider_rate_limit_max_wait", 30)
+                    ),
+                    timeout=float(c.extra.get("provider_timeout", 300)),
+                ).start()
+            except OSError as exc:
+                return ExecutionResult(
+                    False,
+                    error=(
+                        "controller provider gateway is unavailable at "
+                        f"{gateway_host}: {exc}"
+                    ),
+                    outcome=Outcome.RESOURCE_FAILURE,
+                    accounting_level="per_model_request",
+                )
             kwargs["api_key"] = SecretStr(gateway.token)
             kwargs["base_url"] = gateway.base_url
             kwargs["num_retries"] = 0
@@ -347,8 +400,47 @@ class OpenHandsExecutor:
             else:
                 llm = LLM(**kwargs)
             agent = get_default_agent(llm=llm, cli_mode=True)
+            # Make production context behavior explicit and versionable. The SDK
+            # default is an LLM summarizer, but custom provider models often have
+            # no discoverable input limit, leaving only the late event-count trigger.
+            from openhands.sdk.context.condenser import LLMSummarizingCondenser
+
+            if hasattr(agent, "condenser") and hasattr(llm, "model_copy"):
+                default_condenser = agent.condenser
+                condenser = LLMSummarizingCondenser(
+                    llm=llm.model_copy(update={"usage_id": "condenser"}),
+                    max_size=int(
+                        c.extra.get(
+                            "condenser_max_events",
+                            getattr(default_condenser, "max_size", 80),
+                        )
+                    ),
+                    max_tokens=(
+                        int(c.extra["condenser_max_tokens"])
+                        if c.extra.get("condenser_max_tokens")
+                        else getattr(default_condenser, "max_tokens", None)
+                    ),
+                    keep_first=int(
+                        c.extra.get(
+                            "condenser_keep_first",
+                            getattr(default_condenser, "keep_first", 4),
+                        )
+                    ),
+                )
+                agent = agent.model_copy(update={"condenser": condenser})
             conversation_secrets = None
-        agent_diagnostics: dict[str, Any] = {}
+        active_condenser = getattr(agent, "condenser", None)
+        agent_diagnostics: dict[str, Any] = {
+            "condenser": {
+                "class": type(active_condenser).__name__,
+                "enabled": active_condenser is not None
+                and type(active_condenser).__name__ != "NoOpCondenser",
+                "max_size": getattr(active_condenser, "max_size", None),
+                "max_tokens": getattr(active_condenser, "max_tokens", None),
+                "keep_first": getattr(active_condenser, "keep_first", None),
+                "llm": "same-candidate",
+            }
+        }
         try:
             if not c.server_url:
                 if not c.extra.get("allow_local_unsandboxed", False):
@@ -439,7 +531,12 @@ class OpenHandsExecutor:
                         conversation.run()
                         try:
                             events = list(conversation.state.events)
-                            agent_diagnostics = {
+                            condensation_events = [
+                                event
+                                for event in events
+                                if type(event).__name__ == "Condensation"
+                            ]
+                            agent_diagnostics.update({
                                 "conversation_id": str(conversation.id),
                                 "event_counts": dict(
                                     Counter(type(event).__name__ for event in events)
@@ -447,7 +544,12 @@ class OpenHandsExecutor:
                                 "execution_status": str(
                                     conversation.state.execution_status
                                 ),
-                            }
+                                "condensation_events": len(condensation_events),
+                                "forgotten_events": sum(
+                                    len(getattr(event, "forgotten_event_ids", set()))
+                                    for event in condensation_events
+                                ),
+                            })
                         except Exception:
                             # Diagnostics must never turn completed coding work
                             # into an executor failure.
@@ -507,6 +609,12 @@ class OpenHandsExecutor:
             else:
                 in_tok, out_tok, cost, raw = self._metrics(llm)
             outcome, provider_status, rate_headers = _provider_failure(exc)
+            if outcome == Outcome.RESOURCE_FAILURE and re.search(
+                r"request context.*sustainable request limit|ContextCapacityExceeded",
+                str(exc),
+                re.IGNORECASE,
+            ):
+                raw["context_incompatible"] = True
             if provider_status is not None:
                 raw["provider_status"] = provider_status
             if rate_headers:

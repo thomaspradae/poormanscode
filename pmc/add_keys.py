@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import argparse
 import getpass
 import os
 import re
-import argparse
 import tempfile
 from collections.abc import Callable
 from pathlib import Path

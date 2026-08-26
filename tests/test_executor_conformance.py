@@ -22,6 +22,16 @@ def test_all_registered_executors_share_result_contract():
     assert result.accounting_level == "unknown"
 
 
+def test_context_capacity_failure_is_not_model_quality_failure():
+    error = RuntimeError(
+        "HTTP 503: request context and output allowance exceed the selected "
+        "lane's sustainable request limit"
+    )
+    outcome, status, _headers = _provider_failure(error)
+    assert outcome == Outcome.RESOURCE_FAILURE
+    assert status == 503
+
+
 def test_openhands_uses_bounded_stuck_detecting_conversation(tmp_path: Path):
     calls: dict[str, object] = {}
 
@@ -78,6 +88,22 @@ def test_openhands_uses_bounded_stuck_detecting_conversation(tmp_path: Path):
     assert calls["message"] == "do it"
     assert calls["ran"] is True
     assert calls["closed"] is True
+
+
+def _assert_remote_workspace_calls(calls):
+    assert calls["workspace"] == {
+        "host": "http://ofi1.example:8010",
+        "working_dir": "/tmp/pmc-pmc-x-1",
+        "api_key": "session-only",
+    }
+    assert any(
+        "git add -A && git diff --binary --cached HEAD --" in command
+        for command in calls["commands"]
+    )
+    assert any(
+        "git commit --allow-empty -qm baseline" in command
+        for command in calls["commands"]
+    )
 
 
 def test_openhands_passes_nonnative_tool_setting_to_llm(tmp_path: Path):
@@ -367,19 +393,39 @@ def test_openhands_remote_workspace_uses_server_credential(monkeypatch, tmp_path
     result = executor.run(request)
 
     assert result.ok
-    assert calls["workspace"] == {
-        "host": "http://ofi1.example:8010",
-        "working_dir": "/tmp/pmc-pmc-x-1",
-        "api_key": "session-only",
-    }
-    assert any(
-        "git add -A && git diff --binary --cached HEAD --" in command
-        for command in calls["commands"]
+    _assert_remote_workspace_calls(calls)
+
+
+def test_openhands_gateway_bind_failure_is_resource_failure(monkeypatch, tmp_path: Path):
+    from pmc.domain import Outcome
+    from pmc.provider_gateway import ProviderGateway
+
+    def fail_start(self):
+        raise OSError(99, "Cannot assign requested address")
+
+    monkeypatch.setattr(ProviderGateway, "start", fail_start)
+    candidate = Candidate.from_mapping(
+        {
+            "name": "openhands-remote",
+            "executor": "openhands",
+            "provider": "provider",
+            "model": "provider/model",
+            "base_url": "https://provider.invalid/v1",
+            "server_url": "http://ofi1.invalid:8010",
+            "controller_gateway_host": "100.64.0.1",
+        }
     )
-    assert any(
-        "git commit --allow-empty -qm baseline" in command
-        for command in calls["commands"]
+    request = ExecutionRequest(
+        Job("PMC-X", tmp_path, "task"),
+        candidate,
+        tmp_path,
+        "do it",
+        1,
+        accounting=object(),
     )
+    result = OpenHandsExecutor().run(request)
+    assert result.ok is False
+    assert result.outcome == Outcome.RESOURCE_FAILURE
 
 
 def test_jules_http_error_excludes_request_headers_and_key():

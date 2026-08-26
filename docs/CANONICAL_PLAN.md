@@ -45,6 +45,11 @@ humans own acceptance.
 - [x] SIGKILL/restart recovery across dispatch, model request, execution, verification,
   review, READY, and commit; acceptance state/feedback/events are atomic and idempotent
 - [x] Versioned ContextBundle with persisted manifest/hash
+- [x] Explicit OpenHands summarizing condenser configuration plus content-free
+  per-request token/context X-rays, including tool schemas, growth, retries,
+  condensation, lane quota state, and actual-vs-estimated usage
+- [x] Separate model context capacity, provider sustainable request throughput,
+  and cumulative job budgets; reject known-incompatible requests before inference
 - [x] Independent deterministic verification after successful executor output
 - [x] Human decision attached to exact READY attempt
 - [x] Complete reconstructable audit bundle

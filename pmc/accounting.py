@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import json
 import uuid
 from dataclasses import dataclass
 from typing import Any
 
+from .context_xray import analyze_request_context
 from .db import Database
 
 
@@ -15,9 +15,15 @@ class RequestTicket:
     credential_reservation_id: int | None = None
     credential_id: str | None = None
     api_key_env: str | None = None
+    request_kind: str = "agent"
+    context_metrics: dict[str, Any] | None = None
 
 
 class BudgetExceeded(RuntimeError):
+    pass
+
+
+class ContextCapacityExceeded(RuntimeError):
     pass
 
 
@@ -38,20 +44,53 @@ class ModelRequestAccounting:
             candidate,
         )
         self.budget = budget
+        self._previous_estimated_input: int | None = None
+        self._previous_request_hash: str | None = None
+        self._condensation_count = 0
 
     def reserve(
-        self, turn: int, messages: list[dict[str, Any]], max_output: int
+        self,
+        turn: int,
+        messages: list[dict[str, Any]],
+        max_output: int,
+        tools: list[dict[str, Any]] | None = None,
     ) -> RequestTicket:
         # Agent runtimes use structured content blocks, tool calls and tool
         # results.  Estimate the complete serialized conversation rather than
         # only plain-text ``content`` so reservations remain conservative.
-        try:
-            serialized_chars = len(
-                json.dumps(messages, separators=(",", ":"), default=str)
+        context_metrics = analyze_request_context(
+            messages,
+            tools,
+            model_context_window=(
+                int(self.candidate.extra["model_context_window"])
+                if self.candidate.extra.get("model_context_window")
+                else None
+            ),
+            previous_estimated_input=self._previous_estimated_input,
+            previous_request_hash=self._previous_request_hash,
+            condensation_count=self._condensation_count,
+        )
+        estimated_input = int(context_metrics["estimated_input_tokens"])
+        request_soft_limit = self.candidate.extra.get("request_token_soft_limit")
+        if request_soft_limit and estimated_input + max_output > int(request_soft_limit):
+            self.db.event(
+                "MODEL_REQUEST_INCOMPATIBLE_CONTEXT",
+                job_id=self.job_id,
+                attempt_id=self.attempt_id,
+                payload={
+                    "candidate": self.candidate.name,
+                    "turn": turn,
+                    "estimated_input_tokens": estimated_input,
+                    "estimated_output_tokens": max_output,
+                    "request_token_soft_limit": int(request_soft_limit),
+                    "request_hash": context_metrics["request_hash"],
+                },
             )
-        except (TypeError, ValueError):
-            serialized_chars = sum(len(str(message)) for message in messages)
-        estimated_input = max(1, serialized_chars // 4)
+            raise ContextCapacityExceeded(
+                "request context and output allowance exceed the selected "
+                f"lane's sustainable request limit ({estimated_input}+{max_output} > "
+                f"{int(request_soft_limit)})"
+            )
         estimated_cost = self.candidate.monetary_cost_hint or None
         totals = self.db.job_model_request_totals(
             self.job_id, since_latest_feedback=True
@@ -100,6 +139,7 @@ class ModelRequestAccounting:
             estimated_cost=estimated_cost,
             credential_id=credential["credential_id"] if credential else None,
             quota_scope_id=credential["quota_scope_id"] if credential else None,
+            context_metrics=context_metrics,
         )
         ticket = RequestTicket(
             *ids,
@@ -110,7 +150,11 @@ class ModelRequestAccounting:
             api_key_env=credential["api_key_env"]
             if credential
             else self.candidate.api_key_env,
+            request_kind=str(context_metrics["request_kind"]),
+            context_metrics=context_metrics,
         )
+        self._previous_estimated_input = estimated_input
+        self._previous_request_hash = str(context_metrics["request_hash"])
         self.db.start_model_request(
             ticket.model_request_id, self.job_id, self.attempt_id
         )
@@ -132,6 +176,8 @@ class ModelRequestAccounting:
                 actual_tokens=(reply.input_tokens or 0) + (reply.output_tokens or 0),
                 headers=dict(reply.rate_headers or {}),
             )
+        if ticket.request_kind == "condenser":
+            self._condensation_count += 1
 
     def fail(self, ticket: RequestTicket, error: Exception) -> None:
         self.db.finish_model_request(

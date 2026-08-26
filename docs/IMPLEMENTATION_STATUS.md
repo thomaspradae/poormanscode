@@ -20,6 +20,16 @@ audit reports, human acceptance, leases, and Bash/OpenHands/Jules adapters.
   provider gateway. Provider credentials remain controller-side; every physical
   model request reserves/reconciles one ProviderPool lane and records tokens,
   request ID, rate headers, cost when known, failures, and bounded cooldown waits.
+- [x] OpenHands context management is explicit rather than dependent on model-map
+  defaults. SDK 1.43's `LLMSummarizingCondenser` is retained, with candidate-level
+  event/token triggers and the same controller-side credential boundary.
+- [x] Every OpenHands request now has a content-free token X-ray: message and tool
+  counts, component estimates, request hash/growth, unchanged retries, condenser
+  count, actual-vs-estimated usage, context occupancy, quota lane, headers, and
+  wall time. `pmc context-xray JOB --composition` renders it.
+- [x] Tool schemas are included in reservations. Requests that exceed an explicitly
+  configured sustainable lane size are rejected before provider dispatch, after
+  OpenHands has had an opportunity to condense through its configured token trigger.
 - [x] `pmc models conformance NAME` runs a cumulative L0 generation → L1 inspect
   → L2 edit → L3 failing-test repair → L4 Controller/verifier/audit gate.
   Nemotron Super + OpenHands passed all five levels and is the first enabled

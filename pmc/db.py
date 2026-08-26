@@ -162,6 +162,8 @@ CREATE TABLE IF NOT EXISTS model_requests (
     actual_input_tokens INTEGER, actual_output_tokens INTEGER,
     estimated_cost_usd REAL, actual_cost_usd REAL, provider_request_id TEXT,
     rate_headers_json TEXT NOT NULL DEFAULT '{}', error TEXT,
+    request_kind TEXT NOT NULL DEFAULT 'agent', request_hash TEXT,
+    context_metrics_json TEXT NOT NULL DEFAULT '{}',
     started_at TEXT, finished_at TEXT, created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_model_requests_attempt ON model_requests(attempt_id, turn_number);
@@ -317,7 +319,12 @@ class Database:
                 "credential_id": "TEXT",
                 "quota_scope_id": "TEXT",
             },
-            "model_requests": {"credential_id": "TEXT"},
+            "model_requests": {
+                "credential_id": "TEXT",
+                "request_kind": "TEXT NOT NULL DEFAULT 'agent'",
+                "request_hash": "TEXT",
+                "context_metrics_json": "TEXT NOT NULL DEFAULT '{}'",
+            },
             "human_feedback": {
                 "review_started_at": "TEXT",
                 "review_finished_at": "TEXT",
@@ -785,6 +792,7 @@ class Database:
         estimated_cost: float | None,
         credential_id: str | None = None,
         quota_scope_id: str | None = None,
+        context_metrics: dict[str, Any] | None = None,
     ) -> tuple[int, int]:
         reservation_id = self.reserve_quota(
             candidate.name,
@@ -797,8 +805,8 @@ class Database:
             cur = conn.execute(
                 """INSERT INTO model_requests(request_key,job_id,attempt_id,candidate,provider,model,
                 turn_number,state,estimated_input_tokens,estimated_output_tokens,estimated_cost_usd,
-                created_at,credential_id)
-                VALUES(?,?,?,?,?,?,?,'RESERVED',?,?,?,?,?)""",
+                created_at,credential_id,request_kind,request_hash,context_metrics_json)
+                VALUES(?,?,?,?,?,?,?,'RESERVED',?,?,?,?,?,?,?,?)""",
                 (
                     request_key,
                     job_id,
@@ -812,6 +820,9 @@ class Database:
                     estimated_cost,
                     utcnow(),
                     credential_id,
+                    (context_metrics or {}).get("request_kind", "agent"),
+                    (context_metrics or {}).get("request_hash"),
+                    json.dumps(context_metrics or {}, default=str),
                 ),
             )
             model_request_id = int(cur.lastrowid)
@@ -828,9 +839,27 @@ class Database:
                 "estimated_output_tokens": estimated_output,
                 "credential_id": credential_id,
                 "quota_scope_id": quota_scope_id,
+                "context": context_metrics or {},
             },
         )
         return model_request_id, reservation_id
+
+    def model_request_xray(self, job_id: str) -> list[dict[str, Any]]:
+        """Return safe per-request diagnostics; prompt content is never stored."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM model_requests WHERE job_id=? ORDER BY id",
+                (job_id,),
+            ).fetchall()
+        output = []
+        for row in rows:
+            item = dict(row)
+            item["context_metrics"] = json.loads(
+                item.pop("context_metrics_json") or "{}"
+            )
+            item["rate_headers"] = json.loads(item.pop("rate_headers_json") or "{}")
+            output.append(item)
+        return output
 
     def start_model_request(
         self, model_request_id: int, job_id: str, attempt_id: int
@@ -874,9 +903,22 @@ class Database:
             else ("RATE_LIMITED" if status == 429 else "FAILED")
         )
         with self.connect() as conn:
+            row = conn.execute(
+                "SELECT context_metrics_json FROM model_requests WHERE id=?",
+                (model_request_id,),
+            ).fetchone()
+            context_metrics = json.loads(row[0] or "{}") if row else {}
+            if input_tokens is not None:
+                context_metrics["actual_input_tokens"] = input_tokens
+                estimate = context_metrics.get("estimated_input_tokens")
+                if estimate is not None:
+                    context_metrics["estimation_error_tokens"] = input_tokens - int(
+                        estimate
+                    )
             conn.execute(
                 """UPDATE model_requests SET state=?,actual_input_tokens=?,actual_output_tokens=?,
-                actual_cost_usd=?,provider_request_id=?,rate_headers_json=?,error=?,finished_at=? WHERE id=?""",
+                actual_cost_usd=?,provider_request_id=?,rate_headers_json=?,error=?,
+                context_metrics_json=?,finished_at=? WHERE id=?""",
                 (
                     state,
                     input_tokens,
@@ -885,6 +927,7 @@ class Database:
                     request_id,
                     json.dumps(headers),
                     str(error) if error else None,
+                    json.dumps(context_metrics, default=str),
                     utcnow(),
                     model_request_id,
                 ),

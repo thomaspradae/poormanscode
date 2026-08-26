@@ -835,6 +835,11 @@ class Controller:
                     return JobState.FAILED
                 if outcome == Outcome.RESOURCE_FAILURE:
                     self.worktrees.reset_attempt(job.worktree, job.baseline_commit)
+                    if result.raw_metrics.get("context_incompatible"):
+                        # Condensation already ran before the physical request.
+                        # Preserve the job, but choose a candidate/provider whose
+                        # sustainable per-request capacity fits this working set.
+                        retry_exclude.add(candidate.name)
                 if job.constraints.get("_candidate_order"):
                     retry_same = None
                     retry_exclude.add(candidate.name)

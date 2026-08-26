@@ -338,6 +338,33 @@ def coding_conformance(controller: Any, candidate: Candidate) -> dict[str, Any]:
                     "SELECT event_type,COUNT(*) FROM events GROUP BY event_type"
                 ).fetchall()
             }
+        request_xray = []
+        for row in ctl.db.model_request_xray(job_id):
+            metrics = row["context_metrics"]
+            request_xray.append(
+                {
+                    "turn": row["turn_number"],
+                    "kind": row.get("request_kind"),
+                    "state": row["state"],
+                    "estimated_input_tokens": row["estimated_input_tokens"],
+                    "actual_input_tokens": row["actual_input_tokens"],
+                    "actual_output_tokens": row["actual_output_tokens"],
+                    "credential_id": row.get("credential_id"),
+                    "context_occupancy": metrics.get("context_occupancy"),
+                    "condensation_count": metrics.get(
+                        "condensation_count_before", 0
+                    ),
+                    "message_count": metrics.get("message_count"),
+                    "tool_count": metrics.get("tool_count"),
+                    "growth_tokens": metrics.get("growth_tokens"),
+                    "unchanged_retry": metrics.get("unchanged_from_previous"),
+                    "duplicate_messages": metrics.get(
+                        "duplicate_messages_within_request"
+                    ),
+                    "composition": metrics.get("composition", {}),
+                    "rate_headers": row.get("rate_headers", {}),
+                }
+            )
         inspection_ok = bool(
             worktree
             and (worktree / "inspection.txt").exists()
@@ -375,6 +402,7 @@ def coding_conformance(controller: Any, candidate: Candidate) -> dict[str, Any]:
                 "model_requests": totals,
                 "credential_lanes": lanes,
                 "event_counts": events,
+                "request_xray": request_xray,
                 "attempt": dict(attempt) if attempt else None,
                 "wall_seconds": round(time.monotonic() - started, 3),
             }
