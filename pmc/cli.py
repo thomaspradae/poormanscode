@@ -786,6 +786,8 @@ def cmd_doctor(args) -> int:
             else:
                 print(f"candidate {c.name}: network_policy={policy} enforceable")
         if c.executor == "openhands" and c.extra.get("agent_kind") != "acp":
+            from .executors.openhands import _controller_gateway_host
+
             max_events = c.extra.get("condenser_max_events", 80)
             max_tokens = c.extra.get("condenser_max_tokens")
             request_limit = c.extra.get("request_token_soft_limit")
@@ -794,6 +796,15 @@ def cmd_doctor(args) -> int:
                 f"max_events={max_events} max_tokens={max_tokens or 'model-default'} "
                 f"request_soft_limit={request_limit or 'none'}"
             )
+            gateway_setting = c.extra.get("controller_gateway_host")
+            if c.server_url and gateway_setting:
+                gateway_host = _controller_gateway_host(gateway_setting)
+                print(
+                    f"candidate {c.name}: controller gateway="
+                    f"{gateway_host or 'UNAVAILABLE'}"
+                )
+                if c.enabled and gateway_host is None:
+                    ok = False
     if ctl.cfg.research_enabled:
         present = bool(os.getenv(ctl.cfg.research_api_key_env))
         print(
