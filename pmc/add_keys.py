@@ -3,6 +3,7 @@ from __future__ import annotations
 import getpass
 import os
 import re
+import argparse
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
@@ -155,6 +156,44 @@ def groq_main() -> int:
         add_provider_keys(
             requests=(("GROQ_API_KEY", "Additional Groq key", 1, 2),)
         )
+    except (EOFError, KeyboardInterrupt):
+        print("\nCancelled. No credentials were changed.")
+        return 130
+    except ValueError as exc:
+        print(f"Credential collection failed: {exc}")
+        return 2
+    return 0
+
+
+def batch_main() -> int:
+    """Collect an explicitly requested number of additional provider keys."""
+    parser = argparse.ArgumentParser(description="Add PMC provider credentials safely")
+    parser.add_argument("--mistral", type=int, default=0)
+    parser.add_argument("--groq", type=int, default=0)
+    parser.add_argument("--jules", type=int, default=0)
+    parser.add_argument("--nvidia", type=int, default=0)
+    args = parser.parse_args()
+    counts = {
+        "mistral": args.mistral,
+        "groq": args.groq,
+        "jules": args.jules,
+        "nvidia": args.nvidia,
+    }
+    if any(value < 0 for value in counts.values()) or not any(counts.values()):
+        parser.error("provide at least one non-negative provider count")
+    requests = tuple(
+        (base, label, count, first)
+        for key, base, label, first in (
+            ("mistral", "MISTRAL_API_KEY", "Mistral key", 1),
+            ("groq", "GROQ_API_KEY", "Additional Groq key", 2),
+            ("jules", "JULES_API_KEY", "Additional Jules key", 2),
+            ("nvidia", "NVIDIA_API_KEY", "Additional NVIDIA key", 1),
+        )
+        for count in (counts[key],)
+        if count
+    )
+    try:
+        add_provider_keys(requests=requests)
     except (EOFError, KeyboardInterrupt):
         print("\nCancelled. No credentials were changed.")
         return 130
