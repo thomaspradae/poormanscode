@@ -72,7 +72,9 @@ class ModelRequestAccounting:
         )
         estimated_input = int(context_metrics["estimated_input_tokens"])
         request_soft_limit = self.candidate.extra.get("request_token_soft_limit")
-        if request_soft_limit and estimated_input + max_output > int(request_soft_limit):
+        if request_soft_limit and estimated_input + max_output > int(
+            request_soft_limit
+        ):
             self.db.event(
                 "MODEL_REQUEST_INCOMPATIBLE_CONTEXT",
                 job_id=self.job_id,
@@ -118,12 +120,28 @@ class ModelRequestAccounting:
         if self.candidate.provider:
             ok, reason = self.db.provider_availability(self.candidate.provider)
             if ok and reason != "legacy candidate credential":
-                credential = self.db.reserve_provider_credential(
-                    self.candidate.provider,
-                    self.job_id,
-                    self.attempt_id,
-                    estimated_input + max_output,
-                )
+                try:
+                    credential = self.db.reserve_provider_credential(
+                        self.candidate.provider,
+                        self.job_id,
+                        self.attempt_id,
+                        estimated_input + max_output,
+                    )
+                except RuntimeError:
+                    self.db.event(
+                        "MODEL_REQUEST_DEFERRED_QUOTA",
+                        job_id=self.job_id,
+                        attempt_id=self.attempt_id,
+                        payload={
+                            "candidate": self.candidate.name,
+                            "turn": turn,
+                            "estimated_tokens": estimated_input + max_output,
+                            "next_available_seconds": self.db.provider_next_available_seconds(
+                                self.candidate.provider
+                            ),
+                        },
+                    )
+                    raise
             elif not ok and reason != "legacy candidate credential":
                 raise RuntimeError(
                     f"provider {self.candidate.provider} unavailable: {reason}"

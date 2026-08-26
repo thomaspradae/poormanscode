@@ -659,6 +659,85 @@ def cmd_context_xray(args) -> int:
     return 0
 
 
+def cmd_context_profile(args) -> int:
+    """Show empirical request/condensation evidence without auto-tuning policy."""
+    ctl = _controller(args)
+    selected = args.candidates or [None]
+    profiles = []
+    configured = {candidate.name: candidate for candidate in ctl.cfg.candidates}
+    for name in selected:
+        profiles.extend(
+            ctl.db.context_profiles(
+                name, configured[name].version if name in configured else None
+            )
+        )
+    for profile in profiles:
+        candidate = configured.get(profile["candidate"])
+        profile["configured_initial_policy"] = {
+            "condenser_max_tokens": (
+                candidate.extra.get("condenser_max_tokens") if candidate else None
+            ),
+            "request_token_soft_limit": (
+                candidate.extra.get("request_token_soft_limit") if candidate else None
+            ),
+            "candidate_version": candidate.version if candidate else None,
+        }
+    if args.json:
+        print(json.dumps(profiles, indent=2, default=str))
+        return 0
+    if not profiles:
+        print("No request evidence recorded")
+        return 1
+    for item in profiles:
+        policy = item["configured_initial_policy"]
+        print(
+            f"{item['candidate']}: requests={item['requests']} "
+            f"429={item['rate_limit_probability']} p50={item['successful_input_tokens_p50']} "
+            f"p90={item['successful_input_tokens_p90']} attempts={item['attempts']} "
+            f"verified={item['successful_attempts']} policy={item['policy_status']}"
+        )
+        print(
+            "  initial thresholds: "
+            f"condense={policy['condenser_max_tokens']} "
+            f"request_ceiling={policy['request_token_soft_limit']} "
+            f"version={policy['candidate_version']}"
+        )
+        print(
+            "  condensation outcomes: "
+            f"attempts={item['condensed_attempts']} "
+            f"progress={item['condensed_progress_attempts']} "
+            f"verified={item['condensed_verified_attempts']}"
+        )
+    return 0
+
+
+def cmd_provider_capacity(args) -> int:
+    """Report credential lanes and quota-scope confidence without secrets."""
+    ctl = _controller(args)
+    providers = args.providers or None
+    reports = []
+    if providers:
+        for provider in providers:
+            reports.extend(ctl.db.quota_scope_evidence(provider))
+    else:
+        reports = ctl.db.quota_scope_evidence()
+    if args.json:
+        print(json.dumps(reports, indent=2, default=str))
+        return 0
+    for item in reports:
+        print(
+            f"{item['provider']}: credentials={item['credentials_configured']} "
+            f"configured_scopes={item['configured_quota_scopes']} "
+            f"unknown={item['unknown_scope_credentials']} "
+            f"counter_lanes={item['counter_evidence_lanes']} "
+            f"confidence={item['observed_independence_confidence']}"
+        )
+        if item["shared_configured_scopes"]:
+            print(f"  shared configured scopes: {item['shared_configured_scopes']}")
+        print("  observed counters remain evidence; no scope IDs were inferred")
+    return 0
+
+
 def cmd_capabilities(args) -> int:
     ctl = _controller(args)
     snapshot = ctl.capabilities.local
@@ -1090,6 +1169,16 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--composition", action="store_true")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_context_xray)
+
+    s = sub.add_parser("context-profile")
+    s.add_argument("candidates", nargs="*")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_context_profile)
+
+    s = sub.add_parser("provider-capacity")
+    s.add_argument("providers", nargs="*")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_provider_capacity)
 
     s = sub.add_parser("capabilities")
     s.set_defaults(func=cmd_capabilities)

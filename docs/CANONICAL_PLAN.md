@@ -48,6 +48,16 @@ humans own acceptance.
 - [x] Explicit OpenHands summarizing condenser configuration plus content-free
   per-request token/context X-rays, including tool schemas, growth, retries,
   condensation, lane quota state, and actual-vs-estimated usage
+- [x] Versioned, model-independent WorkState recovery packet and partial remote-diff
+  preservation across executor failure/candidate handoff; raw model reasoning is not
+  transferred between candidates
+- [x] Evidence profiles for request-size percentiles, size-bucket 429 probability,
+  post-condensation progress/repetition, and verifier outcome. Initial thresholds
+  remain hypotheses and automatic tuning stays disabled until evidence is mature
+- [x] Conservative quota-scope report separating configured scopes from strongly
+  observed counter-lane independence; observation never fabricates confirmed scope IDs
+- [x] Pre-dispatch observed-TPM fit, reset-aware waiting, and quota deferral events
+  prevent known-impossible physical requests
 - [x] Separate model context capacity, provider sustainable request throughput,
   and cumulative job budgets; reject known-incompatible requests before inference
 - [x] Independent deterministic verification after successful executor output
@@ -92,6 +102,9 @@ humans own acceptance.
 - [x] Information-value-aware allocation driven by contextual uncertainty,
   semantic risk, and verification strength
 - [x] Human-attention economics and stable-outcome metrics
+- [~] Context/request policy evidence is now queryable with `pmc context-profile`;
+  automated threshold selection remains data-gated (minimum 50 requests/five attempts
+  per immutable candidate version plus verified post-condensation outcomes)
 - [ ] Manual-agent baselines and role-specific benchmarks
 
 ## P4 — complete software factory

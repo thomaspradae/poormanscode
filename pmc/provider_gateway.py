@@ -77,9 +77,16 @@ class ProviderGateway:
                 # Request bodies and authorization headers must never enter logs.
                 return
 
-            def _json(self, status: int, payload: dict[str, Any]) -> None:
+            def _json(
+                self,
+                status: int,
+                payload: dict[str, Any],
+                headers: dict[str, str] | None = None,
+            ) -> None:
                 body = json.dumps(payload).encode()
                 self.send_response(status)
+                for key, value in (headers or {}).items():
+                    self.send_header(key, value)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
@@ -139,22 +146,35 @@ class ProviderGateway:
                                 turn, messages, max_output
                             )
                     except Exception as exc:  # noqa: BLE001 - accounting contract boundary
+                        delay = gateway.accounting.db.provider_next_available_seconds(
+                            gateway.accounting.candidate.provider
+                        )
+                        if (
+                            not waited_for_reset
+                            and delay is not None
+                            and delay <= gateway.max_rate_limit_wait
+                        ):
+                            # A successful previous request may have reported
+                            # insufficient remaining TPM before any 429 occurs.
+                            # Wait for that observed reset instead of burning a
+                            # doomed physical provider request.
+                            time.sleep(delay + 0.1)
+                            attempts = 0
+                            waited_for_reset = True
+                            continue
                         if last_status == 429:
-                            delay = (
-                                gateway.accounting.db.provider_next_available_seconds(
-                                    gateway.accounting.candidate.provider
-                                )
-                            )
-                            if (
-                                not waited_for_reset
-                                and delay is not None
-                                and delay <= gateway.max_rate_limit_wait
-                            ):
-                                time.sleep(delay + 0.1)
-                                attempts = 0
-                                waited_for_reset = True
-                                continue
                             break
+                        if delay is not None:
+                            self._json(
+                                429,
+                                {
+                                    "error": {
+                                        "message": "provider quota lanes cannot currently fit this request"
+                                    }
+                                },
+                                {"retry-after": str(max(1, int(delay + 0.999)))},
+                            )
+                            return
                         self._json(503, {"error": {"message": str(exc)}})
                         return
                     import os

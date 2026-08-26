@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -21,6 +22,22 @@ def _header_int(payload: dict[str, Any], name: str) -> int | None:
         return int(payload[name]) if name in payload else None
     except (TypeError, ValueError):
         return None
+
+
+def _duration_seconds(value: Any) -> float | None:
+    """Parse provider reset durations such as ``1m26.4s`` without guessing dates."""
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    try:
+        return max(0.0, float(text))
+    except ValueError:
+        pass
+    matches = re.findall(r"([0-9]+(?:\.[0-9]+)?)(ms|s|m|h)", text)
+    if not matches or "".join(number + unit for number, unit in matches) != text:
+        return None
+    factors = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0}
+    return sum(float(number) * factors[unit] for number, unit in matches)
 
 
 SCHEMA = """
@@ -253,6 +270,7 @@ CREATE TABLE IF NOT EXISTS provider_credentials (
     quota_scope_id TEXT, quota_scope_confidence TEXT NOT NULL DEFAULT 'UNKNOWN',
     concurrency_limit INTEGER NOT NULL DEFAULT 1, cooldown_until REAL,
     requests_remaining INTEGER, tokens_remaining INTEGER, reset_at TEXT,
+    tokens_reset_at REAL,
     consecutive_failures INTEGER NOT NULL DEFAULT 0, last_success_at TEXT,
     last_failure_at TEXT, updated_at TEXT NOT NULL
 );
@@ -332,6 +350,9 @@ class Database:
                 "human_repair_seconds": "REAL",
                 "human_changed_lines": "INTEGER",
                 "accepted_without_human_edit": "INTEGER",
+            },
+            "provider_credentials": {
+                "tokens_reset_at": "REAL",
             },
         }
         for table, columns in additions.items():
@@ -502,6 +523,14 @@ class Database:
                         item["quota_scope_confidence"] == "UNKNOWN"
                         or item["active_scope"] < item["concurrency_limit"]
                     )
+                    and (
+                        item["tokens_remaining"] is None
+                        or item["tokens_remaining"] >= estimated_tokens
+                        or (
+                            item["tokens_reset_at"] is not None
+                            and item["tokens_reset_at"] <= now_epoch
+                        )
+                    )
                     and os.getenv(item["api_key_env"])
                 ),
                 None,
@@ -541,6 +570,19 @@ class Database:
         # later health canary without pretending the key is permanently dead.
         if status_code == 429 and cooldown is None:
             cooldown = time.time() + 60
+        reset_seconds = _duration_seconds(
+            headers.get("x-ratelimit-reset-tokens")
+            or headers.get("x-ratelimit-reset")
+            or retry_after
+        )
+        if reset_seconds is None and "x-ratelimit-remaining-tokens-minute" in headers:
+            # The provider exposes an explicitly minute-scoped counter but no
+            # reset timestamp. Treat 60s as conservative freshness, not as a
+            # claim about fixed-vs-rolling window semantics.
+            reset_seconds = 60.0
+        tokens_reset_at = (
+            time.time() + reset_seconds if reset_seconds is not None else None
+        )
         if status_code in {401, 403}:
             health = "AUTH_FAILED"
         elif status_code == 429:
@@ -549,6 +591,16 @@ class Database:
             health = "DEGRADED"
         else:
             health = "AVAILABLE"
+        requests_remaining = _header_int(headers, "x-ratelimit-remaining-requests")
+        if requests_remaining is None:
+            requests_remaining = _header_int(
+                headers, "x-ratelimit-remaining-req-minute"
+            )
+        tokens_remaining = _header_int(headers, "x-ratelimit-remaining-tokens")
+        if tokens_remaining is None:
+            tokens_remaining = _header_int(
+                headers, "x-ratelimit-remaining-tokens-minute"
+            )
         with self.connect() as conn:
             row = conn.execute(
                 """SELECT cr.credential_id,pc.quota_scope_id,pc.quota_scope_confidence
@@ -564,7 +616,7 @@ class Database:
             )
             conn.execute(
                 """UPDATE provider_credentials SET health=?,cooldown_until=?,
-                requests_remaining=?,tokens_remaining=?,reset_at=?,
+                requests_remaining=?,tokens_remaining=?,reset_at=?,tokens_reset_at=?,
                 consecutive_failures=CASE WHEN ?='AVAILABLE' THEN 0 ELSE consecutive_failures+1 END,
                 last_success_at=CASE WHEN ?='AVAILABLE' THEN ? ELSE last_success_at END,
                 last_failure_at=CASE WHEN ?!='AVAILABLE' THEN ? ELSE last_failure_at END,
@@ -572,9 +624,10 @@ class Database:
                 (
                     health,
                     cooldown,
-                    _header_int(headers, "x-ratelimit-remaining-requests"),
-                    _header_int(headers, "x-ratelimit-remaining-tokens"),
+                    requests_remaining,
+                    tokens_remaining,
                     headers.get("x-ratelimit-reset") or retry_after,
+                    tokens_reset_at,
                     health,
                     health,
                     utcnow(),
@@ -680,15 +733,369 @@ class Database:
             "confidence": sorted({r["quota_scope_confidence"] for r in rows}),
         }
 
+    def quota_scope_evidence(self, provider: str | None = None) -> list[dict[str, Any]]:
+        """Report configured scopes separately from observed counter evidence.
+
+        Observation never rewrites a configured quota scope. Similar counters
+        are evidence, not proof of shared ownership or independent accounts.
+        """
+        with self.connect() as conn:
+            credentials = conn.execute(
+                """SELECT credential_id,provider,health,quota_scope_id,
+                quota_scope_confidence FROM provider_credentials
+                WHERE enabled=1 AND (? IS NULL OR provider=?)
+                ORDER BY provider,credential_id""",
+                (provider, provider),
+            ).fetchall()
+            requests = conn.execute(
+                """SELECT provider,credential_id,state,rate_headers_json,finished_at
+                FROM model_requests WHERE credential_id IS NOT NULL
+                AND (? IS NULL OR provider=?) ORDER BY id""",
+                (provider, provider),
+            ).fetchall()
+            conformance = conn.execute(
+                "SELECT candidate,details_json FROM model_conformance"
+            ).fetchall()
+        by_provider: dict[str, list[Any]] = {}
+        for row in credentials:
+            by_provider.setdefault(str(row["provider"]), []).append(row)
+        observations: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for row in requests:
+            headers = json.loads(row["rate_headers_json"] or "{}")
+            limit = _header_int(headers, "x-ratelimit-limit-tokens")
+            if limit is None:
+                limit = _header_int(headers, "x-ratelimit-limit-tokens-minute")
+            remaining = _header_int(headers, "x-ratelimit-remaining-tokens")
+            if remaining is None:
+                remaining = _header_int(headers, "x-ratelimit-remaining-tokens-minute")
+            query_cost = _header_int(headers, "x-ratelimit-tokens-query-cost")
+            if limit is None and remaining is None:
+                continue
+            observations.setdefault(
+                (str(row["provider"]), str(row["credential_id"])), []
+            ).append(
+                {
+                    "state": row["state"],
+                    "limit": limit,
+                    "remaining": remaining,
+                    "query_cost": query_cost,
+                    "finished_at": row["finished_at"],
+                }
+            )
+        for row in conformance:
+            details = json.loads(row["details_json"] or "{}")
+            provider_name = details.get("provider")
+            if not provider_name or (provider and provider_name != provider):
+                continue
+            for request in details.get("request_xray") or []:
+                credential_id = request.get("credential_id")
+                headers = request.get("rate_headers") or {}
+                if not credential_id:
+                    continue
+                limit = _header_int(headers, "x-ratelimit-limit-tokens")
+                if limit is None:
+                    limit = _header_int(headers, "x-ratelimit-limit-tokens-minute")
+                remaining = _header_int(headers, "x-ratelimit-remaining-tokens")
+                if remaining is None:
+                    remaining = _header_int(
+                        headers, "x-ratelimit-remaining-tokens-minute"
+                    )
+                if limit is None and remaining is None:
+                    continue
+                observations.setdefault(
+                    (str(provider_name), str(credential_id)), []
+                ).append(
+                    {
+                        "state": request.get("state"),
+                        "limit": limit,
+                        "remaining": remaining,
+                        "query_cost": _header_int(
+                            headers, "x-ratelimit-tokens-query-cost"
+                        ),
+                        "finished_at": None,
+                    }
+                )
+        reports: list[dict[str, Any]] = []
+        for provider_name, rows in sorted(by_provider.items()):
+            explicit: dict[str, list[str]] = {}
+            unknown: list[str] = []
+            counter_lanes: list[str] = []
+            fresh_counter_lanes: list[str] = []
+            lane_details = []
+            for row in rows:
+                credential_id = str(row["credential_id"])
+                scope = row["quota_scope_id"]
+                if scope:
+                    explicit.setdefault(str(scope), []).append(credential_id)
+                else:
+                    unknown.append(credential_id)
+                samples = observations.get((provider_name, credential_id), [])
+                if samples:
+                    counter_lanes.append(credential_id)
+                    first = samples[0]
+                    if (
+                        first["limit"]
+                        and first["remaining"] is not None
+                        and first["remaining"] >= 0.5 * first["limit"]
+                    ):
+                        fresh_counter_lanes.append(credential_id)
+                lane_details.append(
+                    {
+                        "credential_id": credential_id,
+                        "configured_scope": scope,
+                        "configured_confidence": row["quota_scope_confidence"],
+                        "health": row["health"],
+                        "counter_samples": len(samples),
+                    }
+                )
+            observed_confidence = (
+                "STRONGLY_OBSERVED"
+                if len(fresh_counter_lanes) >= 2
+                else ("OBSERVED" if counter_lanes else "UNKNOWN")
+            )
+            reports.append(
+                {
+                    "provider": provider_name,
+                    "credentials_configured": len(rows),
+                    "configured_quota_scopes": len(explicit),
+                    "unknown_scope_credentials": len(unknown),
+                    "shared_configured_scopes": {
+                        scope: ids for scope, ids in explicit.items() if len(ids) > 1
+                    },
+                    "counter_evidence_lanes": len(counter_lanes),
+                    "fresh_counter_evidence_lanes": len(fresh_counter_lanes),
+                    "observed_independence_confidence": observed_confidence,
+                    "important": (
+                        "Observed counter lanes are not promoted to confirmed quota scopes."
+                    ),
+                    "lanes": lane_details,
+                }
+            )
+        return reports
+
+    def context_profiles(
+        self, candidate: str | None = None, version: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Aggregate request size, rate limits, latency, and condensation outcomes."""
+        from datetime import datetime
+        from statistics import median
+
+        def percentile(values: list[int], fraction: float) -> int | None:
+            if not values:
+                return None
+            ordered = sorted(values)
+            index = round((len(ordered) - 1) * fraction)
+            return int(ordered[index])
+
+        with self.connect() as conn:
+            requests = conn.execute(
+                """SELECT mr.*,a.version_snapshot_json FROM model_requests mr
+                JOIN attempts a ON a.id=mr.attempt_id
+                WHERE (? IS NULL OR mr.candidate=?) ORDER BY mr.id""",
+                (candidate, candidate),
+            ).fetchall()
+            attempts = conn.execute(
+                """SELECT a.*,MAX(COALESCE(v.ok,0)) verification_ok
+                FROM attempts a LEFT JOIN verifications v ON v.attempt_id=a.id
+                WHERE (? IS NULL OR a.candidate=?) GROUP BY a.id""",
+                (candidate, candidate),
+            ).fetchall()
+            conformance = conn.execute(
+                """SELECT candidate,version,details_json FROM model_conformance
+                WHERE (? IS NULL OR candidate=?) AND (? IS NULL OR version=?)""",
+                (candidate, candidate, version, version),
+            ).fetchall()
+        request_groups: dict[str, list[Any]] = {}
+        for row in requests:
+            snapshot = json.loads(row["version_snapshot_json"] or "{}")
+            if version and snapshot.get("candidate_version") != version:
+                continue
+            request_groups.setdefault(str(row["candidate"]), []).append(row)
+        attempt_groups: dict[str, list[Any]] = {}
+        for row in attempts:
+            snapshot = json.loads(row["version_snapshot_json"] or "{}")
+            if version and snapshot.get("candidate_version") != version:
+                continue
+            attempt_groups.setdefault(str(row["candidate"]), []).append(row)
+        synthetic_id = -1
+        for row in conformance:
+            details = json.loads(row["details_json"] or "{}")
+            candidate_name = str(row["candidate"])
+            job_id = str(details.get("job_id") or "")
+            # A disposable conformance DB cannot overlap a production job ID;
+            # retain its sanitized X-ray as qualification evidence.
+            for request in details.get("request_xray") or []:
+                metrics = {
+                    "condensation_count_before": request.get("condensation_count", 0),
+                    "composition": request.get("composition") or {},
+                    "message_count": request.get("message_count"),
+                    "tool_count": request.get("tool_count"),
+                    "growth_tokens": request.get("growth_tokens"),
+                }
+                request_groups.setdefault(candidate_name, []).append(
+                    {
+                        "candidate": candidate_name,
+                        "state": request.get("state"),
+                        "actual_input_tokens": request.get("actual_input_tokens"),
+                        "estimated_input_tokens": request.get("estimated_input_tokens"),
+                        "started_at": None,
+                        "finished_at": None,
+                        "attempt_id": synthetic_id,
+                        "context_metrics_json": json.dumps(metrics),
+                    }
+                )
+            attempt = details.get("attempt") or {}
+            if attempt:
+                levels = details.get("levels") or {}
+                attempt_groups.setdefault(candidate_name, []).append(
+                    {
+                        "id": synthetic_id,
+                        "candidate": candidate_name,
+                        "status": attempt.get("status"),
+                        "outcome": attempt.get("outcome"),
+                        "raw_metrics_json": attempt.get("raw_metrics_json") or "{}",
+                        "verification_ok": int(bool(levels.get("L4_pmc_lifecycle"))),
+                        "conformance_job_id": job_id,
+                        "candidate_version": row["version"],
+                    }
+                )
+                synthetic_id -= 1
+        profiles = []
+        for candidate_name in sorted(set(request_groups) | set(attempt_groups)):
+            rows = request_groups.get(candidate_name, [])
+            attempt_rows = attempt_groups.get(candidate_name, [])
+            succeeded_sizes = [
+                int(row["actual_input_tokens"] or row["estimated_input_tokens"] or 0)
+                for row in rows
+                if row["state"] == "SUCCEEDED"
+            ]
+            latencies = []
+            condensed_attempt_ids: set[int] = set()
+            bins = {
+                "0-4k": [0, 0],
+                "4-8k": [0, 0],
+                "8-16k": [0, 0],
+                "16-32k": [0, 0],
+                "32k+": [0, 0],
+            }
+            for row in rows:
+                if row["started_at"] and row["finished_at"]:
+                    latencies.append(
+                        (
+                            datetime.fromisoformat(row["finished_at"])
+                            - datetime.fromisoformat(row["started_at"])
+                        ).total_seconds()
+                    )
+                size = int(row["estimated_input_tokens"] or 0)
+                bucket = (
+                    "0-4k"
+                    if size < 4000
+                    else "4-8k"
+                    if size < 8000
+                    else "8-16k"
+                    if size < 16000
+                    else "16-32k"
+                    if size < 32000
+                    else "32k+"
+                )
+                bins[bucket][0] += 1
+                bins[bucket][1] += int(row["state"] == "RATE_LIMITED")
+                metrics = json.loads(row["context_metrics_json"] or "{}")
+                if int(metrics.get("condensation_count_before") or 0) > 0:
+                    condensed_attempt_ids.add(int(row["attempt_id"]))
+            attempt_quality = []
+            for row in attempt_rows:
+                raw = json.loads(row["raw_metrics_json"] or "{}")
+                agent = raw.get("agent") or {}
+                attempt_quality.append(
+                    {
+                        "attempt_id": int(row["id"]),
+                        "status": row["status"],
+                        "outcome": row["outcome"],
+                        "condensed": int(row["id"]) in condensed_attempt_ids,
+                        "verified": bool(row["verification_ok"]),
+                        "meaningful_progress": bool(agent.get("meaningful_progress")),
+                        "actions": int(agent.get("actions") or 0),
+                        "repeated_actions": int(agent.get("repeated_actions") or 0),
+                        "post_condensation_actions": int(
+                            agent.get("post_condensation_actions") or 0
+                        ),
+                    }
+                )
+            successful_attempts = sum(
+                item["status"] == "READY" or item["verified"]
+                for item in attempt_quality
+            )
+            evidence_mature = len(rows) >= 50 and len(attempt_rows) >= 5
+            profiles.append(
+                {
+                    "candidate": candidate_name,
+                    "candidate_version": version,
+                    "requests": len(rows),
+                    "succeeded_requests": len(succeeded_sizes),
+                    "rate_limited_requests": sum(
+                        row["state"] == "RATE_LIMITED" for row in rows
+                    ),
+                    "rate_limit_probability": (
+                        round(
+                            sum(row["state"] == "RATE_LIMITED" for row in rows)
+                            / len(rows),
+                            4,
+                        )
+                        if rows
+                        else None
+                    ),
+                    "successful_input_tokens_p50": percentile(succeeded_sizes, 0.5),
+                    "successful_input_tokens_p90": percentile(succeeded_sizes, 0.9),
+                    "median_request_latency_seconds": (
+                        round(median(latencies), 3) if latencies else None
+                    ),
+                    "size_buckets": {
+                        name: {
+                            "requests": values[0],
+                            "rate_limited": values[1],
+                            "rate_limit_probability": (
+                                round(values[1] / values[0], 4) if values[0] else None
+                            ),
+                        }
+                        for name, values in bins.items()
+                    },
+                    "attempts": len(attempt_rows),
+                    "successful_attempts": successful_attempts,
+                    "condensed_attempts": len(condensed_attempt_ids),
+                    "condensed_verified_attempts": sum(
+                        item["condensed"] and item["verified"]
+                        for item in attempt_quality
+                    ),
+                    "condensed_progress_attempts": sum(
+                        item["condensed"] and item["meaningful_progress"]
+                        for item in attempt_quality
+                    ),
+                    "attempt_quality": attempt_quality,
+                    "policy_status": (
+                        "EMPIRICAL_EVIDENCE"
+                        if evidence_mature
+                        else "INITIAL_HYPOTHESIS"
+                    ),
+                    "automatic_threshold_tuning": False,
+                }
+            )
+        return profiles
+
     def provider_next_available_seconds(self, provider: str) -> float | None:
         """Return the shortest live credential cooldown for a provider."""
         import time
 
         with self.connect() as conn:
             row = conn.execute(
-                """SELECT MIN(cooldown_until) FROM provider_credentials
-                WHERE provider=? AND enabled=1 AND cooldown_until>?""",
-                (provider, time.time()),
+                """SELECT MIN(available_at) FROM (
+                    SELECT cooldown_until available_at FROM provider_credentials
+                    WHERE provider=? AND enabled=1 AND cooldown_until>?
+                    UNION ALL
+                    SELECT tokens_reset_at available_at FROM provider_credentials
+                    WHERE provider=? AND enabled=1 AND tokens_reset_at>?
+                )""",
+                (provider, time.time(), provider, time.time()),
             ).fetchone()
         if not row or row[0] is None:
             return None
@@ -704,7 +1111,7 @@ class Database:
         status: str | None = None,
     ) -> None:
         status = status or ("AVAILABLE" if generation_ok and tool_ok else "QUARANTINED")
-        from .versioning import PROMPT_PROFILE_VERSION
+        from .versioning import PROMPT_PROFILE_VERSION, executor_adapter_version
 
         with self.connect() as conn:
             conn.execute(
@@ -722,7 +1129,7 @@ class Database:
                     int(generation_ok),
                     int(tool_ok),
                     0 if status == "AVAILABLE" else 1,
-                    candidate.tool_profile,
+                    executor_adapter_version(candidate.executor),
                     PROMPT_PROFILE_VERSION,
                     json.dumps(details, default=str),
                     utcnow(),
@@ -730,7 +1137,7 @@ class Database:
             )
 
     def model_conformance(self, candidate: Any) -> dict[str, Any] | None:
-        from .versioning import PROMPT_PROFILE_VERSION
+        from .versioning import PROMPT_PROFILE_VERSION, executor_adapter_version
 
         with self.connect() as conn:
             row = conn.execute(
@@ -740,7 +1147,9 @@ class Database:
         if not row:
             return None
         result = dict(row)
-        if result.get("prompt_version") != PROMPT_PROFILE_VERSION:
+        if result.get("prompt_version") != PROMPT_PROFILE_VERSION or result.get(
+            "adapter_version"
+        ) != executor_adapter_version(candidate.executor):
             result["status"] = "STALE"
         return result
 
@@ -2243,9 +2652,11 @@ class Database:
         where = [
             "a.role=?",
             "a.finished_at IS NOT NULL",
-            "COALESCE(a.outcome,'') NOT IN "
-            "('PROVIDER_FAILURE','RATE_LIMIT','RESOURCE_FAILURE','EXECUTOR_FAILURE',"
-            "'EXECUTOR_CRASH','TIMEOUT','CANCELLED')",
+            (
+                "COALESCE(a.outcome,'') NOT IN "
+                "('PROVIDER_FAILURE','RATE_LIMIT','RESOURCE_FAILURE','EXECUTOR_FAILURE',"
+                "'EXECUTOR_CRASH','TIMEOUT','CANCELLED')"
+            ),
         ]
         params: list[Any] = [role]
         if task_type:

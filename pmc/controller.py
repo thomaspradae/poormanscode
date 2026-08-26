@@ -38,9 +38,11 @@ from .versioning import (
     SCHEMA_VERSION,
     TOOLCHAIN_PROFILE_VERSION,
     VERIFIER_VERSION,
+    executor_adapter_version,
     pmc_git_sha,
     stable_hash,
 )
+from .work_state import WORK_STATE_VERSION, WorkState, build_work_state
 
 
 class LeaseBusy(RuntimeError):
@@ -234,6 +236,31 @@ class Controller:
             indent=2,
         )
 
+    def _capture_work_state(
+        self,
+        job,
+        attempt_no: int,
+        failures: list[str],
+        current_plan: list[str] | None = None,
+    ) -> WorkState:
+        state = build_work_state(
+            job,
+            job.worktree,
+            failures=failures,
+            current_plan=current_plan,
+        )
+        self.reporter.json(
+            job.id,
+            f"attempt-{attempt_no:02d}-work-state.json",
+            {"manifest": state.manifest(), "state": state},
+        )
+        self.db.event(
+            "WORK_STATE_CAPTURED",
+            job_id=job.id,
+            payload={"attempt_no": attempt_no, **state.manifest()},
+        )
+        return state
+
     def run_job(self, job_id: str, forced_candidate: str | None = None) -> JobState:
         with _LeaseHeartbeat(self.db, job_id, self.owner, self.cfg.lease_ttl_seconds):
             return self._run_job_locked(job_id, forced_candidate)
@@ -330,6 +357,7 @@ class Controller:
         total_attempts = self.db.attempt_count(job.id)
         cycle_attempts = self.db.attempt_count_since_latest_feedback(job.id)
         failures: list[str] = []
+        current_plan: list[str] = []
         used: list[str] = []
         retry_exclude: set[str] = set()
         retry_same: str | None = None
@@ -465,11 +493,28 @@ class Controller:
                 candidate.executor == "openhands"
                 and candidate.extra.get("agent_kind") != "acp"
             )
-            prompt_feedback = "\n\n".join(x for x in [prior_feedback, *failures] if x)
+            work_state = build_work_state(
+                job,
+                job.worktree,
+                failures=failures,
+                current_plan=current_plan,
+            )
+            prompt_feedback = "\n\n".join(
+                x
+                for x in [
+                    prior_feedback,
+                    work_state.prompt_packet()
+                    if work_state.has_partial_work or failures
+                    else "",
+                ]
+                if x
+            )
             context_bundle = build_context_bundle(
                 job.worktree,
                 job.request,
-                baseline=job.baseline_commit,
+                # The work-state packet already carries the current diff.
+                # Avoid sending the same patch twice on recovery attempts.
+                baseline=(None if work_state.has_partial_work else job.baseline_commit),
                 limit=int(candidate.extra.get("context_limit", 24_000)),
             )
             prompt = builder_prompt(
@@ -478,6 +523,16 @@ class Controller:
                 repo_cfg,
                 prompt_feedback,
                 context=context_bundle.content,
+            )
+            attempt_context_manifest = {
+                **context_bundle.manifest,
+                "work_state": work_state.manifest(),
+            }
+            attempt_context_hash = stable_hash(
+                {
+                    "repository_context": context_bundle.content_hash,
+                    "work_state": work_state.content_hash,
+                }
             )
             execution_candidate = replace(
                 candidate,
@@ -506,6 +561,8 @@ class Controller:
                 "job_contract_version": JOB_CONTRACT_VERSION,
                 "prompt_profile_version": PROMPT_PROFILE_VERSION,
                 "context_builder_version": context_bundle.manifest["version"],
+                "work_state_version": WORK_STATE_VERSION,
+                "work_state_hash": work_state.content_hash,
                 "verifier_version": VERIFIER_VERSION,
                 "toolchain_profile_version": TOOLCHAIN_PROFILE_VERSION,
                 "toolchain": repo_cfg.get("toolchain"),
@@ -514,7 +571,7 @@ class Controller:
                 "candidate_version": candidate.version,
                 "candidate_hash": stable_hash(candidate),
                 "executor": candidate.executor,
-                "executor_version": "1",
+                "executor_version": executor_adapter_version(candidate.executor),
                 "provider": candidate.provider or candidate.quota_group,
                 "provider_model_id": candidate.model,
                 "prompt_profile": candidate.prompt_profile,
@@ -527,8 +584,8 @@ class Controller:
                 job.id,
                 f"attempt-{attempt_no:02d}-context.json",
                 {
-                    "hash": context_bundle.content_hash,
-                    "manifest": context_bundle.manifest,
+                    "hash": attempt_context_hash,
+                    "manifest": attempt_context_manifest,
                 },
             )
             attempt_id = self.db.begin_attempt(
@@ -538,8 +595,8 @@ class Controller:
                 decision.mode,
                 decision.score,
                 version_snapshot=version_snapshot,
-                context_hash=context_bundle.content_hash,
-                context_manifest=context_bundle.manifest,
+                context_hash=attempt_context_hash,
+                context_manifest=attempt_context_manifest,
             )
             if not request_accounted_executor:
                 if candidate.provider:
@@ -625,17 +682,23 @@ class Controller:
                             allocation_id, "FAILED", {"error": str(exc)}
                         )
             if planner_advice:
+                current_plan = [
+                    line.strip(" -*\t")[:500]
+                    for advice in planner_advice
+                    for line in advice.splitlines()
+                    if line.strip()
+                ][:20]
                 prompt += "\n\nINDEPENDENT PLANNING ADVICE:\n" + "\n\n---\n\n".join(
                     planner_advice
                 )
                 req.prompt = prompt
-                augmented_manifest = dict(context_bundle.manifest)
+                augmented_manifest = dict(attempt_context_manifest)
                 augmented_manifest["planner_advice_hash"] = stable_hash(planner_advice)
                 self.db.update_attempt_context(
                     attempt_id,
                     stable_hash(
                         {
-                            "base": context_bundle.content_hash,
+                            "base": attempt_context_hash,
                             "planner_advice": planner_advice,
                         }
                     ),
@@ -824,6 +887,7 @@ class Controller:
                 failures.append(
                     f"Attempt {attempt_no} executor failure ({candidate.name}): {result.error}"
                 )
+                self._capture_work_state(job, attempt_no, failures, current_plan)
                 retry_policy = policy_for(outcome)
                 if retry_policy.action == RetryAction.BLOCK:
                     self.db.set_state(job.id, JobState.BLOCKED)
@@ -834,12 +898,14 @@ class Controller:
                     self._write_event_audit(job.id)
                     return JobState.FAILED
                 if outcome == Outcome.RESOURCE_FAILURE:
-                    self.worktrees.reset_attempt(job.worktree, job.baseline_commit)
                     if result.raw_metrics.get("context_incompatible"):
                         # Condensation already ran before the physical request.
-                        # Preserve the job, but choose a candidate/provider whose
+                        # Preserve partial repository work and hand it to a
+                        # candidate/provider whose
                         # sustainable per-request capacity fits this working set.
                         retry_exclude.add(candidate.name)
+                    else:
+                        self.worktrees.reset_attempt(job.worktree, job.baseline_commit)
                 if job.constraints.get("_candidate_order"):
                     retry_same = None
                     retry_exclude.add(candidate.name)
@@ -926,6 +992,7 @@ class Controller:
                 failures.append(
                     f"Attempt {attempt_no} verification:\n{v.short_failure()}"
                 )
+                self._capture_work_state(job, attempt_no, failures, current_plan)
                 retry_policy = policy_for(outcome)
                 if retry_policy.action == RetryAction.BLOCK:
                     self.db.set_state(job.id, JobState.BLOCKED)
@@ -1081,6 +1148,9 @@ class Controller:
                             + rejected_review.summary
                             + "\n"
                             + "\n".join(rejected_review.findings)
+                        )
+                        self._capture_work_state(
+                            job, attempt_no, failures, current_plan
                         )
                         if (
                             used.count(candidate.name)

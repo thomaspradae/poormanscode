@@ -396,7 +396,106 @@ def test_openhands_remote_workspace_uses_server_credential(monkeypatch, tmp_path
     _assert_remote_workspace_calls(calls)
 
 
-def test_openhands_gateway_bind_failure_is_resource_failure(monkeypatch, tmp_path: Path):
+def test_openhands_preserves_remote_partial_diff_when_agent_hits_limit(
+    monkeypatch, tmp_path: Path
+):
+    import subprocess
+
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.email", "test@example.invalid"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.name", "Test"], check=True
+    )
+    target = tmp_path / "value.txt"
+    target.write_text("before\n")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "value.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "commit", "-qm", "baseline"], check=True
+    )
+    target.write_text("after\n")
+    patch = subprocess.run(
+        ["git", "-C", str(tmp_path), "diff", "--binary", "HEAD", "--"],
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout
+    target.write_text("before\n")
+
+    class FakeSecret:
+        def __init__(self, value):
+            self.value = value
+
+    class FakeLLM:
+        def __init__(self, **_kwargs):
+            pass
+
+    class FakeWorkspace:
+        def __init__(self, **_kwargs):
+            pass
+
+        def file_upload(self, *_args):
+            pass
+
+        def execute_command(self, command):
+            class Result:
+                stdout = patch if "git diff --binary" in command else ""
+
+            return Result()
+
+    class State:
+        events = []
+        execution_status = "FAILED"
+
+    class FakeConversation:
+        state = State()
+        id = "partial"
+
+        def __init__(self, **_kwargs):
+            pass
+
+        def send_message(self, _message):
+            pass
+
+        def run(self):
+            raise RuntimeError("MaxIterationsReached")
+
+        def close(self):
+            pass
+
+    monkeypatch.setenv("OPENHANDS_SESSION_KEY", "session-only")
+    executor = OpenHandsExecutor()
+    executor._imports = lambda: (
+        FakeSecret,
+        FakeLLM,
+        FakeConversation,
+        FakeWorkspace,
+        lambda **_kwargs: "agent",
+    )
+    candidate = Candidate.from_mapping(
+        {
+            "name": "openhands-remote",
+            "executor": "openhands",
+            "model": "provider/model",
+            "server_url": "http://ofi1.example:8010",
+            "server_api_key_env": "OPENHANDS_SESSION_KEY",
+        }
+    )
+    result = executor.run(
+        ExecutionRequest(
+            Job("PMC-X", tmp_path, "task"), candidate, tmp_path, "do it", 1
+        )
+    )
+    assert result.ok is False
+    assert target.read_text() == "after\n"
+    assert result.raw_metrics["agent"]["meaningful_progress"] is True
+
+
+def test_openhands_gateway_bind_failure_is_resource_failure(
+    monkeypatch, tmp_path: Path
+):
     from pmc.domain import Outcome
     from pmc.provider_gateway import ProviderGateway
 

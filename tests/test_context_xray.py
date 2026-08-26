@@ -5,7 +5,7 @@ import pytest
 from pmc.accounting import ContextCapacityExceeded, ModelRequestAccounting
 from pmc.context_xray import analyze_request_context
 from pmc.db import Database
-from pmc.domain import Candidate, Job
+from pmc.domain import Candidate, ExecutionResult, Job, ProviderCredential
 from pmc.providers.openai_compat import ChatReply
 
 
@@ -82,3 +82,61 @@ def test_request_soft_limit_rejects_before_provider_dispatch(tmp_path: Path):
     assert "MODEL_REQUEST_INCOMPATIBLE_CONTEXT" in {
         event["event_type"] for event in db.job_events(job.id)
     }
+
+
+def test_profiles_keep_thresholds_hypotheses_and_report_scope_evidence(
+    tmp_path: Path, monkeypatch
+):
+    db = Database(tmp_path / "db.sqlite")
+    job = Job("PMC-PROFILE", tmp_path, "task")
+    candidate = Candidate(
+        "profile", "bash", provider="pool", model="model", max_turns=3
+    )
+    db.create_job(job)
+    monkeypatch.setenv("POOL_1", "one")
+    monkeypatch.setenv("POOL_2", "two")
+    db.register_provider_credentials(
+        [
+            ProviderCredential("pool-1", "pool", "POOL_1"),
+            ProviderCredential("pool-2", "pool", "POOL_2"),
+        ]
+    )
+    attempt = db.begin_attempt(job.id, 1, candidate, "forced", 0)
+    accounting = ModelRequestAccounting(
+        db, job_id=job.id, attempt_id=attempt, candidate=candidate
+    )
+    for turn in (1, 2):
+        ticket = accounting.reserve(
+            turn,
+            [{"role": "user", "content": "summarize" if turn == 1 else "act"}],
+            100,
+            tools=[] if turn == 1 else [{"type": "function", "name": "shell"}],
+        )
+        accounting.succeed(
+            ticket,
+            ChatReply(
+                "ok",
+                input_tokens=500 + turn,
+                output_tokens=10,
+                rate_headers={
+                    "x-ratelimit-limit-tokens": "25000",
+                    "x-ratelimit-remaining-tokens": "24000",
+                },
+            ),
+        )
+    db.finish_attempt(
+        attempt,
+        "EXECUTOR_FAILED",
+        ExecutionResult(False, error="bounded diagnostic"),
+        1.0,
+        outcome="EXECUTOR_FAILURE",
+    )
+    profile = db.context_profiles("profile")[0]
+    assert profile["policy_status"] == "INITIAL_HYPOTHESIS"
+    assert profile["automatic_threshold_tuning"] is False
+    assert profile["successful_input_tokens_p50"] is not None
+    scope = db.quota_scope_evidence("pool")[0]
+    assert scope["credentials_configured"] == 2
+    assert scope["configured_quota_scopes"] == 0
+    assert scope["counter_evidence_lanes"] == 2
+    assert scope["observed_independence_confidence"] == "STRONGLY_OBSERVED"

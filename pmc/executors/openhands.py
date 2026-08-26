@@ -13,6 +13,59 @@ from pydantic import PrivateAttr
 
 from ..domain import ExecutionRequest, ExecutionResult, Outcome
 from ..providers.openai_compat import ChatReply
+from ..versioning import stable_hash
+
+
+def _event_fingerprint(event: Any) -> str:
+    try:
+        payload = event.model_dump(mode="json")
+    except Exception:
+        payload = {"type": type(event).__name__, "id": getattr(event, "id", None)}
+    return stable_hash({"type": type(event).__name__, "payload": payload})
+
+
+def _agent_progress_diagnostics(
+    events: list[Any], diff: str, base: dict[str, Any]
+) -> dict[str, Any]:
+    """Content-free progress signals around condensation and tool activity."""
+    names = [type(event).__name__ for event in events]
+    condensation_positions = [
+        index for index, name in enumerate(names) if name == "Condensation"
+    ]
+    action_positions = [
+        (index, _event_fingerprint(event))
+        for index, (event, name) in enumerate(zip(events, names, strict=True))
+        if name == "ActionEvent"
+    ]
+    action_hashes = [fingerprint for _, fingerprint in action_positions]
+    last_condensation = condensation_positions[-1] if condensation_positions else None
+    post_condensation = [
+        fingerprint
+        for index, fingerprint in action_positions
+        if last_condensation is not None and index > last_condensation
+    ]
+    changed_files = sorted(
+        set(re.findall(r"^diff --git a/(.+?) b/", diff, flags=re.MULTILINE))
+    )
+    return {
+        **base,
+        "event_counts": dict(Counter(names)),
+        "condensation_events": len(condensation_positions),
+        "forgotten_events": sum(
+            len(getattr(event, "forgotten_event_ids", set()))
+            for event in events
+            if type(event).__name__ == "Condensation"
+        ),
+        "actions": len(action_hashes),
+        "unique_actions": len(set(action_hashes)),
+        "repeated_actions": len(action_hashes) - len(set(action_hashes)),
+        "post_condensation_actions": len(post_condensation),
+        "post_condensation_unique_actions": len(set(post_condensation)),
+        "final_diff_present": bool(diff.strip()),
+        "final_diff_hash": stable_hash(diff) if diff.strip() else None,
+        "changed_files": changed_files,
+        "meaningful_progress": bool(diff.strip()),
+    }
 
 
 def _controller_gateway_host(configured: Any) -> str | None:
@@ -526,38 +579,42 @@ class OpenHandsExecutor:
                         visualizer=None,
                         secrets=conversation_secrets,
                     )
+                    run_error: Exception | None = None
+                    diff = ""
                     try:
                         conversation.send_message(remote_prompt)
                         conversation.run()
+                    except Exception as exc:  # preserve partial work before classifying
+                        run_error = exc
+                    finally:
+                        try:
+                            diff = workspace.execute_command(
+                                f"cd {remote_dir} && git add -A && git diff --binary --cached HEAD --"
+                            ).stdout
+                        except Exception:
+                            diff = ""
                         try:
                             events = list(conversation.state.events)
-                            condensation_events = [
-                                event
-                                for event in events
-                                if type(event).__name__ == "Condensation"
-                            ]
-                            agent_diagnostics.update({
-                                "conversation_id": str(conversation.id),
-                                "event_counts": dict(
-                                    Counter(type(event).__name__ for event in events)
-                                ),
-                                "execution_status": str(
-                                    conversation.state.execution_status
-                                ),
-                                "condensation_events": len(condensation_events),
-                                "forgotten_events": sum(
-                                    len(getattr(event, "forgotten_event_ids", set()))
-                                    for event in condensation_events
-                                ),
-                            })
+                            agent_diagnostics = _agent_progress_diagnostics(
+                                events,
+                                diff,
+                                {
+                                    **agent_diagnostics,
+                                    "conversation_id": str(conversation.id),
+                                    "execution_status": str(
+                                        conversation.state.execution_status
+                                    ),
+                                    "terminated_with_error": run_error is not None,
+                                },
+                            )
                         except Exception:
-                            # Diagnostics must never turn completed coding work
-                            # into an executor failure.
-                            agent_diagnostics = {"diagnostics": "unavailable"}
-                        diff = workspace.execute_command(
-                            f"cd {remote_dir} && git add -A && git diff --binary --cached HEAD --"
-                        ).stdout
-                    finally:
+                            # Diagnostics must never hide the original executor
+                            # outcome or turn completed coding work into failure.
+                            agent_diagnostics = {
+                                **agent_diagnostics,
+                                "diagnostics": "unavailable",
+                                "terminated_with_error": run_error is not None,
+                            }
                         conversation.close()
                     if diff.strip():
                         from ..gitops import WorktreeManager
@@ -565,6 +622,8 @@ class OpenHandsExecutor:
                         WorktreeManager(request.worktree.parent).apply_patch(
                             request.worktree, diff
                         )
+                    if run_error is not None:
+                        raise run_error
             if request.accounting is not None:
                 totals = request.accounting.db.model_request_totals(
                     request.accounting.attempt_id, c.name
@@ -577,7 +636,8 @@ class OpenHandsExecutor:
                     "agent": agent_diagnostics,
                 }
             else:
-                in_tok, out_tok, cost, raw = self._metrics(llm)
+                in_tok, out_tok, cost, sdk_raw = self._metrics(llm)
+                raw = {**sdk_raw, "agent": agent_diagnostics}
             return ExecutionResult(
                 True,
                 summary="OpenHands conversation completed; controller will verify independently",
@@ -607,7 +667,8 @@ class OpenHandsExecutor:
                     "agent": agent_diagnostics,
                 }
             else:
-                in_tok, out_tok, cost, raw = self._metrics(llm)
+                in_tok, out_tok, cost, sdk_raw = self._metrics(llm)
+                raw = {**sdk_raw, "agent": agent_diagnostics}
             outcome, provider_status, rate_headers = _provider_failure(exc)
             if outcome == Outcome.RESOURCE_FAILURE and re.search(
                 r"request context.*sustainable request limit|ContextCapacityExceeded",

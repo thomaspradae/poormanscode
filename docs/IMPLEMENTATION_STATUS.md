@@ -27,6 +27,20 @@ audit reports, human acceptance, leases, and Bash/OpenHands/Jules adapters.
   counts, component estimates, request hash/growth, unchanged retries, condenser
   count, actual-vs-estimated usage, context occupancy, quota lane, headers, and
   wall time. `pmc context-xray JOB --composition` renders it.
+- [x] `pmc context-profile` aggregates version-specific request p50/p90 sizes,
+  size-bucket 429 probability, condensation outcomes, progress, and verification.
+  Configured thresholds remain explicitly labelled initial hypotheses until at
+  least 50 requests and five attempts exist; PMC does not silently auto-tune them.
+- [x] Failed remote OpenHands runs retrieve and apply their partial Git patch before
+  classification. PMC writes a versioned, model-independent work-state packet with
+  task, acceptance, baseline, changed files/diff, current plan, latest exact failure,
+  and blockers; alternate candidates receive this instead of raw agent history.
+- [x] Per-lane observed token remainder/reset state gates the next physical request.
+  If no credential can currently fit it, PMC waits within policy or records
+  `MODEL_REQUEST_DEFERRED_QUOTA` without burning a doomed provider call.
+- [x] `pmc provider-capacity` reports configured credentials, explicit/shared scope
+  IDs, unknown scopes, and counter-based independence evidence separately. Observed
+  similarity/independence never silently becomes a confirmed quota-scope identity.
 - [x] Tool schemas are included in reservations. Requests that exceed an explicitly
   configured sustainable lane size are rejected before provider dispatch, after
   OpenHands has had an opportunity to condense through its configured token trigger.
@@ -34,11 +48,14 @@ audit reports, human acceptance, leases, and Bash/OpenHands/Jules adapters.
   → L2 edit → L3 failing-test repair → L4 Controller/verifier/audit gate.
   Nemotron Super + OpenHands passed all five levels and is the first enabled
   general-purpose OpenHands production candidate.
-- [~] Mistral Medium + OpenHands passes standalone L3 and rotates across all three
-  credential lanes, but remains quarantined because its full Controller prompt
-  exceeded the aggregate TPM pool before convergence. Groq OSS 120B reached real
-  OpenHands turns but remains gated by its single lane's 8k TPM window. Local Qwen
-  2.5 Coder 7B generated text but made no L2 tool action in 138 seconds.
+- [~] Live 2026-08-26 qualification: Mistral Medium rotated across seven strongly
+  observed counter lanes with zero 429s, inspected the repo, and produced a useful
+  two-file partial patch, but did not complete tests within the fixed 12-turn
+  qualification budget. Groq OSS 120B used three strongly observed counter lanes;
+  TPM-aware deferral reduced physical 429s from 13/26 to 0/13, it repaired the
+  failing tests after two condensations, but omitted the inspection artifact and
+  therefore failed L4. Both remain quarantined as general coders while retaining
+  evidence as limited candidates. Local Qwen remains below the L2 gate.
 
 ## P0 substrate
 
