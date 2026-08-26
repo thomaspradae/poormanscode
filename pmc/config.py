@@ -35,7 +35,9 @@ class PMCConfig:
     research_max_queries_per_attempt: int = 5
     toolchains: dict[str, dict[str, Any]] = field(default_factory=dict)
     candidates: list[Candidate] = field(default_factory=list)
-    provider_credentials: dict[str, list[ProviderCredential]] = field(default_factory=dict)
+    provider_credentials: dict[str, list[ProviderCredential]] = field(
+        default_factory=dict
+    )
     require_model_conformance: bool = False
     router_policy: str = "contextual_thompson"
     contextual_min_observations: int = 50
@@ -84,7 +86,7 @@ def load_config(path: Path | None = None) -> PMCConfig:
         raise FileNotFoundError(
             f"PMC config not found: {path}. Copy examples/config.toml there first."
         )
-    load_secrets_file(path.parent / "secrets.env")
+    loaded_secrets = load_secrets_file(path.parent / "secrets.env")
     raw = tomllib.loads(path.read_text())
     core = raw.get("pmc", {})
     research = raw.get("research", {})
@@ -98,9 +100,7 @@ def load_config(path: Path | None = None) -> PMCConfig:
                 api_key_env=str(item["api_key_env"]),
                 enabled=bool(item.get("enabled", True)),
                 quota_scope_id=(
-                    str(item["quota_scope_id"])
-                    if item.get("quota_scope_id")
-                    else None
+                    str(item["quota_scope_id"]) if item.get("quota_scope_id") else None
                 ),
                 quota_scope_confidence=str(
                     item.get("quota_scope_confidence", "UNKNOWN")
@@ -109,6 +109,31 @@ def load_config(path: Path | None = None) -> PMCConfig:
             )
             for item in provider_cfg.get("credentials", [])
         ]
+    # Numbered credentials added through pmc-add-provider-keys become lanes
+    # automatically. Configuration remains a list of secret references only;
+    # values never leave the protected environment.
+    prefixes = {
+        "groq": "GROQ_API_KEY",
+        "mistral": "MISTRAL_API_KEY",
+        "nvidia": "NVIDIA_API_KEY",
+        "gemini": "GEMINI_API_KEY",
+        "jules": "JULES_API_KEY",
+    }
+    for provider, prefix in prefixes.items():
+        pool = provider_credentials.setdefault(provider, [])
+        configured_envs = {credential.api_key_env for credential in pool}
+        configured_ids = {credential.id for credential in pool}
+        for env_name in loaded_secrets:
+            match = re.fullmatch(rf"{re.escape(prefix)}(?:_([0-9]+))?", env_name)
+            if not match or env_name in configured_envs:
+                continue
+            number = int(match.group(1) or "1")
+            credential_id = f"{provider}-{number}"
+            if credential_id in configured_ids:
+                continue
+            pool.append(ProviderCredential(credential_id, provider, env_name))
+            configured_envs.add(env_name)
+            configured_ids.add(credential_id)
     cfg = PMCConfig(
         db_path=_expand(core.get("db_path", "~/.local/share/poormans-code/pmc.db")),
         runs_dir=_expand(core.get("runs_dir", "~/.local/share/poormans-code/runs")),
@@ -132,9 +157,7 @@ def load_config(path: Path | None = None) -> PMCConfig:
         toolchains={str(k): dict(v) for k, v in raw.get("toolchains", {}).items()},
         candidates=candidates,
         provider_credentials=provider_credentials,
-        require_model_conformance=bool(
-            core.get("require_model_conformance", False)
-        ),
+        require_model_conformance=bool(core.get("require_model_conformance", False)),
         router_policy=str(core.get("router_policy", "contextual_thompson")),
         contextual_min_observations=int(core.get("contextual_min_observations", 50)),
         bandit_simulations=int(core.get("bandit_simulations", 256)),

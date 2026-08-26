@@ -738,6 +738,42 @@ def cmd_provider_capacity(args) -> int:
     return 0
 
 
+def cmd_credentials_probe(args) -> int:
+    """Warm up individual credential lanes without changing model quality."""
+    from .credentials import probe_credentials
+
+    ctl = _controller(args)
+    configured = set(ctl.cfg.provider_credentials)
+    selected = set(args.providers)
+    unknown = selected - configured
+    if unknown:
+        raise SystemExit("unknown providers: " + ", ".join(sorted(unknown)))
+    results = probe_credentials(
+        ctl.db,
+        ctl.cfg,
+        selected or None,
+        include_all=args.all,
+        concurrency=args.concurrency,
+    )
+    if args.json:
+        print(json.dumps([result.safe_dict() for result in results], indent=2))
+    elif not results:
+        print("No eligible UNKNOWN credential lanes")
+    else:
+        for result in results:
+            status = result.http_status if result.http_status is not None else "network"
+            print(
+                f"{result.provider:<10} {result.credential_id:<16} "
+                f"{result.health:<15} HTTP={status} {result.latency_seconds:.2f}s"
+            )
+            if result.error:
+                print(f"  {result.error}")
+    failed = any(
+        result.health not in {"AVAILABLE", "RATE_LIMITED"} for result in results
+    )
+    return 2 if failed else 0
+
+
 def cmd_capabilities(args) -> int:
     ctl = _controller(args)
     snapshot = ctl.capabilities.local
@@ -1179,6 +1215,15 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("providers", nargs="*")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_provider_capacity)
+
+    s = sub.add_parser("credentials")
+    credential_sub = s.add_subparsers(dest="credentials_command", required=True)
+    cp = credential_sub.add_parser("probe")
+    cp.add_argument("providers", nargs="*")
+    cp.add_argument("--all", action="store_true", help="re-probe non-UNKNOWN lanes")
+    cp.add_argument("--concurrency", type=int, default=2)
+    cp.add_argument("--json", action="store_true")
+    cp.set_defaults(func=cmd_credentials_probe)
 
     s = sub.add_parser("capabilities")
     s.set_defaults(func=cmd_capabilities)

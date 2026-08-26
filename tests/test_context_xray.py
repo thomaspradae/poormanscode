@@ -138,5 +138,8 @@ def test_profiles_keep_thresholds_hypotheses_and_report_scope_evidence(
     scope = db.quota_scope_evidence("pool")[0]
     assert scope["credentials_configured"] == 2
     assert scope["configured_quota_scopes"] == 0
-    assert scope["counter_evidence_lanes"] == 2
-    assert scope["observed_independence_confidence"] == "STRONGLY_OBSERVED"
+    # Known-good lanes are preferred over UNKNOWN lanes during ordinary work;
+    # explicit credential probes warm the remaining lane without contaminating
+    # this model-request history.
+    assert scope["counter_evidence_lanes"] == 1
+    assert scope["observed_independence_confidence"] == "OBSERVED"

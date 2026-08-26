@@ -41,6 +41,13 @@ audit reports, human acceptance, leases, and Bash/OpenHands/Jules adapters.
 - [x] `pmc provider-capacity` reports configured credentials, explicit/shared scope
   IDs, unknown scopes, and counter-based independence evidence separately. Observed
   similarity/independence never silently becomes a confirmed quota-scope identity.
+- [x] `pmc credentials probe [PROVIDER...]` performs cheap per-lane authentication
+  warm-up independently of candidate qualification. It reserves and reconciles the
+  exact lane, persists sanitized latency/quota/reset evidence and append-only events,
+  and transitions success/401/403/429/transient failures to the appropriate health
+  state without writing model-quality history. Numbered keys added to `secrets.env`
+  are discovered as credential lanes automatically, and known-available lanes are
+  preferred over unknown lanes during ordinary selection.
 - [x] Tool schemas are included in reservations. Requests that exceed an explicitly
   configured sustainable lane size are rejected before provider dispatch, after
   OpenHands has had an opportunity to condense through its configured token trigger.

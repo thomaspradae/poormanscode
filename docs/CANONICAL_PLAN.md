@@ -11,6 +11,9 @@ affecting acceptance must remain outside worker authority.
 - [x] Atomic per-model-request credential selection, reservation, reconciliation,
   authentication quarantine, and least-utilized lane selection
 - [x] Provider capacity gates candidates without adding credentials to candidate identity
+- [x] Automatic numbered-key discovery plus per-credential `pmc credentials probe`
+  warm-up ledger; lane health is independent of candidate qualification and quota-scope
+  confidence
 - [x] `pmc models list`, `pmc models smoke`, and cumulative L0-L4
   `pmc models conformance` persist generation, repository inspection, editing,
   repair, verifier, accounting, and audit evidence and gate production scheduling

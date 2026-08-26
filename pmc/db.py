@@ -280,6 +280,16 @@ CREATE TABLE IF NOT EXISTS credential_reservations (
     state TEXT NOT NULL, actual_tokens INTEGER, created_at TEXT NOT NULL, reconciled_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_credential_reservations_active ON credential_reservations(credential_id,state);
+CREATE TABLE IF NOT EXISTS credential_probes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    credential_id TEXT NOT NULL REFERENCES provider_credentials(credential_id),
+    provider TEXT NOT NULL, state TEXT NOT NULL, http_status INTEGER,
+    latency_seconds REAL, request_id TEXT, input_tokens INTEGER,
+    output_tokens INTEGER, rate_headers_json TEXT NOT NULL DEFAULT '{}',
+    error TEXT, started_at TEXT NOT NULL, finished_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_credential_probes_lane
+ON credential_probes(credential_id,started_at);
 CREATE TABLE IF NOT EXISTS model_conformance (
     candidate TEXT NOT NULL, version TEXT NOT NULL, status TEXT NOT NULL,
     generation_ok INTEGER NOT NULL DEFAULT 0, tool_ok INTEGER NOT NULL DEFAULT 0,
@@ -511,7 +521,9 @@ class Database:
                 FROM provider_credentials pc WHERE provider=? AND enabled=1
                 AND health NOT IN ('AUTH_FAILED','DISABLED','QUOTA_EXHAUSTED')
                 AND (cooldown_until IS NULL OR cooldown_until<=?)
-                ORDER BY active ASC, used ASC, credential_id ASC""",
+                ORDER BY active ASC,
+                CASE health WHEN 'AVAILABLE' THEN 0 WHEN 'UNKNOWN' THEN 1 ELSE 2 END,
+                used ASC, credential_id ASC""",
                 (provider, now_epoch),
             ).fetchall()
             row = next(
@@ -550,6 +562,85 @@ class Database:
                 "quota_scope_id": row["quota_scope_id"],
             }
 
+    def credentials_for_probe(
+        self, providers: set[str] | None = None, *, include_all: bool = False
+    ) -> list[dict[str, Any]]:
+        """Return enabled credential metadata for controller-side health probes."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT credential_id,provider,api_key_env,health,cooldown_until,
+                requests_remaining,tokens_remaining,reset_at,
+                quota_scope_id,quota_scope_confidence FROM provider_credentials
+                WHERE enabled=1 ORDER BY provider,credential_id"""
+            ).fetchall()
+        allowed = providers or set()
+        return [
+            dict(row)
+            for row in rows
+            if (not allowed or row["provider"] in allowed)
+            and (include_all or row["health"] == "UNKNOWN")
+        ]
+
+    def reserve_specific_credential_probe(
+        self, credential_id: str, estimated_tokens: int = 128
+    ) -> tuple[int, int]:
+        """Atomically reserve one exact lane without involving model routing."""
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """SELECT credential_id,provider FROM provider_credentials
+                WHERE credential_id=? AND enabled=1""",
+                (credential_id,),
+            ).fetchone()
+            if not row:
+                raise RuntimeError(f"credential is unavailable: {credential_id}")
+            reservation = conn.execute(
+                """INSERT INTO credential_reservations
+                (credential_id,job_id,attempt_id,estimated_tokens,state,created_at)
+                VALUES(?,'CREDENTIAL-PROBE',NULL,?,'RESERVED',?)""",
+                (credential_id, estimated_tokens, utcnow()),
+            )
+            probe = conn.execute(
+                """INSERT INTO credential_probes
+                (credential_id,provider,state,started_at)
+                VALUES(?,?,'STARTED',?)""",
+                (credential_id, row["provider"], utcnow()),
+            )
+        return int(reservation.lastrowid), int(probe.lastrowid)
+
+    def finish_credential_probe(
+        self,
+        probe_id: int,
+        *,
+        state: str,
+        http_status: int | None,
+        latency_seconds: float,
+        request_id: str | None = None,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        rate_headers: dict[str, Any] | None = None,
+        error: str | None = None,
+    ) -> None:
+        """Persist sanitized probe evidence independently of candidate history."""
+        with self.connect() as conn:
+            conn.execute(
+                """UPDATE credential_probes SET state=?,http_status=?,latency_seconds=?,
+                request_id=?,input_tokens=?,output_tokens=?,rate_headers_json=?,error=?,
+                finished_at=? WHERE id=?""",
+                (
+                    state,
+                    http_status,
+                    latency_seconds,
+                    request_id,
+                    input_tokens,
+                    output_tokens,
+                    json.dumps(rate_headers or {}),
+                    error,
+                    utcnow(),
+                    probe_id,
+                ),
+            )
+
     def reconcile_provider_credential(
         self,
         reservation_id: int,
@@ -587,7 +678,7 @@ class Database:
             health = "AUTH_FAILED"
         elif status_code == 429:
             health = "RATE_LIMITED"
-        elif status_code is not None and status_code >= 500:
+        elif status_code is not None and status_code >= 400:
             health = "DEGRADED"
         else:
             health = "AVAILABLE"
@@ -683,7 +774,8 @@ class Database:
             rows = conn.execute(
                 """SELECT * FROM provider_credentials WHERE provider=? AND enabled=1
                 AND health NOT IN ('AUTH_FAILED','DISABLED','QUOTA_EXHAUSTED')
-                ORDER BY consecutive_failures, credential_id""",
+                ORDER BY CASE health WHEN 'AVAILABLE' THEN 0 WHEN 'UNKNOWN' THEN 1 ELSE 2 END,
+                consecutive_failures, credential_id""",
                 (provider,),
             ).fetchall()
         for row in rows:
