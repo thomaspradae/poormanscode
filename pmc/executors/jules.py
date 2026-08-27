@@ -64,6 +64,18 @@ class JulesExecutor:
             "Jules requires a GitHub origin remote or an explicit source override"
         )
 
+    @staticmethod
+    def _starting_branch(request: ExecutionRequest) -> str:
+        """Jules needs a branch name; PMC jobs may pin a commit as baseline."""
+        from ..gitops import git
+
+        configured = request.job.base_branch
+        if configured and not re.fullmatch(r"[0-9a-fA-F]{7,64}", configured):
+            return configured
+        head = git(request.job.repo, "symbolic-ref", "refs/remotes/origin/HEAD", check=False)
+        match = re.search(r"refs/remotes/origin/(.+)$", head.stdout.strip())
+        return match.group(1) if match else "main"
+
     def run(self, request: ExecutionRequest) -> ExecutionResult:
         c = request.candidate
         if request.attempt_no > 1:
@@ -91,7 +103,7 @@ class JulesExecutor:
                     "sourceContext": {
                         "source": source,
                         "githubRepoContext": {
-                            "startingBranch": request.job.base_branch
+                            "startingBranch": self._starting_branch(request)
                         },
                     },
                     "requirePlanApproval": False,
