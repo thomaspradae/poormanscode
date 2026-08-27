@@ -94,7 +94,10 @@ humans own acceptance.
 ## P2 — multi-agent/distributed capability
 
 - [x] Foreman proposal format, human approval, dependency DAG, and Kanban CLI
-- [ ] Automatic cross-worktree integration/rebase/conflict handling
+- [~] Autonomous program mode now assembles verifier-green commits in deterministic
+  dependency order on an immutable program baseline, with bounded concurrent workers,
+  crash-safe promotion, pause/resume, aggregate review diff, and a human-gated terminal
+  result. Automatic conflict resolution/rebase remains intentionally blocked for review.
 - [ ] Shadow/challenger execution
 - [ ] Post-acceptance regression, revert, reopen, and hotfix outcomes
 

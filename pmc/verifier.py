@@ -308,7 +308,7 @@ def verify(
     secret_ok = not secret_findings
 
     commands_ok = all(c.ok for c in commands)
-    if not changed:
+    if not changed and not job.constraints.get("allow_no_changes", False):
         findings.append("executor produced no code changes")
         scope_ok = False
     ok = commands_ok and scope_ok and protected_ok and secret_ok and dependencies_ok

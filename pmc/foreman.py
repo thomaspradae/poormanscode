@@ -40,6 +40,18 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
             isinstance(x, str) for x in candidate_order
         ):
             raise ValueError(f"task {key} candidate_order must be strings")
+        if task.get("complexity") not in {None, "TRIVIAL", "STANDARD", "DIFFICULT"}:
+            raise ValueError(f"task {key} has invalid complexity")
+        if task.get("risk") not in {None, "LOW", "MEDIUM", "HIGH", "CRITICAL"}:
+            raise ValueError(f"task {key} has invalid risk")
+        if task.get("budget") not in {
+            None,
+            "trivial",
+            "standard",
+            "difficult",
+            "high-risk",
+        }:
+            raise ValueError(f"task {key} has invalid budget")
         keys.append(key)
     key_set = set(keys)
     graph = {task["id"]: list(task.get("depends_on", [])) for task in tasks}
@@ -74,6 +86,22 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
     return {"version": 1, "tasks": tasks}
 
 
+def validate_program_plan(plan: dict[str, Any]) -> dict[str, Any]:
+    """Apply stricter boundaries required for verifier-driven autonomous chaining."""
+    validated = validate_plan(plan)
+    tasks = validated["tasks"]
+    if len(tasks) < 2:
+        raise ValueError("program plan requires at least one milestone and one terminal task")
+    if len(tasks) > 50:
+        raise ValueError("program plan exceeds the 50-task safety limit")
+    for task in tasks:
+        if not task.get("acceptance"):
+            raise ValueError(
+                f"program task {task['id']} requires explicit verification acceptance"
+            )
+    return {"version": 2, "kind": "program", "tasks": tasks}
+
+
 def _json_object(text: str) -> dict[str, Any]:
     try:
         return json.loads(text)
@@ -85,14 +113,27 @@ def _json_object(text: str) -> dict[str, Any]:
 
 
 def propose_plan(
-    repo: Path, title: str, request: str, candidate: Candidate
+    repo: Path,
+    title: str,
+    request: str,
+    candidate: Candidate,
+    *,
+    program: bool = False,
 ) -> dict[str, Any]:
     if not candidate.model or not candidate.base_url:
         raise ValueError("Foreman candidate must expose an OpenAI-compatible model")
     context = build_context_bundle(repo, request).content
+    program_rules = """
+This is a long-running autonomous program. Produce 4-40 bounded milestones, not
+one giant implementation task. Establish shared contracts before parallel tasks.
+Each task needs concrete deterministic acceptance criteria. Use no more than
+three naturally independent branches at a time. End with exactly one terminal
+integration/experiment task that transitively depends on every other task.
+""" if program else "Avoid needless decomposition."
     prompt = f"""Decompose this software feature into the smallest useful dependency DAG.
-Every task must be independently implementable and verifiable. Avoid needless decomposition.
-Return JSON only: {{"tasks":[{{"id":"short-id","request":"...","acceptance":["..."],"depends_on":[],"task_type":"FEATURE","priority":2,"candidate_order":["groq-oss20-bash","jules","local-qwen25-coder-7b-bash"]}}]}}.
+Every task must be independently implementable and verifiable.
+{program_rules}
+Return JSON only: {{"tasks":[{{"id":"short-id","request":"...","acceptance":["..."],"depends_on":[],"task_type":"FEATURE","priority":2,"candidate_order":[]}}]}}.
 Cover every part of the parent request. Bootstrap/setup must precede tasks that require it.
 
 FEATURE: {title}
@@ -108,4 +149,5 @@ CONTEXT:
         max_tokens=int(candidate.extra.get("foreman_max_tokens", 4096)),
         extra_body=candidate.extra.get("request_extra"),
     )
-    return validate_plan(_json_object(reply.content))
+    parsed = _json_object(reply.content)
+    return validate_program_plan(parsed) if program else validate_plan(parsed)

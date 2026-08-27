@@ -68,6 +68,21 @@ pmc daemon
 
 See `docs/FOREMAN.md` for the reviewed JSON plan format and dependency semantics.
 
+For a long-running, low-touch build, use an autonomous program. Intermediate
+verifier-green jobs can feed dependent work without being mislabeled as human
+accepted; the terminal integration result remains human-gated:
+
+```bash
+pmc program-create . "V0 laboratory" --spec docs/v0-build-spec.md --workers 3
+pmc program-plan PMCF-000001 --file program-plan.json
+pmc program-approve PMCF-000001
+pmc program-run PMCF-000001 --detach
+pmc program-status PMCF-000001
+```
+
+See `docs/PROGRAMS.md` for state semantics, recovery behavior, and intervention
+commands.
+
 Inspect and accept only after PMC's verifier is green:
 
 ```bash

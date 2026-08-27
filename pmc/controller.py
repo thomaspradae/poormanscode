@@ -167,7 +167,12 @@ class Controller:
                     already_present.append(commit)
                     continue
                 cherry = git(wt, "cherry", "HEAD", commit, check=False)
-                if cherry.returncode == 0 and cherry.stdout.lstrip().startswith("-"):
+                target_patch_state = {
+                    parts[1]: parts[0]
+                    for line in cherry.stdout.splitlines()
+                    if len(parts := line.split(maxsplit=1)) == 2
+                }.get(commit)
+                if cherry.returncode == 0 and target_patch_state == "-":
                     # The accepted commit may have been human-integrated via
                     # cherry-pick and therefore have a different SHA but the
                     # same patch identity.
@@ -1223,6 +1228,7 @@ class Controller:
             job.baseline_commit or "HEAD^",
             message or f"{job.id}: {job.request[:60]}",
             job.id,
+            allow_empty=bool(job.constraints.get("allow_no_changes", False)),
         )
         ready_attempt = self.db.latest_ready_attempt_id(job.id)
         if ready_attempt is None:

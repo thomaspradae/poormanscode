@@ -35,3 +35,8 @@ unlock dependents: prerequisites must reach `ACCEPTED`.
 
 Automatic cross-worktree integration remains a separate safety milestone. Accepted
 commits remain attributable, but PMC does not yet merge a feature DAG automatically.
+
+For pre-approved long-running work, `docs/PROGRAMS.md` defines autonomous program
+mode. It adds verifier-green internal chaining while keeping final acceptance and
+main-branch integration human-controlled. Ordinary feature DAG semantics above are
+unchanged.

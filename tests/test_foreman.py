@@ -4,7 +4,7 @@ import pytest
 
 from pmc.db import Database
 from pmc.domain import Candidate, Job, JobState
-from pmc.foreman import validate_plan
+from pmc.foreman import validate_plan, validate_program_plan
 from pmc.scheduler import Scheduler
 
 
@@ -59,6 +59,31 @@ def test_plan_requires_one_terminal_integration_task():
     }
     with pytest.raises(ValueError, match="one terminal integration task"):
         validate_plan(plan)
+
+
+def test_program_plan_requires_explicit_acceptance_and_is_bounded():
+    missing_acceptance = _plan()
+    missing_acceptance["tasks"][1]["acceptance"] = []
+    with pytest.raises(ValueError, match="requires explicit verification"):
+        validate_program_plan(missing_acceptance)
+    plan = _plan()
+    for task in plan["tasks"]:
+        task["acceptance"] = [f"{task['id']} verified"]
+    assert validate_program_plan(plan)["kind"] == "program"
+
+    too_large = {
+        "tasks": [
+            {
+                "id": f"n{index}",
+                "request": f"node {index}",
+                "acceptance": ["verified"],
+                "depends_on": [] if index == 0 else [f"n{index - 1}"],
+            }
+            for index in range(51)
+        ]
+    }
+    with pytest.raises(ValueError, match="50-task"):
+        validate_program_plan(too_large)
 
 
 def test_dependency_queue_releases_only_accepted_prerequisites(tmp_path: Path):
@@ -122,6 +147,143 @@ def test_dependency_commits_are_topological_and_unique(tmp_path: Path):
         "commit-pitch",
         "commit-camera",
     ]
+
+
+def test_program_dependencies_release_on_verified_internal_commit(tmp_path: Path):
+    db = Database(tmp_path / "pmc.db")
+    feature_id = db.next_feature_id()
+    db.create_feature(
+        feature_id,
+        tmp_path,
+        "Football V0",
+        "Build the lab",
+        "main",
+        mode="AUTONOMOUS_PROGRAM",
+        max_workers=3,
+    )
+    plan = validate_plan(_plan())
+    db.save_feature_plan(feature_id, plan, "foreman")
+    jobs = []
+    for position, task in enumerate(plan["tasks"], 1):
+        job = Job(f"PMC-{position:06d}", tmp_path, task["request"])
+        jobs.append((job, task["id"], position - 1, task.get("depends_on", [])))
+    db.approve_feature_plan(feature_id, jobs)
+
+    db.set_state("PMC-000001", JobState.READY)
+    assert db.program_ready_jobs(feature_id, 10) == []
+    assert db.promote_program_task("PMC-000001", "verified-bootstrap")
+    assert db.get_job("PMC-000001").state == JobState.READY
+    assert db.program_ready_jobs(feature_id, 10) == ["PMC-000002", "PMC-000003"]
+
+    with pytest.raises(RuntimeError, match="terminal"):
+        db.set_state("PMC-000004", JobState.READY)
+        db.promote_program_task("PMC-000004", "must-not-promote")
+
+
+def test_program_dependency_commits_use_promotions_without_fake_acceptance(
+    tmp_path: Path,
+):
+    db = Database(tmp_path / "pmc.db")
+    feature_id = db.next_feature_id()
+    db.create_feature(
+        feature_id,
+        tmp_path,
+        "Program",
+        "Build",
+        "main",
+        mode="AUTONOMOUS_PROGRAM",
+    )
+    plan = validate_plan(_plan())
+    db.save_feature_plan(feature_id, plan, None)
+    jobs = []
+    for position, task in enumerate(plan["tasks"], 1):
+        job = Job(f"PMC-{position:06d}", tmp_path, task["request"])
+        jobs.append((job, task["id"], position, task.get("depends_on", [])))
+    db.approve_feature_plan(feature_id, jobs)
+    with db.connect() as conn:
+        for job_id, commit in (
+            ("PMC-000001", "verified-bootstrap"),
+            ("PMC-000002", "verified-pitch"),
+            ("PMC-000003", "verified-camera"),
+        ):
+            conn.execute(
+                """UPDATE jobs SET state='READY_FOR_REVIEW' WHERE id=?""", (job_id,)
+            )
+            conn.execute(
+                """UPDATE feature_tasks SET promotion_state='VERIFIED_FOR_CHAINING',
+                verified_commit=? WHERE job_id=?""",
+                (commit, job_id),
+            )
+
+    assert db.dependency_commits("PMC-000004") == [
+        "verified-bootstrap",
+        "verified-pitch",
+        "verified-camera",
+    ]
+    assert all(db.get_job(f"PMC-{n:06d}").state != JobState.ACCEPTED for n in range(1, 4))
+
+
+def test_approved_program_plan_is_immutable(tmp_path: Path):
+    db = Database(tmp_path / "pmc.db")
+    feature_id = db.next_feature_id()
+    db.create_feature(
+        feature_id,
+        tmp_path,
+        "Program",
+        "Build",
+        "main",
+        mode="AUTONOMOUS_PROGRAM",
+    )
+    plan = validate_plan(_plan())
+    db.save_feature_plan(feature_id, plan, None)
+    jobs = [
+        (
+            Job(f"PMC-{position + 1:06d}", tmp_path, task["request"]),
+            task["id"],
+            position,
+            task.get("depends_on", []),
+        )
+        for position, task in enumerate(plan["tasks"])
+    ]
+    db.approve_feature_plan(feature_id, jobs)
+    with pytest.raises(RuntimeError, match="immutable"):
+        db.save_feature_plan(feature_id, plan, None)
+
+
+def test_only_terminal_human_acceptance_accepts_program(tmp_path: Path):
+    db = Database(tmp_path / "pmc.db")
+    feature_id = db.next_feature_id()
+    db.create_feature(
+        feature_id,
+        tmp_path,
+        "Program",
+        "Build",
+        "main",
+        mode="AUTONOMOUS_PROGRAM",
+    )
+    plan = validate_plan(_plan())
+    db.save_feature_plan(feature_id, plan, None)
+    jobs = [
+        (
+            Job(f"PMC-{position + 1:06d}", tmp_path, task["request"]),
+            task["id"],
+            position,
+            task.get("depends_on", []),
+        )
+        for position, task in enumerate(plan["tasks"])
+    ]
+    db.approve_feature_plan(feature_id, jobs)
+    with db.connect() as conn:
+        conn.execute("UPDATE jobs SET state='READY_FOR_REVIEW' WHERE id='PMC-000004'")
+        attempt_id = conn.execute(
+            """INSERT INTO attempts(job_id,attempt_no,candidate,executor,role,
+            selection_mode,status,started_at) VALUES(
+            'PMC-000004',1,'candidate','jules','builder','forced','READY','now')"""
+        ).lastrowid
+    db.complete_acceptance("PMC-000004", int(attempt_id), "final-commit")
+    assert db.get_feature(feature_id)["state"] == "ACCEPTED"
+    assert db.get_feature(feature_id)["integration_commit"] == "final-commit"
+    assert db.get_job("PMC-000001").state == JobState.QUEUED
 
 
 def test_candidate_order_precedes_empirical_routing(tmp_path: Path):

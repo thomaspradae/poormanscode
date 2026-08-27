@@ -4,6 +4,23 @@ PMC already implements the schema/persistence contract, operator CLI, isolated G
 worktrees, deterministic verification, retries with failure evidence, scheduling,
 audit reports, human acceptance, leases, and Bash/OpenHands/Jules adapters.
 
+## Autonomous programs
+
+- [x] A reviewed 2-50 node program DAG can run with an approved concurrency ceiling.
+  Independent ready nodes use ordinary PMC job/resource/provider leases and isolated
+  worktrees.
+- [x] Nonterminal verifier-green jobs become `VERIFIED_FOR_CHAINING` with attributable
+  internal commits while remaining `READY_FOR_REVIEW`; no fake human feedback or
+  `ACCEPTED` state is created.
+- [x] Program creation pins the exact repository SHA. Dependency commits are assembled
+  topologically, and `pmc program-diff` shows the full result from the immutable base.
+- [x] A restartable user-systemd runner supports status, pause/drain, resume after
+  repair, cancel, expired-lease recovery, deadlock detection, and bounded parallelism.
+- [x] A blocked branch halts new dispatch while active siblings drain. Git conflicts
+  block with evidence instead of being guessed through.
+- [x] The single terminal integration task is never internally promoted. Only
+  `pmc program-accept` records human acceptance of the complete program result.
+
 ## Executor policy
 
 - [x] Treat BashExecutor as a narrow executor for small, deterministic work. By

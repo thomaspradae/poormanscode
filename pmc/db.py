@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import asdict
@@ -49,6 +50,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     repo TEXT NOT NULL,
     request TEXT NOT NULL,
     base_branch TEXT NOT NULL,
+    base_commit TEXT,
     priority INTEGER NOT NULL,
     task_type TEXT NOT NULL,
     acceptance_json TEXT NOT NULL,
@@ -235,6 +237,11 @@ CREATE TABLE IF NOT EXISTS features (
     plan_candidate TEXT,
     integration_worktree TEXT,
     integration_commit TEXT,
+    mode TEXT NOT NULL DEFAULT 'HUMAN_GATED',
+    max_workers INTEGER NOT NULL DEFAULT 1,
+    run_owner TEXT,
+    run_lease_expires REAL,
+    last_error TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -245,6 +252,10 @@ CREATE TABLE IF NOT EXISTS feature_tasks (
     job_id TEXT NOT NULL UNIQUE REFERENCES jobs(id),
     position INTEGER NOT NULL,
     depends_json TEXT NOT NULL,
+    verified_commit TEXT,
+    promotion_state TEXT NOT NULL DEFAULT 'WAITING',
+    promoted_at TEXT,
+    is_terminal INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY(feature_id, task_key)
 );
 CREATE INDEX IF NOT EXISTS idx_feature_tasks_job ON feature_tasks(job_id);
@@ -363,6 +374,20 @@ class Database:
             },
             "provider_credentials": {
                 "tokens_reset_at": "REAL",
+            },
+            "features": {
+                "base_commit": "TEXT",
+                "mode": "TEXT NOT NULL DEFAULT 'HUMAN_GATED'",
+                "max_workers": "INTEGER NOT NULL DEFAULT 1",
+                "run_owner": "TEXT",
+                "run_lease_expires": "REAL",
+                "last_error": "TEXT",
+            },
+            "feature_tasks": {
+                "verified_commit": "TEXT",
+                "promotion_state": "TEXT NOT NULL DEFAULT 'WAITING'",
+                "promoted_at": "TEXT",
+                "is_terminal": "INTEGER NOT NULL DEFAULT 0",
             },
         }
         for table, columns in additions.items():
@@ -1901,14 +1926,39 @@ class Database:
         return f"PMCF-{n:06d}"
 
     def create_feature(
-        self, feature_id: str, repo: Path, title: str, request: str, base_branch: str
+        self,
+        feature_id: str,
+        repo: Path,
+        title: str,
+        request: str,
+        base_branch: str,
+        *,
+        base_commit: str | None = None,
+        mode: str = "HUMAN_GATED",
+        max_workers: int = 1,
     ) -> None:
+        if mode not in {"HUMAN_GATED", "AUTONOMOUS_PROGRAM"}:
+            raise ValueError(f"invalid feature mode: {mode}")
+        if not 1 <= max_workers <= 16:
+            raise ValueError("max_workers must be between 1 and 16")
         now = utcnow()
         with self.connect() as conn:
             conn.execute(
-                """INSERT INTO features(id,repo,title,request,base_branch,state,created_at,updated_at)
-                VALUES(?,?,?,?,?,'DRAFT',?,?)""",
-                (feature_id, str(repo), title, request, base_branch, now, now),
+                """INSERT INTO features(id,repo,title,request,base_branch,base_commit,
+                state,mode,max_workers,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,'DRAFT',?,?,?,?)""",
+                (
+                    feature_id,
+                    str(repo),
+                    title,
+                    request,
+                    base_branch,
+                    base_commit,
+                    mode,
+                    max_workers,
+                    now,
+                    now,
+                ),
             )
         self.event(
             "FEATURE_CREATED", payload={"feature_id": feature_id, "title": title}
@@ -1927,6 +1977,11 @@ class Database:
         self, feature_id: str, plan: dict[str, Any], candidate: str | None
     ) -> None:
         with self.connect() as conn:
+            current = conn.execute(
+                "SELECT state FROM features WHERE id=?", (feature_id,)
+            ).fetchone()
+            if not current or current["state"] not in {"DRAFT", "PLANNED"}:
+                raise RuntimeError("approved/running plans are immutable")
             conn.execute(
                 "UPDATE features SET state='PLANNED',plan_json=?,plan_candidate=?,updated_at=? WHERE id=?",
                 (json.dumps(plan), candidate, utcnow(), feature_id),
@@ -1946,6 +2001,7 @@ class Database:
             ).fetchone()
             if not feature or feature["state"] != "PLANNED":
                 raise RuntimeError("feature must be PLANNED before approval")
+            referenced = {dep for _job, _key, _position, deps in jobs for dep in deps}
             for job, task_key, position, depends in jobs:
                 conn.execute(
                     """INSERT INTO jobs
@@ -1969,8 +2025,16 @@ class Database:
                     ),
                 )
                 conn.execute(
-                    "INSERT INTO feature_tasks(feature_id,task_key,job_id,position,depends_json) VALUES(?,?,?,?,?)",
-                    (feature_id, task_key, job.id, position, json.dumps(depends)),
+                    """INSERT INTO feature_tasks(feature_id,task_key,job_id,position,depends_json,is_terminal)
+                    VALUES(?,?,?,?,?,?)""",
+                    (
+                        feature_id,
+                        task_key,
+                        job.id,
+                        position,
+                        json.dumps(depends),
+                        int(task_key not in referenced),
+                    ),
                 )
             conn.execute(
                 "UPDATE features SET state='APPROVED',updated_at=? WHERE id=?",
@@ -2003,18 +2067,202 @@ class Database:
                 )
             )
 
+    def program_terminal_job(self, feature_id: str) -> str:
+        feature = self.get_feature(feature_id)
+        if feature["mode"] != "AUTONOMOUS_PROGRAM":
+            raise RuntimeError(f"{feature_id} is not an autonomous program")
+        with self.connect() as conn:
+            rows = list(
+                conn.execute(
+                    "SELECT job_id FROM feature_tasks WHERE feature_id=? AND is_terminal=1",
+                    (feature_id,),
+                )
+            )
+        if len(rows) != 1:
+            raise RuntimeError(f"{feature_id} must have exactly one terminal task")
+        return str(rows[0]["job_id"])
+
+    def program_ready_jobs(self, feature_id: str, limit: int) -> list[str]:
+        feature = self.get_feature(feature_id)
+        if feature["mode"] != "AUTONOMOUS_PROGRAM":
+            raise RuntimeError(f"{feature_id} is not an autonomous program")
+        if feature["state"] not in {"APPROVED", "RUNNING"}:
+            return []
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT j.id FROM feature_tasks ft
+                JOIN jobs j ON j.id=ft.job_id
+                WHERE ft.feature_id=? AND j.state IN (?,?)
+                AND NOT EXISTS (
+                    SELECT 1 FROM json_each(ft.depends_json) dep
+                    LEFT JOIN feature_tasks required
+                      ON required.feature_id=ft.feature_id AND required.task_key=dep.value
+                    LEFT JOIN jobs required_job ON required_job.id=required.job_id
+                    WHERE required_job.state IS NULL OR (
+                        required_job.state!='ACCEPTED' AND NOT (
+                            required.promotion_state='VERIFIED_FOR_CHAINING'
+                            AND required.verified_commit IS NOT NULL
+                        )
+                    )
+                )
+                ORDER BY j.priority,ft.position LIMIT ?""",
+                (feature_id, JobState.QUEUED.value, JobState.RETRY.value, limit),
+            ).fetchall()
+        return [str(row["id"]) for row in rows]
+
+    def program_inflight_jobs(self, feature_id: str) -> list[str]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT j.id FROM feature_tasks ft JOIN jobs j ON j.id=ft.job_id
+                WHERE ft.feature_id=? AND j.state IN ('RUNNING','VERIFYING','REVIEWING')
+                ORDER BY ft.position""",
+                (feature_id,),
+            ).fetchall()
+        return [str(row["id"]) for row in rows]
+
+    def promote_program_task(self, job_id: str, commit: str) -> bool:
+        """Record a verifier-green internal commit without claiming human acceptance."""
+        now = utcnow()
+        with self.connect() as conn:
+            row = conn.execute(
+                """SELECT ft.feature_id,ft.task_key,ft.is_terminal,ft.promotion_state,
+                j.state,f.mode FROM feature_tasks ft
+                JOIN jobs j ON j.id=ft.job_id
+                JOIN features f ON f.id=ft.feature_id WHERE ft.job_id=?""",
+                (job_id,),
+            ).fetchone()
+            if not row or row["mode"] != "AUTONOMOUS_PROGRAM":
+                raise RuntimeError(f"{job_id} is not an autonomous program task")
+            if row["is_terminal"]:
+                raise RuntimeError("terminal program task must remain human-gated")
+            if row["state"] != JobState.READY.value:
+                raise RuntimeError(f"{job_id} must be READY_FOR_REVIEW before promotion")
+            if row["promotion_state"] == "VERIFIED_FOR_CHAINING":
+                existing = conn.execute(
+                    "SELECT verified_commit FROM feature_tasks WHERE job_id=?",
+                    (job_id,),
+                ).fetchone()["verified_commit"]
+                if existing != commit:
+                    raise RuntimeError("program task was already promoted with another commit")
+                return False
+            conn.execute(
+                """UPDATE feature_tasks SET verified_commit=?,
+                promotion_state='VERIFIED_FOR_CHAINING',promoted_at=? WHERE job_id=?""",
+                (commit, now, job_id),
+            )
+            conn.execute(
+                "UPDATE features SET state='RUNNING',updated_at=? WHERE id=?",
+                (now, row["feature_id"]),
+            )
+        self.event(
+            "PROGRAM_TASK_PROMOTED",
+            job_id=job_id,
+            payload={
+                "feature_id": row["feature_id"],
+                "task_key": row["task_key"],
+                "commit": commit,
+                "meaning": "VERIFIED_FOR_CHAINING_NOT_HUMAN_ACCEPTED",
+            },
+        )
+        return True
+
+    def claim_program_run(self, feature_id: str, owner: str, lease_seconds: int) -> bool:
+        now = time.time()
+        with self.connect() as conn:
+            result = conn.execute(
+                """UPDATE features SET state='RUNNING',run_owner=?,run_lease_expires=?,
+                last_error=NULL,updated_at=? WHERE id=? AND mode='AUTONOMOUS_PROGRAM'
+                AND state IN ('APPROVED','RUNNING')
+                AND (run_owner IS NULL OR run_owner=? OR run_lease_expires<?)""",
+                (owner, now + lease_seconds, utcnow(), feature_id, owner, now),
+            )
+        return result.rowcount == 1
+
+    def heartbeat_program_run(
+        self, feature_id: str, owner: str, lease_seconds: int
+    ) -> bool:
+        with self.connect() as conn:
+            result = conn.execute(
+                """UPDATE features SET run_lease_expires=?,updated_at=?
+                WHERE id=? AND run_owner=? AND state='RUNNING'""",
+                (time.time() + lease_seconds, utcnow(), feature_id, owner),
+            )
+        return result.rowcount == 1
+
+    def release_program_run(
+        self, feature_id: str, owner: str, *, state: str | None = None, error: str | None = None
+    ) -> None:
+        with self.connect() as conn:
+            if state:
+                conn.execute(
+                    """UPDATE features SET state=?,run_owner=NULL,run_lease_expires=NULL,
+                    last_error=?,updated_at=? WHERE id=? AND run_owner=?""",
+                    (state, error, utcnow(), feature_id, owner),
+                )
+            else:
+                conn.execute(
+                    """UPDATE features SET run_owner=NULL,run_lease_expires=NULL,
+                    last_error=?,updated_at=? WHERE id=? AND run_owner=?""",
+                    (error, utcnow(), feature_id, owner),
+                )
+
+    def set_program_state(self, feature_id: str, state: str) -> None:
+        allowed = {"APPROVED", "RUNNING", "PAUSED", "BLOCKED", "CANCELLED"}
+        if state not in allowed:
+            raise ValueError(f"invalid mutable program state: {state}")
+        feature = self.get_feature(feature_id)
+        if feature["mode"] != "AUTONOMOUS_PROGRAM":
+            raise RuntimeError(f"{feature_id} is not an autonomous program")
+        with self.connect() as conn:
+            conn.execute(
+                """UPDATE features SET state=?,run_owner=NULL,run_lease_expires=NULL,
+                updated_at=? WHERE id=?""",
+                (state, utcnow(), feature_id),
+            )
+
+    def refresh_program_state(self, feature_id: str) -> str:
+        feature = self.get_feature(feature_id)
+        if feature["mode"] != "AUTONOMOUS_PROGRAM":
+            return self.refresh_feature_state(feature_id)
+        tasks = self.feature_tasks(feature_id)
+        terminal = [row for row in tasks if row["is_terminal"]]
+        if len(terminal) != 1:
+            return feature["state"]
+        terminal_state = terminal[0]["state"]
+        if terminal_state == JobState.ACCEPTED.value:
+            state = "ACCEPTED"
+        elif terminal_state == JobState.READY.value:
+            state = "READY_FOR_REVIEW"
+        elif any(row["state"] in {JobState.BLOCKED.value, JobState.FAILED.value} for row in tasks):
+            state = "BLOCKED"
+        elif feature["state"] in {"PAUSED", "CANCELLED"}:
+            return str(feature["state"])
+        elif feature["state"] in {"APPROVED", "RUNNING"}:
+            state = str(feature["state"])
+        else:
+            state = "RUNNING"
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE features SET state=?,updated_at=? WHERE id=?",
+                (state, utcnow(), feature_id),
+            )
+        return state
+
     def dependency_commits(self, job_id: str) -> list[str]:
         """Return accepted prerequisite commits in deterministic topological order."""
         with self.connect() as conn:
             current = conn.execute(
-                "SELECT feature_id,depends_json FROM feature_tasks WHERE job_id=?",
+                """SELECT ft.feature_id,ft.depends_json,f.mode
+                FROM feature_tasks ft JOIN features f ON f.id=ft.feature_id
+                WHERE ft.job_id=?""",
                 (job_id,),
             ).fetchone()
             if not current:
                 return []
             rows = list(
                 conn.execute(
-                    """SELECT ft.task_key,ft.depends_json,j.accepted_commit,j.state
+                    """SELECT ft.task_key,ft.depends_json,ft.verified_commit,
+                    ft.promotion_state,j.accepted_commit,j.state
                     FROM feature_tasks ft JOIN jobs j ON j.id=ft.job_id
                     WHERE ft.feature_id=?""",
                     (current["feature_id"],),
@@ -2030,11 +2278,17 @@ class Database:
             row = by_key[key]
             for dep in json.loads(row["depends_json"]):
                 visit(dep)
-            if row["state"] != JobState.ACCEPTED.value or not row["accepted_commit"]:
+            commit = row["accepted_commit"]
+            if current["mode"] == "AUTONOMOUS_PROGRAM":
+                if not commit and row["promotion_state"] == "VERIFIED_FOR_CHAINING":
+                    commit = row["verified_commit"]
+                if not commit:
+                    raise RuntimeError(f"dependency {key} is not verified for chaining")
+            elif row["state"] != JobState.ACCEPTED.value or not commit:
                 raise RuntimeError(f"dependency {key} is not accepted")
             visited.add(key)
-            if row["accepted_commit"] not in ordered:
-                ordered.append(row["accepted_commit"])
+            if commit not in ordered:
+                ordered.append(commit)
 
         for key in json.loads(current["depends_json"]):
             visit(key)
@@ -2046,6 +2300,8 @@ class Database:
 
     def refresh_feature_state(self, feature_id: str) -> str:
         feature = self.get_feature(feature_id)
+        if feature["mode"] == "AUTONOMOUS_PROGRAM":
+            return self.refresh_program_state(feature_id)
         tasks = self.feature_tasks(feature_id)
         if not tasks:
             return feature["state"]
@@ -2180,19 +2436,26 @@ class Database:
                 (JobState.ACCEPTED.value, commit, now, job_id),
             )
             feature = conn.execute(
-                "SELECT feature_id FROM feature_tasks WHERE job_id=?", (job_id,)
+                """SELECT ft.feature_id,ft.is_terminal,f.mode
+                FROM feature_tasks ft JOIN features f ON f.id=ft.feature_id
+                WHERE ft.job_id=?""",
+                (job_id,),
             ).fetchone()
             if feature:
-                remaining = conn.execute(
-                    """SELECT COUNT(*) n FROM feature_tasks ft JOIN jobs j ON j.id=ft.job_id
-                    WHERE ft.feature_id=? AND j.state!='ACCEPTED'""",
-                    (feature["feature_id"],),
-                ).fetchone()["n"]
+                if feature["mode"] == "AUTONOMOUS_PROGRAM":
+                    finished = bool(feature["is_terminal"])
+                else:
+                    remaining = conn.execute(
+                        """SELECT COUNT(*) n FROM feature_tasks ft JOIN jobs j ON j.id=ft.job_id
+                        WHERE ft.feature_id=? AND j.state!='ACCEPTED'""",
+                        (feature["feature_id"],),
+                    ).fetchone()["n"]
+                    finished = not remaining
                 conn.execute(
                     "UPDATE features SET state=?,integration_commit=?,updated_at=? WHERE id=?",
                     (
-                        "ACCEPTED" if not remaining else "RUNNING",
-                        commit if not remaining else None,
+                        "ACCEPTED" if finished else "RUNNING",
+                        commit if finished else None,
                         now,
                         feature["feature_id"],
                     ),
@@ -2243,7 +2506,14 @@ class Database:
                             LEFT JOIN feature_tasks required
                               ON required.feature_id=ft.feature_id AND required.task_key=dep.value
                             LEFT JOIN jobs required_job ON required_job.id=required.job_id
-                            WHERE required_job.state IS NULL OR required_job.state != 'ACCEPTED'
+                            WHERE required_job.state IS NULL OR (
+                                required_job.state != 'ACCEPTED'
+                                AND NOT (
+                                    f.mode='AUTONOMOUS_PROGRAM'
+                                    AND required.promotion_state='VERIFIED_FOR_CHAINING'
+                                    AND required.verified_commit IS NOT NULL
+                                )
+                            )
                         )
                     )
                 )

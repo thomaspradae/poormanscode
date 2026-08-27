@@ -57,6 +57,26 @@ def test_protected_and_secret_scan(tmp_path: Path):
     assert not v.secret_scan_ok
 
 
+def test_no_change_verification_is_narrowly_allowed_for_program_integration(
+    tmp_path: Path,
+):
+    repo = make_repo(tmp_path)
+    baseline = sh(repo, "git rev-parse HEAD").stdout.strip()
+    ordinary = Job("PMC-000010", repo, "inspect", baseline_commit=baseline)
+    assert not verify(ordinary, repo, {"test": "/usr/bin/true"}).ok
+
+    integration = Job(
+        "PMC-000011",
+        repo,
+        "verify integrated program",
+        baseline_commit=baseline,
+        constraints={"allow_no_changes": True},
+    )
+    result = verify(integration, repo, {"test": "/usr/bin/true"})
+    assert result.ok
+    assert result.changed_files == []
+
+
 def test_scheduler_forces_cold_start_then_can_explore(tmp_path: Path):
     db = Database(tmp_path / "pmc.db")
     job = Job("PMC-000001", tmp_path, "fix bug", task_type="BUG_FIX")

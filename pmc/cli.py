@@ -15,7 +15,7 @@ from .classifier import classify
 from .config import DEFAULT_CONFIG, load_config
 from .controller import Controller, LeaseBusy
 from .domain import Job, JobState
-from .foreman import propose_plan, validate_plan
+from .foreman import propose_plan, validate_plan, validate_program_plan
 
 
 def _attempt_duration(attempt) -> float:
@@ -185,6 +185,239 @@ def cmd_feature_create(args) -> int:
     return 0
 
 
+def _require_program(ctl: Controller, feature_id: str):
+    feature = ctl.db.get_feature(feature_id)
+    if feature["mode"] != "AUTONOMOUS_PROGRAM":
+        raise RuntimeError(f"{feature_id} is not an autonomous program")
+    return feature
+
+
+def cmd_program_create(args) -> int:
+    ctl = _controller(args)
+    repo = Path(args.repo).resolve()
+    ensure_repo(repo)
+    spec_path = Path(args.spec).expanduser().resolve()
+    request = spec_path.read_text().strip()
+    if not request:
+        raise RuntimeError("program specification is empty")
+    from .gitops import resolve_commit
+
+    base_commit = resolve_commit(repo, args.base_branch)
+    feature_id = ctl.db.next_feature_id()
+    ctl.db.create_feature(
+        feature_id,
+        repo,
+        args.title,
+        request,
+        args.base_branch,
+        base_commit=base_commit,
+        mode="AUTONOMOUS_PROGRAM",
+        max_workers=args.workers,
+    )
+    ctl.db.event(
+        "PROGRAM_CREATED",
+        payload={
+            "feature_id": feature_id,
+            "spec_path": str(spec_path),
+            "base_commit": base_commit,
+            "max_workers": args.workers,
+        },
+    )
+    print(feature_id)
+    return 0
+
+
+def cmd_program_plan(args) -> int:
+    ctl = _controller(args)
+    feature = _require_program(ctl, args.feature_id)
+    if args.file:
+        plan = validate_program_plan(json.loads(Path(args.file).read_text()))
+        candidate_name = None
+    else:
+        matches = [
+            candidate
+            for candidate in ctl.cfg.candidates
+            if candidate.name == args.candidate and candidate.enabled
+        ]
+        if not matches:
+            raise RuntimeError(
+                f"unknown or disabled Foreman candidate: {args.candidate}"
+            )
+        plan = propose_plan(
+            Path(feature["repo"]),
+            feature["title"],
+            feature["request"],
+            matches[0],
+            program=True,
+        )
+        candidate_name = matches[0].name
+    ctl.db.save_feature_plan(args.feature_id, plan, candidate_name)
+    print(json.dumps(plan, indent=2))
+    print(f"\nReview, then run: pmc program-approve {args.feature_id}")
+    return 0
+
+
+def cmd_program_approve(args) -> int:
+    ctl = _controller(args)
+    feature = _require_program(ctl, args.feature_id)
+    if not feature["plan_json"]:
+        raise RuntimeError("program has no proposed plan")
+    plan = validate_program_plan(json.loads(feature["plan_json"]))
+    result = cmd_feature_approve(args)
+    from .versioning import stable_hash
+
+    ctl.db.event(
+        "PROGRAM_APPROVED",
+        payload={
+            "feature_id": args.feature_id,
+            "plan_hash": stable_hash(plan),
+            "tasks": len(plan["tasks"]),
+            "max_workers": feature["max_workers"],
+        },
+    )
+    return result
+
+
+def cmd_program_run(args) -> int:
+    ctl = _controller(args)
+    feature = _require_program(ctl, args.feature_id)
+    workers = args.workers or int(feature["max_workers"] or 1)
+    if args.detach:
+        if shutil.which("systemd-run") is None:
+            raise RuntimeError("detached program runs require systemd-run")
+        unit = f"pmc-program-{args.feature_id.lower()}"
+        command = [sys.executable, "-m", "pmc.cli"]
+        if args.config:
+            command.extend(["--config", str(Path(args.config).expanduser())])
+        command.extend(
+            [
+                "program-run",
+                args.feature_id,
+                "--workers",
+                str(workers),
+                "--poll-seconds",
+                str(args.poll_seconds),
+            ]
+        )
+        subprocess.run(
+            [
+                "systemd-run",
+                "--user",
+                f"--unit={unit}",
+                "--collect",
+                "--property=Restart=on-failure",
+                "--property=RestartSec=15s",
+                "--",
+                *command,
+            ],
+            check=True,
+        )
+        print(f"STARTED {unit}")
+        print(f"Follow: journalctl --user -fu {unit}")
+        return 0
+    from .program import ProgramRunner
+
+    result = ProgramRunner(
+        ctl.cfg,
+        args.feature_id,
+        workers=workers,
+        poll_seconds=args.poll_seconds,
+    ).run()
+    print(
+        f"{result.state} completed={result.completed_jobs} promoted={result.promoted_jobs}"
+    )
+    # Managed terminal states are not supervisor crashes. In detached mode a
+    # nonzero status would cause systemd's Restart=on-failure to loop forever.
+    return 0
+
+
+def cmd_program_status(args) -> int:
+    ctl = _controller(args)
+    feature = _require_program(ctl, args.feature_id)
+    state = ctl.db.refresh_program_state(args.feature_id)
+    print(
+        f"{feature['id']} [{state}] workers={feature['max_workers']} {feature['title']}"
+    )
+    if feature["last_error"]:
+        print(f"  last_error: {feature['last_error']}")
+    for row in ctl.db.feature_tasks(args.feature_id):
+        deps = ",".join(json.loads(row["depends_json"])) or "-"
+        promotion = row["promotion_state"]
+        terminal = " FINAL" if row["is_terminal"] else ""
+        print(
+            f"  {row['job_id']:<12} {row['task_key']:<24} {row['state']:<18} "
+            f"{promotion:<23} deps={deps}{terminal}"
+        )
+    return 0
+
+
+def cmd_program_diff(args) -> int:
+    ctl = _controller(args)
+    feature = _require_program(ctl, args.feature_id)
+    terminal_id = ctl.db.program_terminal_job(args.feature_id)
+    terminal = ctl.db.get_job(terminal_id)
+    if not terminal.worktree:
+        raise RuntimeError("terminal program worktree does not exist yet")
+    baseline = feature["base_commit"]
+    if not baseline:
+        raise RuntimeError("program has no immutable base commit")
+    from .gitops import git, intent_to_add_untracked
+
+    intent_to_add_untracked(terminal.worktree)
+    sys.stdout.write(git(terminal.worktree, "diff", "--binary", baseline, "--").stdout)
+    return 0
+
+
+def cmd_program_pause(args) -> int:
+    ctl = _controller(args)
+    _require_program(ctl, args.feature_id)
+    ctl.db.set_program_state(args.feature_id, "PAUSED")
+    ctl.db.event("PROGRAM_PAUSED", payload={"feature_id": args.feature_id})
+    print("PAUSED (running jobs will drain safely)")
+    return 0
+
+
+def cmd_program_resume(args) -> int:
+    ctl = _controller(args)
+    feature = _require_program(ctl, args.feature_id)
+    if feature["state"] not in {"PAUSED", "BLOCKED"}:
+        raise RuntimeError(f"cannot resume program in state {feature['state']}")
+    blocked = [
+        row
+        for row in ctl.db.feature_tasks(args.feature_id)
+        if row["state"] in {JobState.BLOCKED.value, JobState.FAILED.value}
+    ]
+    if blocked:
+        jobs = ", ".join(row["job_id"] for row in blocked)
+        raise RuntimeError(f"repair or reject blocked jobs before resuming: {jobs}")
+    ctl.db.set_program_state(args.feature_id, "APPROVED")
+    ctl.db.event("PROGRAM_RESUMED", payload={"feature_id": args.feature_id})
+    print("APPROVED")
+    return 0
+
+
+def cmd_program_cancel(args) -> int:
+    ctl = _controller(args)
+    _require_program(ctl, args.feature_id)
+    ctl.db.set_program_state(args.feature_id, "CANCELLED")
+    for row in ctl.db.feature_tasks(args.feature_id):
+        state = JobState(row["state"])
+        if state in {JobState.QUEUED, JobState.RETRY, JobState.RUNNING}:
+            ctl.cancel(row["job_id"])
+    ctl.db.event("PROGRAM_CANCELLED", payload={"feature_id": args.feature_id})
+    print("CANCELLED")
+    return 0
+
+
+def cmd_program_accept(args) -> int:
+    ctl = _controller(args)
+    _require_program(ctl, args.feature_id)
+    terminal = ctl.db.program_terminal_job(args.feature_id)
+    commit = ctl.accept(terminal, args.message)
+    print(commit)
+    return 0
+
+
 def cmd_feature_plan(args) -> int:
     ctl = _controller(args)
     feature = ctl.db.get_feature(args.feature_id)
@@ -220,22 +453,48 @@ def cmd_feature_approve(args) -> int:
     from .capabilities import infer_required_capabilities, repository_is_skeletal
 
     skeletal = repository_is_skeletal(Path(feature["repo"]))
+    referenced_tasks = {
+        dependency
+        for task in plan["tasks"]
+        for dependency in task.get("depends_on", [])
+    }
     for position, task in enumerate(plan["tasks"]):
+        from .budget import characterize, envelope_for
+
+        task_type = str(task.get("task_type") or classify(task["request"]))
+        inferred_complexity, inferred_risk = characterize(
+            task["request"], task_type, int(task.get("priority", 2))
+        )
+        complexity = str(task.get("complexity") or inferred_complexity)
+        risk = str(task.get("risk") or inferred_risk)
+        constraints = {
+            "_feature_dependencies": list(task.get("depends_on", [])),
+            "_candidate_order": list(task.get("candidate_order", [])),
+            "required_capabilities": infer_required_capabilities(
+                task["request"], skeletal=skeletal and not task.get("depends_on")
+            ),
+        }
+        if (
+            feature["mode"] == "AUTONOMOUS_PROGRAM"
+            and task["id"] not in referenced_tasks
+        ):
+            constraints["allow_no_changes"] = True
         job = Job(
             id=f"PMC-{next_number + position:06d}",
             repo=Path(feature["repo"]),
             request=task["request"],
-            base_branch=feature["base_branch"],
+            base_branch=(
+                feature["base_commit"]
+                if feature["mode"] == "AUTONOMOUS_PROGRAM" and feature["base_commit"]
+                else feature["base_branch"]
+            ),
             priority=int(task.get("priority", 2)),
-            task_type=str(task.get("task_type") or classify(task["request"])),
+            task_type=task_type,
             acceptance=list(task.get("acceptance", [])),
-            constraints={
-                "_feature_dependencies": list(task.get("depends_on", [])),
-                "_candidate_order": list(task.get("candidate_order", [])),
-                "required_capabilities": infer_required_capabilities(
-                    task["request"], skeletal=skeletal and not task.get("depends_on")
-                ),
-            },
+            constraints=constraints,
+            complexity=complexity,
+            risk=risk,
+            budget=envelope_for(complexity, risk, task.get("budget")),
         )
         jobs.append((job, task["id"], position, list(task.get("depends_on", []))))
     by_name = {c.name: c for c in ctl.cfg.candidates if c.enabled}
@@ -1087,6 +1346,60 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("feature-approve")
     s.add_argument("feature_id")
     s.set_defaults(func=cmd_feature_approve)
+
+    s = sub.add_parser(
+        "program-create",
+        help="create a human-approved autonomous program from a specification file",
+    )
+    s.add_argument("repo")
+    s.add_argument("title")
+    s.add_argument("--spec", required=True, help="path to the complete program spec")
+    s.add_argument("--base-branch", default="main")
+    s.add_argument("--workers", type=int, choices=range(1, 17), default=3)
+    s.set_defaults(func=cmd_program_create)
+
+    s = sub.add_parser("program-plan")
+    s.add_argument("feature_id")
+    source = s.add_mutually_exclusive_group(required=True)
+    source.add_argument("--file", help="reviewed JSON dependency plan")
+    source.add_argument("--candidate", help="OpenAI-compatible Foreman candidate")
+    s.set_defaults(func=cmd_program_plan)
+
+    s = sub.add_parser("program-approve")
+    s.add_argument("feature_id")
+    s.set_defaults(func=cmd_program_approve)
+
+    s = sub.add_parser("program-run")
+    s.add_argument("feature_id")
+    s.add_argument("--workers", type=int, choices=range(1, 17))
+    s.add_argument("--poll-seconds", type=float, default=2.0)
+    s.add_argument("--detach", action="store_true")
+    s.set_defaults(func=cmd_program_run)
+
+    s = sub.add_parser("program-status")
+    s.add_argument("feature_id")
+    s.set_defaults(func=cmd_program_status)
+
+    s = sub.add_parser("program-diff")
+    s.add_argument("feature_id")
+    s.set_defaults(func=cmd_program_diff)
+
+    s = sub.add_parser("program-pause")
+    s.add_argument("feature_id")
+    s.set_defaults(func=cmd_program_pause)
+
+    s = sub.add_parser("program-resume")
+    s.add_argument("feature_id")
+    s.set_defaults(func=cmd_program_resume)
+
+    s = sub.add_parser("program-cancel")
+    s.add_argument("feature_id")
+    s.set_defaults(func=cmd_program_cancel)
+
+    s = sub.add_parser("program-accept")
+    s.add_argument("feature_id")
+    s.add_argument("--message")
+    s.set_defaults(func=cmd_program_accept)
 
     s = sub.add_parser("board")
     s.add_argument("feature_id", nargs="?")

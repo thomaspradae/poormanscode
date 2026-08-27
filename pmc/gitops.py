@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import fnmatch
 import os
 import re
-import fnmatch
 import shutil
 import subprocess
 from pathlib import Path
@@ -150,17 +150,24 @@ class WorktreeManager:
         if p.returncode != 0:
             raise GitError(f"Could not apply executor patch:\n{p.stderr.strip()}")
 
-    def commit(self, worktree: Path, message: str) -> str:
+    def commit(self, worktree: Path, message: str, *, allow_empty: bool = False) -> str:
         git(worktree, "add", "-A")
-        if not git(worktree, "diff", "--cached", "--quiet", check=False).returncode:
+        if (
+            not allow_empty
+            and not git(worktree, "diff", "--cached", "--quiet", check=False).returncode
+        ):
             raise GitError("There are no changes to commit")
         env = os.environ.copy()
         env.setdefault("GIT_AUTHOR_NAME", "Poor Man's Code")
         env.setdefault("GIT_AUTHOR_EMAIL", "pmc@localhost")
         env.setdefault("GIT_COMMITTER_NAME", env["GIT_AUTHOR_NAME"])
         env.setdefault("GIT_COMMITTER_EMAIL", env["GIT_AUTHOR_EMAIL"])
+        command = ["git", "-C", str(worktree), "commit"]
+        if allow_empty:
+            command.append("--allow-empty")
+        command.extend(["-m", message])
         p = subprocess.run(
-            ["git", "-C", str(worktree), "commit", "-m", message],
+            command,
             text=True,
             capture_output=True,
             env=env,
@@ -170,7 +177,13 @@ class WorktreeManager:
         return resolve_commit(worktree, "HEAD")
 
     def commit_idempotent(
-        self, worktree: Path, baseline: str, message: str, job_id: str
+        self,
+        worktree: Path,
+        baseline: str,
+        message: str,
+        job_id: str,
+        *,
+        allow_empty: bool = False,
     ) -> str:
         """Return a prior PMC commit after a crash instead of creating a duplicate."""
         head = resolve_commit(worktree, "HEAD")
@@ -180,7 +193,7 @@ class WorktreeManager:
         if head != baseline and clean and marker in subject_body:
             return head
         full_message = message if marker in message else f"{message}\n\n{marker}"
-        return self.commit(worktree, full_message)
+        return self.commit(worktree, full_message, allow_empty=allow_empty)
 
     def destroy(self, repo: Path, worktree: Path, force: bool = False) -> None:
         args = ["worktree", "remove"]
