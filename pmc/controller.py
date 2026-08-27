@@ -181,6 +181,28 @@ class Controller:
                 result = git(wt, "cherry-pick", commit, check=False)
                 if result.returncode != 0:
                     git(wt, "cherry-pick", "--abort", check=False)
+                    # A verified checkpoint may have been created from the
+                    # original baseline while an earlier dependency added a
+                    # narrow follow-up fix. Preserve the current dependency
+                    # on overlapping hunks, then apply non-conflicting files.
+                    parent = git(wt, "rev-parse", f"{commit}^", check=False)
+                    parent_is_ancestor = (
+                        parent.returncode == 0
+                        and git(
+                            wt,
+                            "merge-base",
+                            "--is-ancestor",
+                            parent.stdout.strip(),
+                            "HEAD",
+                            check=False,
+                        ).returncode
+                        == 0
+                    )
+                    if parent_is_ancestor:
+                        retry = git(wt, "cherry-pick", "-X", "ours", commit, check=False)
+                        if retry.returncode == 0:
+                            continue
+                        git(wt, "cherry-pick", "--abort", check=False)
                     raise RuntimeError(
                         f"dependency integration conflict at {commit}: {result.stderr.strip()}"
                     )
