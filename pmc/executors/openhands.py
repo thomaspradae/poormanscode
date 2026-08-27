@@ -78,7 +78,22 @@ def _controller_gateway_host(configured: Any) -> str | None:
         check=False,
     )
     match = re.search(r"\binet\s+(100\.\d+\.\d+\.\d+)/", proc.stdout)
-    return match.group(1) if match else None
+    if match:
+        return match.group(1)
+    # Userspace-networking deployments can have a healthy Tailscale daemon and
+    # no kernel tailscale0 interface. The CLI remains the authoritative source.
+    cli = subprocess.run(
+        ["tailscale", "ip", "-4"],
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+    address = next(
+        (line.strip() for line in cli.stdout.splitlines() if line.startswith("100.")),
+        "",
+    )
+    return address or None
 
 
 def _provider_failure(exc: Exception) -> tuple[Outcome, int | None, dict[str, str]]:

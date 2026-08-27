@@ -8,7 +8,27 @@ from pmc.db import Database
 from pmc.domain import Candidate, ExecutionRequest, ExecutionResult, Job, Outcome
 from pmc.executors import build_executor
 from pmc.executors.jules import JulesExecutor
-from pmc.executors.openhands import OpenHandsExecutor, _provider_failure
+from pmc.executors.openhands import (
+    OpenHandsExecutor,
+    _controller_gateway_host,
+    _provider_failure,
+)
+
+
+def test_gateway_host_falls_back_to_tailscale_cli_without_kernel_interface(
+    monkeypatch,
+):
+    replies = iter(
+        [
+            SimpleNamespace(stdout="", returncode=1),
+            SimpleNamespace(stdout="100.126.65.34\n", returncode=0),
+        ]
+    )
+    monkeypatch.setattr(
+        "pmc.executors.openhands.subprocess.run", lambda *a, **k: next(replies)
+    )
+
+    assert _controller_gateway_host("tailscale") == "100.126.65.34"
 
 
 def test_all_registered_executors_share_result_contract():
