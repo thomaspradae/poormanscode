@@ -112,7 +112,10 @@ class Scheduler:
             provider_ok, provider_reason = self.db.provider_availability(c.provider)
             if not provider_ok:
                 return Availability(False, provider_reason)
-        if self.require_model_conformance:
+        # Jules is a provider-hosted executor: its tool/runtime conformance is
+        # validated by the Jules API path, not by the OpenHands coding ladder.
+        # Keep the strict gate for local/OpenHands model candidates.
+        if self.require_model_conformance and c.executor != "jules":
             conformance = self.db.model_conformance(c)
             if not conformance:
                 return Availability(False, "model conformance unknown")
