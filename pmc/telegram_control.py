@@ -229,13 +229,14 @@ class Controller:
         handled = 0
         for update in updates:
             update_id = int(update["update_id"])
-            self.store.set_meta("telegram_offset", str(update_id + 1))
             message = update.get("message") or {}
             chat = message.get("chat") or {}
             if str(chat.get("id")) != self.telegram.chat_id:
+                self.store.set_meta("telegram_offset", str(update_id + 1))
                 continue
             text = str(message.get("text") or "")
             if not text or self.store.seen(update_id):
+                self.store.set_meta("telegram_offset", str(update_id + 1))
                 continue
             self.store.record_update(update_id, text)
             try:
@@ -243,6 +244,9 @@ class Controller:
             except Exception as exc:  # report, but keep the queue moving
                 result = f"Operator error: {type(exc).__name__}: {exc}"
             self.store.finish_update(update_id, result)
+            # Advance only after durable completion. A process death before this
+            # point re-delivers the update instead of silently dropping it.
+            self.store.set_meta("telegram_offset", str(update_id + 1))
             self.telegram.send(result)
             handled += 1
         return handled

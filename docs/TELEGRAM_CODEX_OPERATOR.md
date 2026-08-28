@@ -51,9 +51,11 @@ Run exactly one active controller. The primary is `uace-ofi-01`; install
 failed primary checks before starting its local controller and steps aside
 again when the primary is healthy.
 
-Before a planned handoff, copy the SQLite database from the active runner to
-the standby while its controller is stopped. The database contains processed
-Telegram update IDs and the selected conversation.
+The standby synchronizes only the processed Telegram update high-water mark
+from the primary. It deliberately keeps its own Codex conversation registry:
+Codex rollouts are host-local, so copying a primary thread ID to another host
+does not make it resumable there. The recovery thread receives the durable
+repository state and `OPERATOR_LEDGER.md` instead.
 
 This is an *automatic cold standby*, not a consensus cluster: a severe network
 partition could briefly make both hosts think the other is down. For strict

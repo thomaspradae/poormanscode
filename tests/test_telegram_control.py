@@ -42,6 +42,7 @@ def test_controller_selects_and_delivers_without_replaying_updates(tmp_path: Pat
     assert delivered[0][1] == "check the build"
     assert any(first.alias in message for message in telegram.sent)
     assert telegram.sent[-1] == "done"
+    assert store.get_meta("telegram_offset") == "4"
 
 
 def test_runner_prefers_the_standalone_codex_location(monkeypatch, tmp_path: Path):
