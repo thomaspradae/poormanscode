@@ -30,6 +30,33 @@ notify() {
 }
 
 last_signature=""
+block_luna_uses=0
+block_terra_used=0
+if [[ -s "$STATE_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$STATE_FILE"
+fi
+
+save_block_state() {
+  umask 077
+  {
+    printf 'last_signature=%q\n' "$last_signature"
+    printf 'block_luna_uses=%q\n' "$block_luna_uses"
+    printf 'block_terra_used=%q\n' "$block_terra_used"
+  } >"$STATE_FILE"
+}
+
+intervene() {
+  local model="$1"
+  local label="$2"
+  local prompt="$3"
+  local result
+  result="$(codex exec -m "$model" -c 'model_reasoning_effort="low"' --approve-for-me \
+    -C "$PMC_DIR" "$prompt" 2>&1 || true)"
+  printf '%s\n' "$result" >>"$LOG"
+  notify "$label:\n$(printf '%s' "$result" | tail -20)"
+}
+
 healthy_cycles=0
 while true; do
   status="$(env HOME=/home/t XDG_RUNTIME_DIR=/run/user/1000 "$PMC_BIN" --config "$CFG" program-status "$PROGRAM" 2>&1 || true)"
@@ -43,12 +70,23 @@ while true; do
     healthy_cycles=0
     if [[ "$signature" != "$last_signature" ]]; then
       notify "PMC blocked: $detail\nLuna is investigating."
-      diagnosis="$(codex exec -m gpt-5.6-luna --approve-for-me \
-        -C "$PMC_DIR" \
-        "You are the overnight PMC operator. Inspect only this new PMC block in $PROGRAM: $detail. The PMC database/configuration is under /home/t; use --approve-for-me escalation if needed to read it. Read the Football V0 specification and relevant PMC worktrees/logs. Fix only clear orchestration or code defects in the isolated task worktree; run relevant verification. Do not delete work, force-push, or accept final program output. Return a concise diagnosis and exact next action." 2>&1 || true)"
-      printf '%s\n' "$diagnosis" >>"$LOG"
-      notify "Luna intervention result:\n$(printf '%s' "$diagnosis" | tail -20)"
       last_signature="$signature"
+      block_luna_uses=0
+      block_terra_used=0
+    fi
+    if (( block_luna_uses < 2 )); then
+      block_luna_uses=$((block_luna_uses + 1))
+      save_block_state
+      intervene "gpt-5.6-luna" "Luna block repair ${block_luna_uses}/2" \
+        "You are the overnight PMC operator. Inspect only this PMC block in $PROGRAM: $detail. The PMC database/configuration is under /home/t; use --approve-for-me escalation if needed to read it. Read the Football V0 specification and relevant PMC worktrees/logs. For the active task, obtain the live Jules session with exactly: sqlite3 /home/t/.local/share/poormans-code/pmc.db \"SELECT id,attempt_no,status,provider_request_id FROM attempts WHERE job_id='${active_job:-UNKNOWN}' ORDER BY id DESC LIMIT 1;\". Query that provider session only if an ID exists, without printing secrets. Fix only clear orchestration or code defects in the isolated task worktree; run relevant verification; preserve/checkpoint useful work and resume if repaired. Do not delete work, force-push, or accept final program output. Return a concise diagnosis and exact next action."
+    elif (( block_terra_used == 0 )); then
+      block_terra_used=1
+      save_block_state
+      notify "Two Luna repairs did not clear this block. Terra is taking one bounded pass."
+      intervene "gpt-5.6-terra" "Terra escalation result" \
+        "You are the senior Football World Lab operator. Two Luna-low repair attempts did not clear this exact PMC block in $PROGRAM: $detail. Inspect the active task, PMC state, live Jules session (use attempts.provider_request_id, not provider_session_id), worktree, and the V0 checklist. Take one bounded, evidence-based repair pass: fix clear orchestration/code defects, preserve/checkpoint useful work, verify, and resume if possible. Do not discard work, force-push, or accept final program output. Return diagnosis, actions taken, and exact remaining blocker."
+    else
+      notify "PMC remains blocked after two Luna repairs and one Terra escalation: $detail\nManual review is now required."
     fi
   else
     healthy_cycles=$((healthy_cycles + 1))
@@ -61,10 +99,13 @@ while true; do
     # football task merely because it wants a different implementation.
     audit="$(codex exec -m gpt-5.6-luna -c 'model_reasoning_effort="low"' --approve-for-me \
       -C "$PMC_DIR" \
-      "You are the Football World Lab watchdog. $PROGRAM status is: ${first}. The active task is ${active_job:-NONE}. Inspect only that task if one is named; if NONE, inspect only $PROGRAM feature_tasks and identify the single nonterminal task in RUNNING/VERIFYING/REVIEWING state. Never inspect or invent a different historical PMC job ID. If it is a Jules attempt, read its latest attempt/session ID and query its provider state using the configured credential without printing secrets. At most four terminal commands. If the provider says terminal/AWAITING_USER_FEEDBACK while PMC says running, fix the narrow PMC/Jules handoff, preserve/checkpoint work, and resume. Otherwise return a <=100-word checklist/progress audit. You may commit/push PMC orchestration fixes for this Football-only experiment, but do not discard task work or force-push." 2>&1 || true)"
+      "You are the Football World Lab watchdog. $PROGRAM status is: ${first}. The active task is ${active_job:-NONE}. Inspect only that task if one is named; if NONE, inspect only $PROGRAM feature_tasks and identify the single nonterminal task in RUNNING/VERIFYING/REVIEWING state. Never inspect or invent a different historical PMC job ID. If it is a Jules attempt, retrieve it with: sqlite3 /home/t/.local/share/poormans-code/pmc.db \"SELECT id,attempt_no,status,provider_request_id FROM attempts WHERE job_id='${active_job:-UNKNOWN}' ORDER BY id DESC LIMIT 1;\". The session ID is provider_request_id; provider_session_id is not a column. Query provider state only if that ID exists, without printing secrets. At most four terminal commands. If provider says terminal/AWAITING_USER_FEEDBACK while PMC says running, fix the narrow PMC/Jules handoff, preserve/checkpoint work, and resume. Otherwise return a <=100-word checklist/progress audit. You may commit/push PMC orchestration fixes for this Football-only experiment, but do not discard task work or force-push." 2>&1 || true)"
     printf '%s\n' "$audit" >>"$LOG"
     notify "Luna 30-minute football audit:\n$(printf '%s' "$audit" | tail -20)"
     last_signature=""
+    block_luna_uses=0
+    block_terra_used=0
+    save_block_state
   fi
   sleep "$INTERVAL_SECONDS"
 done
