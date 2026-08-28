@@ -37,7 +37,7 @@ while true; do
     healthy_cycles=0
     if [[ "$signature" != "$last_signature" ]]; then
       notify "PMC blocked: $detail\nLuna is investigating."
-      diagnosis="$(codex exec -m gpt-5.6-luna -s workspace-write --ask-for-approval never \
+      diagnosis="$(codex exec -m gpt-5.6-luna -s workspace-write --approve-for-me \
         -C /home/t/football-game \
         "You are the overnight PMC operator. Inspect only this new PMC block: $detail. Read docs/FOOTBALL_WORLD_LAB_V0.md and relevant PMC worktrees/logs. Fix only clear orchestration or code defects in the isolated task worktree; run relevant verification. Do not delete work, force-push, or accept final program output. Return a concise diagnosis and exact next action." 2>&1 || true)"
       printf '%s\n' "$diagnosis" >>"$LOG"
@@ -48,7 +48,7 @@ while true; do
     healthy_cycles=$((healthy_cycles + 1))
     notify "PMC hourly update:\n$first\n$(printf '%s' "$status" | tail -5)"
     if (( healthy_cycles % 4 == 0 )); then
-      audit="$(codex exec -m gpt-5.6-luna -s read-only --ask-for-approval never \
+      audit="$(codex exec -m gpt-5.6-luna -s read-only \
         -C /home/t/football-game \
         "Perform a concise progress audit for Football World Lab. Read docs/FOOTBALL_WORLD_LAB_V0.md, current program status, and recent verified work. Report whether current work is aligned with the checklist, one concrete risk, and the next milestone. Do not edit files." 2>&1 || true)"
       printf '%s\n' "$audit" >>"$LOG"
