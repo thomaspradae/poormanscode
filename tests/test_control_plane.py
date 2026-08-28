@@ -22,6 +22,22 @@ def test_shared_resource_group_blocks_second_candidate(tmp_path: Path):
     assert "potato" in availability.reason
 
 
+def test_football_provider_evidenced_jules_quota_ignores_local_attempt_rows(tmp_path: Path):
+    db = Database(tmp_path / "db.sqlite")
+    db.create_job(Job("PMC-000001", tmp_path, "task"))
+    jules = Candidate(
+        name="jules", executor="jules", quota_attempts=1, quota_window_seconds=86_400
+    )
+    db.begin_attempt("PMC-000001", 1, jules, "forced", 0)
+    job = Job(
+        "PMC-000002",
+        tmp_path,
+        "Football-only task",
+        constraints={"provider_evidenced_jules_quota": True},
+    )
+    assert Scheduler(db, 0.2, 1).available(jules, [jules], job).ok
+
+
 def test_quantitative_resource_reservations(tmp_path: Path):
     db = Database(tmp_path / "db.sqlite")
     for n in (1, 2, 3):

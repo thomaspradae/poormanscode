@@ -104,7 +104,10 @@ class Scheduler:
         )
 
     def available(
-        self, c: Candidate, universe: list[Candidate] | None = None
+        self,
+        c: Candidate,
+        universe: list[Candidate] | None = None,
+        job: Job | None = None,
     ) -> Availability:
         if not c.enabled:
             return Availability(False, "disabled")
@@ -151,7 +154,16 @@ class Scheduler:
             if c.quota_group
             else [c.name]
         )
-        if c.quota_attempts is not None and c.quota_window_seconds is not None:
+        provider_evidenced_jules_quota = bool(
+            job
+            and c.executor == "jules"
+            and job.constraints.get("provider_evidenced_jules_quota", False)
+        )
+        if (
+            c.quota_attempts is not None
+            and c.quota_window_seconds is not None
+            and not provider_evidenced_jules_quota
+        ):
             used = self.db.attempts_many_in_window(quota_names, c.quota_window_seconds)
             if used >= c.quota_attempts:
                 return Availability(False, "rolling attempt quota exhausted")
@@ -234,7 +246,7 @@ class Scheduler:
             if c.name in exclude:
                 unavailable[c.name] = "excluded by retry policy"
                 continue
-            availability = self.available(c, candidates)
+            availability = self.available(c, candidates, job)
             if not availability.ok:
                 unavailable[c.name] = availability.reason
             elif self.capability_registry and self.capability_registry.missing(job, c):
