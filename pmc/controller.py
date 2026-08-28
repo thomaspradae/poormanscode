@@ -1099,8 +1099,10 @@ class Controller:
 
             automatic_review = intelligence_plan.reviewers > 0
             if (
-                self.cfg.review_enabled or automatic_review
-            ) and job.budget.max_reviews > 0:
+                not job.constraints.get("skip_model_review", False)
+                and (self.cfg.review_enabled or automatic_review)
+                and job.budget.max_reviews > 0
+            ):
                 self.db.set_state(job.id, JobState.REVIEWING)
                 reviewer_pool = [
                     c
