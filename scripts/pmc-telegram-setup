@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_DIR="/home/t/.config/poormans-code"
+SECRETS_FILE="$CONFIG_DIR/telegram.env"
+
+mkdir -p "$CONFIG_DIR"
+umask 077
+
+read -r -s -p "Telegram bot token: " BOT_TOKEN
+printf "\n"
+read -r -p "Telegram chat ID: " CHAT_ID
+
+if [[ -z "$BOT_TOKEN" || -z "$CHAT_ID" ]]; then
+  echo "Bot token and chat ID are both required." >&2
+  exit 1
+fi
+
+printf 'TELEGRAM_BOT_TOKEN=%q\nTELEGRAM_CHAT_ID=%q\n' "$BOT_TOKEN" "$CHAT_ID" >"$SECRETS_FILE"
+chmod 600 "$SECRETS_FILE"
+
+curl --fail --silent --show-error --max-time 15 \
+  -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+  --data-urlencode "chat_id=$CHAT_ID" \
+  --data-urlencode "text=PMC Telegram notifications configured." >/dev/null
+
+echo "Saved $SECRETS_FILE (mode 600) and sent a test message."
+

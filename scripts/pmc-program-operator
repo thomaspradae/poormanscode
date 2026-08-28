@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROGRAM="${1:-PMCF-000006}"
+PMC_DIR="/home/t/poormans-hpc/poormanscode"
+PMC_BIN="$PMC_DIR/.venv/bin/pmc"
+CFG="/home/t/.config/poormans-code/config.toml"
+SECRETS="/home/t/.config/poormans-code/telegram.env"
+STATE_DIR="/home/t/.local/share/poormans-code"
+STATE_FILE="$STATE_DIR/$PROGRAM-operator-state"
+LOG="$STATE_DIR/$PROGRAM-operator.log"
+INTERVAL_SECONDS=3600
+
+test -r "$SECRETS" || { echo "Missing $SECRETS. Run pmc-telegram-setup first." >&2; exit 1; }
+# shellcheck disable=SC1090
+source "$SECRETS"
+mkdir -p "$STATE_DIR"
+touch "$STATE_FILE"
+
+notify() {
+  curl --silent --show-error --max-time 20 -X POST \
+    "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
+    --data-urlencode "chat_id=$TELEGRAM_CHAT_ID" \
+    --data-urlencode "text=$1" >/dev/null || true
+}
+
+last_signature=""
+while true; do
+  status="$(env HOME=/home/t XDG_RUNTIME_DIR=/run/user/1000 "$PMC_BIN" --config "$CFG" program-status "$PROGRAM" 2>&1 || true)"
+  first="$(printf '%s' "$status" | head -1)"
+  detail="$(printf '%s' "$status" | sed -n 's/.*last_error: //p' | head -1)"
+  signature="$(printf '%s\n%s' "$first" "$detail" | sha256sum | cut -d' ' -f1)"
+  printf '[%s] %s\n' "$(date -Is)" "$first" >>"$LOG"
+
+  if printf '%s' "$status" | grep -q '\[BLOCKED\]'; then
+    if [[ "$signature" != "$last_signature" ]]; then
+      notify "PMC blocked: $detail\nLuna is investigating."
+      diagnosis="$(codex exec -m gpt-5.6-luna -s workspace-write --ask-for-approval never \
+        -C /home/t/football-game \
+        "You are the overnight PMC operator. Inspect only this new PMC block: $detail. Read docs/FOOTBALL_WORLD_LAB_V0.md and relevant PMC worktrees/logs. Fix only clear orchestration or code defects in the isolated task worktree; run relevant verification. Do not delete work, force-push, or accept final program output. Return a concise diagnosis and exact next action." 2>&1 || true)"
+      printf '%s\n' "$diagnosis" >>"$LOG"
+      notify "Luna intervention result:\n$(printf '%s' "$diagnosis" | tail -20)"
+      last_signature="$signature"
+    fi
+  else
+    notify "PMC hourly update:\n$first\n$(printf '%s' "$status" | tail -5)"
+    last_signature=""
+  fi
+  sleep "$INTERVAL_SECONDS"
+done
+
