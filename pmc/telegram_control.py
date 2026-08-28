@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -248,6 +249,12 @@ class Controller:
 
 
 def codex_runner(model: str) -> Callable[[Conversation, str], str]:
+    # User services intentionally start with a small PATH. Prefer the
+    # standalone runner installation, then allow an explicit override.
+    codex_binary = os.environ.get("CODEX_BIN") or str(Path.home() / ".local" / "bin" / "codex")
+    if not Path(codex_binary).is_file():
+        codex_binary = shutil.which("codex") or codex_binary
+
     def run(item: Conversation, message: str) -> str:
         prompt = (
             "You are the Football World Lab operator. This message arrived via the owner's Telegram bot. "
@@ -258,7 +265,7 @@ def codex_runner(model: str) -> Callable[[Conversation, str], str]:
         # resume deliberately preserves the named Codex conversation. Approval policy is the
         # configuration equivalent of --approve-for-me, which the resume subcommand does not expose.
         command = [
-            "codex", "exec", "resume", "-m", model,
+            codex_binary, "exec", "resume", "-m", model,
             "-c", 'approval_policy="on-request_auto_review"',
             "-c", 'sandbox_mode="workspace-write"',
             item.thread_id, prompt,
