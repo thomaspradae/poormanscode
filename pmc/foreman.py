@@ -99,7 +99,47 @@ def validate_program_plan(plan: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(
                 f"program task {task['id']} requires explicit verification acceptance"
             )
-    return {"version": 2, "kind": "program", "tasks": tasks}
+
+    # Long specifications often get silently reduced to a handful of vague
+    # tickets.  A checklist-backed plan makes that reduction visible and
+    # rejects plans that leave source requirements orphaned.  It is opt-in so
+    # existing generic programs remain compatible.
+    checklist = plan.get("checklist")
+    if checklist is not None:
+        if not isinstance(checklist, list) or not checklist or not all(
+            isinstance(item, str) and item.strip() for item in checklist
+        ):
+            raise ValueError("program checklist must be a non-empty list of item IDs")
+        if len(set(checklist)) != len(checklist):
+            raise ValueError("program checklist contains duplicate item IDs")
+        known = set(checklist)
+        covered: set[str] = set()
+        for task in tasks:
+            items = task.get("checklist_items")
+            if not isinstance(items, list) or not items or not all(
+                isinstance(item, str) for item in items
+            ):
+                raise ValueError(
+                    f"program task {task['id']} requires checklist_items"
+                )
+            unknown = set(items) - known
+            if unknown:
+                raise ValueError(
+                    f"program task {task['id']} references unknown checklist items: "
+                    f"{sorted(unknown)}"
+                )
+            covered.update(items)
+        missing = known - covered
+        if missing:
+            raise ValueError(
+                f"program plan leaves checklist items uncovered: {sorted(missing)}"
+            )
+    return {
+        "version": 3 if checklist is not None else 2,
+        "kind": "program",
+        "checklist": checklist,
+        "tasks": tasks,
+    }
 
 
 def _json_object(text: str) -> dict[str, Any]:

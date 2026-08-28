@@ -1,0 +1,126 @@
+{
+  "checklist": [
+    "scope-and-truthful-docs", "build-and-test-workflow", "historical-ingestion", "domain-model", "provenance", "calibration", "economy", "synthetic-people", "relationships-memory-beliefs", "perception-attention-actions-learning", "clock-events-effects", "match-simulation", "competitions", "season-loop", "careers-youth-transfers-managers", "salience-threads", "persistence", "cli-inspector", "diagnostics-emergence", "monte-carlo-final-report", "determinism-invariants", "definition-of-done-audit"
+  ],
+  "tasks": [
+    {
+      "id": "baseline-repair",
+      "request": "Start from the existing Football World Lab checkpoint. Inspect docs/FOOTBALL_WORLD_LAB_V0.md, TASKS.md, PROGRESS.md and all current source. Repair the current runnable baseline before adding features: dotnet test must pass using the documented SDK/runtime policy; `simulate --years 1 --seed 42` must execute actual matches and save/reload without the StableId JSON dictionary-key crash. Add a regression test for that failure. Do not claim any unimplemented V0 subsystem complete. Update TASKS.md and PROGRESS.md only with evidence-backed status.",
+      "acceptance": ["dotnet test passes", "one-year simulation produces matches", "save/reload regression test passes", "docs distinguish implemented baseline from remaining work"],
+      "checklist_items": ["scope-and-truthful-docs", "build-and-test-workflow", "persistence"],
+      "depends_on": [], "task_type": "FEATURE", "complexity": "DIFFICULT", "risk": "HIGH", "budget": "high-risk", "priority": 1, "candidate_order": ["jules"]
+    },
+    {
+      "id": "historical-ingestion",
+      "request": "Implement reproducible historical ingestion for openfootball South America results covering Colombia, Argentina, Brazil, and Copa Libertadores. Add source manifest/license/retrieval/checksum handling, alias normalization, canonical output, duplicate/impossible-score/unresolved-club validation, and a coverage report. Keep raw downloads out of git and clearly label observed data.",
+      "acceptance": ["ingestion can run reproducibly from documented public source", "coverage report includes all four environments and gaps", "validation tests cover duplicates impossible scores and unresolved clubs", "observed data is distinct from synthetic data"],
+      "checklist_items": ["historical-ingestion"],
+      "depends_on": ["baseline-repair"], "task_type": "FEATURE", "complexity": "DIFFICULT", "risk": "MEDIUM", "budget": "difficult", "priority": 1, "candidate_order": ["jules"]
+    },
+    {
+      "id": "domain-provenance",
+      "request": "Complete the canonical domain model and provenance infrastructure. Ensure stable IDs and source metadata for Country, City, Club, Competition, Season, Match, Person, Player, Manager, SquadMembership and Contract. Implement immutable versioned events, effects carrying source event/rule IDs, StateContribution ledger, deterministic query API, and a CLI-level `why` foundation with tests spanning years of simulated time.",
+      "acceptance": ["all listed entities have stable IDs and tests", "important scalar changes record queryable StateContribution provenance", "event/effect origin is serializable and versioned", "why query returns contributors in deterministic order"],
+      "checklist_items": ["domain-model", "provenance"],
+      "depends_on": ["historical-ingestion"], "task_type": "ARCHITECTURAL", "complexity": "DIFFICULT", "risk": "HIGH", "budget": "high-risk", "priority": 1, "candidate_order": ["jules"]
+    },
+    {
+      "id": "calibration-economy",
+      "request": "Implement deterministic historical club calibration and bounded synthetic economy. Build tested configurable Elo with home advantage, K factor and seasonal regression; derive strength separately from domestic/continental/overall prestige, trajectory, volatility and expectations/surprise. Add inspectable finances, revenue, cash, wage/transfer budgets, academy/scouting investment, continental revenue and player sales, with long-run bounds/invariants.",
+      "acceptance": ["tiny known Elo tests pass", "strength and prestige are separately tested", "calibration consumes canonical historical output", "30-year economy stress test has no NaN/infinite/exploding values or impossible spending"],
+      "checklist_items": ["calibration", "economy"],
+      "depends_on": ["domain-provenance"], "task_type": "FEATURE", "complexity": "DIFFICULT", "risk": "HIGH", "budget": "high-risk", "priority": 1, "candidate_order": ["jules"]
+    },
+    {
+      "id": "people-generation",
+      "request": "Create deterministic synthetic player and manager population generation. Model compact position-aware attributes, ability/potential, contracts/career state, personality, drives and dynamic state; managers need ability, reputation, ambitions and tactical/preferences/career state. Centralize tunable distributions and add reproducibility/range/population tests. Do not use real rosters as canonical input.",
+      "acceptance": ["Colombia Argentina and Brazil worlds receive viable synthetic squads and managers", "same seed produces the same people", "attributes and psychological values remain bounded", "position variation and manager state have unit tests"],
+      "checklist_items": ["synthetic-people"],
+      "depends_on": ["calibration-economy"], "task_type": "FEATURE", "complexity": "DIFFICULT", "risk": "MEDIUM", "budget": "difficult", "priority": 1, "candidate_order": ["jules"]
+    },
+    {
+      "id": "social-state",
+      "request": "Implement sparse first-class relationships, decaying/reinforcing memories, and non-omniscient beliefs. Relationships include trust, affection, respect, rivalry, familiarity and influence. Memories have ownership, subjects, valence, importance and deterministic retrieval. Beliefs include estimate/confidence/evidence. Add a test proving two actors form different beliefs from the same event due to prior evidence.",
+      "acceptance": ["relationship changes result from shared events", "memory decay and reinforcement are analytically tested", "beliefs differ from objective truth", "belief divergence test passes"],
+      "checklist_items": ["relationships-memory-beliefs"],
+      "depends_on": ["people-generation"], "task_type": "FEATURE", "complexity": "DIFFICULT", "risk": "MEDIUM", "budget": "difficult", "priority": 1, "candidate_order": ["jules"]
+    },
+    {
+      "id": "actor-decisions",
+      "request": "Implement bounded perception/attention, explainable utility action arbitration, and simple learned associations. Actors must not process every event. Implement V0 actions such as train, talk to manager/agent, seek transfer, accept situation and support/mentor. Utilities must expose contributors; learning must be gradual, inspectable and seed-deterministic.",
+      "acceptance": ["perception filters events by relevance", "action output exposes utilities and contributors", "seeded action choices are reproducible", "association update/decay tests pass", "low/high utility behavior is statistically tested"],
+      "checklist_items": ["perception-attention-actions-learning"],
+      "depends_on": ["social-state"], "task_type": "FEATURE", "complexity": "DIFFICULT", "risk": "MEDIUM", "budget": "difficult", "priority": 1, "candidate_order": ["jules"]
+    },
+    {
+      "id": "time-events-effects",
+      "request": "Complete deterministic time and the typed event/rule/effect pipeline. Implement day/week/season hooks, scheduling, immutable Match/Goal/Trophy/transfer/playing-time/injury/manager/youth/retirement/finance event types, modular rules, and instant/decaying/persistent/memory/scheduled effects. All effects must retain provenance and values must stay bounded.",
+      "acceptance": ["clock ordering and scheduled events are deterministic", "all required event families serialize/replay", "effect lifecycle tests cover each temporal type", "events never move backward and effects preserve provenance"],
+      "checklist_items": ["clock-events-effects"],
+      "depends_on": ["actor-decisions"], "task_type": "ARCHITECTURAL", "complexity": "DIFFICULT", "risk": "HIGH", "budget": "high-risk", "priority": 1, "candidate_order": ["jules"]
+    },
+    {
+      "id": "match-simulator",
+      "request": "Implement the deliberately crude but real deterministic match simulator: effective team strength includes squads, manager, home advantage, fatigue and form; expected-goals/Poisson-like scoring produces plausible goals, draws and upsets. Assign starters, minutes, scorers, substitutions, fatigue and low-probability injuries via typed events.",
+      "acceptance": ["one-year run produces nonzero matches", "same seed yields identical match results", "statistical tests show draws home advantage and stronger-club advantage", "scores/minutes/participants satisfy invariants"],
+      "checklist_items": ["match-simulation"],
+      "depends_on": ["time-events-effects"], "task_type": "FEATURE", "complexity": "DIFFICULT", "risk": "HIGH", "budget": "high-risk", "priority": 1, "candidate_order": ["jules"]
+    },
+    {
+      "id": "competition-framework",
+      "request": "Implement configurable competition stages and a first playable world of domestic Colombia, Argentina and Brazil plus simplified Libertadores qualification/group/knockout/final. Do not bury competition rules in entities. Exact historical formats are not required; document simplifications.",
+      "acceptance": ["all three domestic competitions schedule and table correctly", "continental qualification and a Libertadores winner exist", "league/group/knockout/final stage tests pass", "every trophy has exactly one winner"],
+      "checklist_items": ["competitions"],
+      "depends_on": ["match-simulator"], "task_type": "FEATURE", "complexity": "DIFFICULT", "risk": "HIGH", "budget": "high-risk", "priority": 1, "candidate_order": ["jules"]
+    },
+    {
+      "id": "season-loop",
+      "request": "Implement the autonomous preseason-to-postseason loop: registration, fixtures/matches, standings and continental play, settlements, effects, aging/development hooks, and invariant checks throughout. Make 1-, 5-, and 20-season integration tests execute without structural failure.",
+      "acceptance": ["1 5 and 20-season seeded integration tests pass", "fixtures standings and winners remain valid", "invariants run during rather than only after simulation", "world state changes materially without frozen or runaway behavior"],
+      "checklist_items": ["season-loop", "determinism-invariants"],
+      "depends_on": ["competition-framework"], "task_type": "INTEGRATION", "complexity": "DIFFICULT", "risk": "HIGH", "budget": "high-risk", "priority": 1, "candidate_order": ["jules"]
+    },
+    {
+      "id": "careers-markets",
+      "request": "Implement development/aging/retirement, youth generation, transfers, and manager labor market as causal mechanisms. Add broad career phases and rare late bloomers; academy-tail cohorts; three-party transfer decisions including failed deals; board expectations and manager moves. Preserve provenance and prevent immortal players/unbounded transfer values.",
+      "acceptance": ["players age develop move and retire in multi-season tests", "youth varies by academy/reach/cohort without scripted stories", "transfers can succeed fail and be explained", "manager expectation test distinguishes equivalent finish at different clubs", "career/economy invariants pass over 30 years"],
+      "checklist_items": ["careers-youth-transfers-managers"],
+      "depends_on": ["season-loop"], "task_type": "FEATURE", "complexity": "DIFFICULT", "risk": "HIGH", "budget": "high-risk", "priority": 1, "candidate_order": ["jules"]
+    },
+    {
+      "id": "salience-threads",
+      "request": "Implement event salience and descriptive causal thread clustering. Classify silent through historic using stakes, surprise, novelty, relationships and repetition; track repeated themes to prevent spam. Cluster shared actors/themes/temporal/causal links without predefined storylines.",
+      "acceptance": ["salience tests distinguish mundane repetition from escalating issue", "surprise materially affects major trophy salience", "thread clustering returns actors theme duration and events", "no prose generation or scripted storyline is added"],
+      "checklist_items": ["salience-threads"],
+      "depends_on": ["careers-markets"], "task_type": "FEATURE", "complexity": "STANDARD", "risk": "MEDIUM", "budget": "difficult", "priority": 1, "candidate_order": ["jules"]
+    },
+    {
+      "id": "persistence-cli-inspector",
+      "request": "Make persistence and inspection production-useful for V0. Version saves, preserve complete world/event/provenance/RNG state, cleanly reject incompatible saves, and prove continuous five-year equals two-year save/reload plus three-year continuation. Implement documented CLI commands simulate inspect why history player club competition world-stats monte-carlo and a readable static debug inspector.",
+      "acceptance": ["continuous versus save/reload canonical hashes match", "unsupported save schema fails cleanly", "all documented CLI commands execute against a sample world", "static inspector contains overview club player manager history and why views"],
+      "checklist_items": ["persistence", "cli-inspector"],
+      "depends_on": ["salience-threads"], "task_type": "INTEGRATION", "complexity": "DIFFICULT", "risk": "HIGH", "budget": "high-risk", "priority": 1, "candidate_order": ["jules"]
+    },
+    {
+      "id": "diagnostics-emergence",
+      "request": "Build statistical diagnostics, fuzz/stress/sensitivity/performance/historical sanity checks, emergence detectors and structured causal explanations. Diagnostics must cover match, competition, player, economy, manager and social metrics; detect but never force dynasties, collapses, Cinderella rises, manager ascents, academy cohorts, export booms and career anomalies.",
+      "acceptance": ["diagnostic output reports every requested metric family", "fuzz configurations preserve invariants", "sensitivity run flags fragile parameters", "emergence detector finds descriptive patterns without creating them", "causal explanations cite recorded provenance and admit ambiguity"],
+      "checklist_items": ["diagnostics-emergence", "determinism-invariants"],
+      "depends_on": ["persistence-cli-inspector"], "task_type": "FEATURE", "complexity": "DIFFICULT", "risk": "HIGH", "budget": "high-risk", "priority": 1, "candidate_order": ["jules"]
+    },
+    {
+      "id": "monte-carlo-final-report",
+      "request": "Implement deterministic Monte Carlo batches for 10x10, 50x20 and 100x30 worlds, with 1000x30 attempted when feasible and measured limitation otherwise. Produce summary.html, aggregate.json and weirdest_worlds.md with five reproducible unusual worlds and structured causal contributors. Record runtime/memory/event/provenance profiling.",
+      "acceptance": ["10x10 and 50x20 runs complete automatically", "100x30 runs or records a measured documented performance limitation", "reports include aggregate JSON HTML and five reproducible weird worlds", "each selected anomaly has seed detector reason and causal evidence"],
+      "checklist_items": ["monte-carlo-final-report"],
+      "depends_on": ["diagnostics-emergence"], "task_type": "INTEGRATION", "complexity": "DIFFICULT", "risk": "HIGH", "budget": "high-risk", "priority": 1, "candidate_order": ["jules"]
+    },
+    {
+      "id": "definition-of-done-audit",
+      "request": "Perform an adversarial final integration audit against docs/FOOTBALL_WORLD_LAB_V0.md and the checklist mapping in this approved plan. Do not implement placeholder-only claims. Run clean-checkout build/tests, deterministic replay, save/reload, sample world, 10x10 Monte Carlo and the documented larger run. Update TASKS.md and PROGRESS.md item by item: mark only evidence-backed items complete, leave gaps unchecked with exact reasons, write V0_LIMITATIONS.md and final_v0_report/ handoff instructions/questions. Fix discovered integration defects before declaring READY_FOR_REVIEW.",
+      "acceptance": ["every checklist mapping item has an evidence-backed status in TASKS.md/PROGRESS.md", "clean checkout workflow is documented and passes", "definition-of-done gaps are explicit rather than hidden", "final_v0_report includes required handoff and limitations", "no Unity gameplay or LLM dependency was introduced"],
+      "checklist_items": ["definition-of-done-audit", "scope-and-truthful-docs", "build-and-test-workflow"],
+      "depends_on": ["monte-carlo-final-report"], "task_type": "INTEGRATION", "complexity": "DIFFICULT", "risk": "CRITICAL", "budget": "high-risk", "priority": 1, "candidate_order": ["jules"]
+    }
+  ]
+}

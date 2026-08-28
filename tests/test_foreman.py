@@ -86,6 +86,23 @@ def test_program_plan_requires_explicit_acceptance_and_is_bounded():
         validate_program_plan(too_large)
 
 
+def test_checklist_backed_program_covers_every_declared_requirement():
+    plan = _plan()
+    for task in plan["tasks"]:
+        task["acceptance"] = [f"{task['id']} verified"]
+    plan["checklist"] = ["scope", "engine", "integration"]
+    plan["tasks"][0]["checklist_items"] = ["scope"]
+    plan["tasks"][1]["checklist_items"] = ["engine"]
+    plan["tasks"][2]["checklist_items"] = ["engine"]
+    plan["tasks"][3]["checklist_items"] = ["integration"]
+    validated = validate_program_plan(plan)
+    assert validated["version"] == 3
+
+    del plan["tasks"][3]["checklist_items"]
+    with pytest.raises(ValueError, match="requires checklist_items"):
+        validate_program_plan(plan)
+
+
 def test_dependency_queue_releases_only_accepted_prerequisites(tmp_path: Path):
     db = Database(tmp_path / "pmc.db")
     feature_id = db.next_feature_id()
