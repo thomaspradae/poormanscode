@@ -91,6 +91,30 @@ class JulesExecutor:
         configured = request.job.base_branch
         if configured and not re.fullmatch(r"[0-9a-fA-F]{7,64}", configured):
             return configured
+        if configured:
+            # Program jobs deliberately pin an immutable commit.  Jules, however,
+            # can only start from a remote branch.  Recover the remote branch
+            # that contains that exact checkpoint instead of silently falling
+            # back to main and generating a patch against the wrong tree.
+            contains = git(
+                request.job.repo,
+                "branch",
+                "-r",
+                "--contains",
+                configured,
+                check=False,
+            )
+            branches = [
+                line.strip().removeprefix("origin/")
+                for line in contains.stdout.splitlines()
+                if line.strip().startswith("origin/")
+                and not line.strip().endswith("/HEAD")
+            ]
+            if branches:
+                # Prefer the explicit PMC checkpoint when available; otherwise
+                # use a stable lexical choice rather than an arbitrary listing.
+                branches.sort(key=lambda item: (not item.startswith("pmc/"), item))
+                return branches[0]
         head = git(request.job.repo, "symbolic-ref", "refs/remotes/origin/HEAD", check=False)
         match = re.search(r"refs/remotes/origin/(.+)$", head.stdout.strip())
         return match.group(1) if match else "main"

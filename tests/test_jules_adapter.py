@@ -198,3 +198,25 @@ def test_jules_uses_pushed_task_branch_for_follow_up_lane(tmp_path: Path):
     job = Job("PMC-000011", repo, "continue", baseline_commit=baseline, worktree=wt)
 
     assert JulesExecutor._starting_branch(ExecutionRequest(job, candidate, wt, "continue", 2)) == "pmc/pmc-000011"
+
+
+def test_jules_maps_pinned_checkpoint_to_remote_branch(tmp_path: Path):
+    repo = tmp_path / "repo"
+    remote = tmp_path / "remote.git"
+    repo.mkdir()
+    sh(remote.parent, f"git init -q --bare {remote}")
+    sh(
+        repo,
+        "git init -q -b main && git config user.email t@e.com && git config user.name T",
+    )
+    (repo / "x.txt").write_text("main\n")
+    sh(repo, f"git add -A && git commit -qm init && git remote add origin {remote} && git push -qu origin main")
+    sh(repo, "git checkout -qb pmc/checkpoint && echo checkpoint > x.txt && git add x.txt && git commit -qm checkpoint && git push -qu origin pmc/checkpoint")
+    wm = WorktreeManager(tmp_path / "w")
+    wt, baseline = wm.create(repo, "PMC-000012", "pmc/checkpoint")
+    candidate = Candidate(name="j", executor="jules", source="sources/github/o/r")
+    job = Job(
+        "PMC-000012", repo, "continue", base_branch=baseline, baseline_commit=baseline, worktree=wt
+    )
+
+    assert JulesExecutor._starting_branch(ExecutionRequest(job, candidate, wt, "continue", 1)) == "pmc/checkpoint"

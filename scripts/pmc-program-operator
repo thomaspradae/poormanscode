@@ -44,8 +44,8 @@ while true; do
     if [[ "$signature" != "$last_signature" ]]; then
       notify "PMC blocked: $detail\nLuna is investigating."
       diagnosis="$(codex exec -m gpt-5.6-luna --approve-for-me \
-        -C /home/t/football-game \
-        "You are the overnight PMC operator. Inspect only this new PMC block: $detail. Read docs/FOOTBALL_WORLD_LAB_V0.md and relevant PMC worktrees/logs. Fix only clear orchestration or code defects in the isolated task worktree; run relevant verification. Do not delete work, force-push, or accept final program output. Return a concise diagnosis and exact next action." 2>&1 || true)"
+        -C "$PMC_DIR" \
+        "You are the overnight PMC operator. Inspect only this new PMC block in $PROGRAM: $detail. The PMC database/configuration is under /home/t; use --approve-for-me escalation if needed to read it. Read the Football V0 specification and relevant PMC worktrees/logs. Fix only clear orchestration or code defects in the isolated task worktree; run relevant verification. Do not delete work, force-push, or accept final program output. Return a concise diagnosis and exact next action." 2>&1 || true)"
       printf '%s\n' "$diagnosis" >>"$LOG"
       notify "Luna intervention result:\n$(printf '%s' "$diagnosis" | tail -20)"
       last_signature="$signature"
@@ -60,7 +60,7 @@ while true; do
     # this explicitly fail-open Football program; it must not rewrite the
     # football task merely because it wants a different implementation.
     audit="$(codex exec -m gpt-5.6-luna -c 'model_reasoning_effort="low"' --approve-for-me \
-      -C /home/t/football-game \
+      -C "$PMC_DIR" \
       "You are the Football World Lab watchdog. $PROGRAM status is: ${first}. The active task is ${active_job:-NONE}. Inspect only that task if one is named; if NONE, inspect only $PROGRAM feature_tasks and identify the single nonterminal task in RUNNING/VERIFYING/REVIEWING state. Never inspect or invent a different historical PMC job ID. If it is a Jules attempt, read its latest attempt/session ID and query its provider state using the configured credential without printing secrets. At most four terminal commands. If the provider says terminal/AWAITING_USER_FEEDBACK while PMC says running, fix the narrow PMC/Jules handoff, preserve/checkpoint work, and resume. Otherwise return a <=100-word checklist/progress audit. You may commit/push PMC orchestration fixes for this Football-only experiment, but do not discard task work or force-push." 2>&1 || true)"
     printf '%s\n' "$audit" >>"$LOG"
     notify "Luna 30-minute football audit:\n$(printf '%s' "$audit" | tail -20)"
