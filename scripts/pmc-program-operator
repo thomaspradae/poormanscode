@@ -33,7 +33,7 @@ while true; do
   status="$(env HOME=/home/t XDG_RUNTIME_DIR=/run/user/1000 "$PMC_BIN" --config "$CFG" program-status "$PROGRAM" 2>&1 || true)"
   first="$(printf '%s' "$status" | head -1)"
   detail="$(printf '%s' "$status" | sed -n 's/.*last_error: //p' | head -1)"
-  active_job="$(printf '%s\n' "$status" | awk '$1 ~ /^PMC-/ && $3 == "RUNNING" { print $1; exit }')"
+  active_job="$(printf '%s\n' "$status" | awk '$1 ~ /^PMC-/ && ($3 == "RUNNING" || $3 == "VERIFYING" || $3 == "REVIEWING") { print $1; exit }')"
   signature="$(printf '%s\n%s' "$first" "$detail" | sha256sum | cut -d' ' -f1)"
   printf '[%s] %s\n' "$(date -Is)" "$first" >>"$LOG"
 
@@ -59,7 +59,7 @@ while true; do
     # football task merely because it wants a different implementation.
     audit="$(codex exec -m gpt-5.6-luna -c 'model_reasoning_effort="low"' --approve-for-me \
       -C /home/t/football-game \
-      "You are the Football World Lab watchdog. The active task is ${active_job:-NONE}; PMCF-000006 status is: ${first}. Inspect only that active task (never infer a different PMC job ID). If it is a Jules attempt, read its latest attempt/session ID and query its provider state using the configured credential without printing secrets. At most four terminal commands. If the provider says terminal/AWAITING_USER_FEEDBACK while PMC says running, fix the narrow PMC/Jules handoff, preserve/checkpoint work, and resume. Otherwise return a <=100-word checklist/progress audit. You may commit/push PMC orchestration fixes for this Football-only experiment, but do not discard task work or force-push." 2>&1 || true)"
+      "You are the Football World Lab watchdog. PMCF-000006 status is: ${first}. The active task is ${active_job:-NONE}. Inspect only that task if one is named; if NONE, inspect only PMCF-000006 feature_tasks and identify the single nonterminal task in RUNNING/VERIFYING/REVIEWING state. Never inspect or invent a different historical PMC job ID. If it is a Jules attempt, read its latest attempt/session ID and query its provider state using the configured credential without printing secrets. At most four terminal commands. If the provider says terminal/AWAITING_USER_FEEDBACK while PMC says running, fix the narrow PMC/Jules handoff, preserve/checkpoint work, and resume. Otherwise return a <=100-word checklist/progress audit. You may commit/push PMC orchestration fixes for this Football-only experiment, but do not discard task work or force-push." 2>&1 || true)"
     printf '%s\n' "$audit" >>"$LOG"
     notify "Luna 30-minute football audit:\n$(printf '%s' "$audit" | tail -20)"
     last_signature=""
