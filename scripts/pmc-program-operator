@@ -50,13 +50,17 @@ while true; do
   else
     healthy_cycles=$((healthy_cycles + 1))
     notify "PMC hourly update:\n$first\n$(printf '%s' "$status" | tail -5)"
-    if (( healthy_cycles % 4 == 0 )); then
-      audit="$(codex exec -m gpt-5.6-luna -s read-only \
-        -C /home/t/football-game \
-        "Perform a concise progress audit for Football World Lab. Read docs/FOOTBALL_WORLD_LAB_V0.md, current program status, and recent verified work. Report whether current work is aligned with the checklist, one concrete risk, and the next milestone. Do not edit files." 2>&1 || true)"
-      printf '%s\n' "$audit" >>"$LOG"
-      notify "Luna four-hour checklist audit:\n$(printf '%s' "$audit" | tail -20)"
-    fi
+    # A RUNNING label alone is not enough: Jules can enter a terminal
+    # provider state while PMC is still polling it.  Every healthy cycle gets
+    # a cheap Luna-low inspection of the current attempt/session as well as
+    # the checklist.  It may repair a clear orchestration mismatch and resume
+    # this explicitly fail-open Football program; it must not rewrite the
+    # football task merely because it wants a different implementation.
+    audit="$(codex exec -m gpt-5.6-luna -c 'model_reasoning_effort="low"' --approve-for-me \
+      -C /home/t/football-game \
+      "You are the Football World Lab watchdog. Inspect PMCF-000006, the current PMC attempt, and, if Jules is active, its provider session state using the sanitized attempt/session ID. Also read docs/FOOTBALL_WORLD_LAB_V0.md and inspect the current task branch. If a Jules session is terminal or awaiting feedback while PMC still considers it running, fix the narrow PMC/Jules handoff issue, preserve/checkpoint work, and resume the program. If truly healthy, give a concise checklist/progress audit. You may commit and push PMC orchestration fixes for this Football-only experiment. Do not discard task work or force-push." 2>&1 || true)"
+    printf '%s\n' "$audit" >>"$LOG"
+    notify "Luna 30-minute football audit:\n$(printf '%s' "$audit" | tail -20)"
     last_signature=""
   fi
   sleep "$INTERVAL_SECONDS"
