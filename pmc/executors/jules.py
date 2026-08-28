@@ -134,6 +134,12 @@ class JulesExecutor:
                 return ExecutionResult(
                     False,
                     error="Jules cannot safely repair an unpushed local patch; use it as a first attempt or push an explicit branch",
+                    # Retrying without first checkpointing the worktree cannot
+                    # change this condition.  Mark it as an orchestration
+                    # policy failure so the controller preserves the work and
+                    # blocks for an explicit operator handoff rather than
+                    # consuming the Jules rolling-attempt quota.
+                    outcome=Outcome.POLICY_FAILURE,
                 )
         if not c.api_key_env:
             return ExecutionResult(False, error="Jules candidate requires api_key_env")

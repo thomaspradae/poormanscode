@@ -3,7 +3,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from pmc.domain import Candidate, ExecutionRequest, Job
+from pmc.domain import Candidate, ExecutionRequest, Job, Outcome
 from pmc.executors.jules import JulesExecutor
 from pmc.gitops import WorktreeManager
 
@@ -93,6 +93,27 @@ def test_jules_changeset_applies_to_controller_worktree(tmp_path: Path, monkeypa
     result = ex.run(req)
     assert result.ok
     assert (wt / "x.txt").read_text() == "new\n"
+
+
+def test_jules_unpushed_patch_guard_is_a_policy_failure(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    sh(
+        repo,
+        "git init -q -b main && git config user.email t@e.com && git config user.name T",
+    )
+    (repo / "x.txt").write_text("old\n")
+    sh(repo, "git add -A && git commit -qm init")
+    wm = WorktreeManager(tmp_path / "w")
+    wt, baseline = wm.create(repo, "PMC-000002", "main")
+    (wt / "x.txt").write_text("local patch\n")
+    candidate = Candidate(name="j", executor="jules")
+    job = Job("PMC-000002", repo, "change it", baseline_commit=baseline, worktree=wt)
+
+    result = JulesExecutor().run(ExecutionRequest(job, candidate, wt, "change it", 2))
+
+    assert not result.ok
+    assert result.outcome == Outcome.POLICY_FAILURE
 
 
 def test_jules_awaiting_user_feedback_is_a_completed_patch(tmp_path: Path, monkeypatch):
