@@ -192,8 +192,10 @@ class Scheduler:
         exclude = exclude or set()
 
         def fits(c: Candidate) -> bool:
-            if c.executor == "jules" and job.constraints.get("_feature_dependencies"):
-                return False
+            # Jules tasks participate in the same dependency DAG as every
+            # other executor.  Dependencies are integrated by the controller
+            # before dispatch; rejecting Jules here made every chained task
+            # fail with a misleading profile-constraint error.
             # BashExecutor is intentionally a narrow, low-overhead executor.  It is
             # not a general software-engineering runtime: production experience
             # showed that difficult/multi-file work burns turns without converging.

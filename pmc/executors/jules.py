@@ -66,8 +66,27 @@ class JulesExecutor:
 
     @staticmethod
     def _starting_branch(request: ExecutionRequest) -> str:
-        """Jules needs a branch name; PMC jobs may pin a commit as baseline."""
+        """Choose the task branch so a follow-up Jules lane sees its checkpoint."""
         from ..gitops import git
+
+        # A resumed PMC task has a controller-owned worktree branch such as
+        # ``pmc/PMC-000052``.  Once that branch is pushed, it is the canonical
+        # handoff point between independent Jules sessions/credentials.  Using
+        # the original base branch here made every later lane start from main
+        # and regenerate already-integrated foundation files.
+        active = git(request.worktree, "branch", "--show-current", check=False)
+        branch = active.stdout.strip()
+        if branch:
+            remote = git(
+                request.worktree,
+                "ls-remote",
+                "--heads",
+                "origin",
+                f"refs/heads/{branch}",
+                check=False,
+            )
+            if remote.returncode == 0 and remote.stdout.strip():
+                return branch
 
         configured = request.job.base_branch
         if configured and not re.fullmatch(r"[0-9a-fA-F]{7,64}", configured):
@@ -118,7 +137,15 @@ class JulesExecutor:
                     c.extra.get("timeout_seconds", 3600)
                 )
                 state = session.get("state", "QUEUED")
-                while state not in {"COMPLETED", "FAILED"}:
+                # Jules commonly ends a successful autonomous session in
+                # AWAITING_USER_FEEDBACK: the agent has produced its patch and
+                # is waiting for a human reply in the Jules UI.  PMC does not
+                # need a conversational reply here; it must retrieve the
+                # immutable ChangeSet immediately.  Treating that state as
+                # non-terminal previously left completed work polling until
+                # the local one-hour deadline, then falsely reported TIMEOUT.
+                terminal_success = {"COMPLETED", "AWAITING_USER_FEEDBACK"}
+                while state not in terminal_success | {"FAILED"}:
                     if time.monotonic() >= deadline:
                         return ExecutionResult(
                             False,
