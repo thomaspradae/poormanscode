@@ -128,6 +128,10 @@ class ExecutionRequest:
     feedback: str | None = None
     accounting: Any | None = None
     research: Any | None = None
+    # External executors can publish an opaque provider session ID as soon as
+    # they create it.  The controller persists that ID while the attempt is
+    # still RUNNING so watchdogs can inspect/recover a long-lived session.
+    on_progress: Any | None = None
 
 
 class Outcome(StrEnum):

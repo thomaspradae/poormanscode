@@ -632,6 +632,9 @@ class Controller:
                 context_hash=attempt_context_hash,
                 context_manifest=attempt_context_manifest,
             )
+            req.on_progress = lambda session_id, state: self.db.record_attempt_provider_session(
+                attempt_id, session_id, state
+            )
             if not request_accounted_executor:
                 if candidate.provider:
                     ok, reason = self.db.provider_availability(candidate.provider)

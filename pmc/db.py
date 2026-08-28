@@ -2627,6 +2627,27 @@ class Database:
             },
         )
 
+    def record_attempt_provider_session(
+        self, attempt_id: int, provider_request_id: str, state: str
+    ) -> None:
+        """Persist an external executor session before it finishes."""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT job_id FROM attempts WHERE id=?", (attempt_id,)
+            ).fetchone()
+            if not row:
+                raise KeyError(f"unknown attempt {attempt_id}")
+            conn.execute(
+                "UPDATE attempts SET provider_request_id=? WHERE id=?",
+                (provider_request_id, attempt_id),
+            )
+        self.event(
+            "EXECUTOR_SESSION_STARTED",
+            job_id=row["job_id"],
+            attempt_id=attempt_id,
+            payload={"provider_request_id": provider_request_id, "state": state},
+        )
+
     def record_verification(self, attempt_id: int, v: VerificationResult) -> None:
         commands = [asdict(x) for x in v.commands]
         with self.connect() as conn:

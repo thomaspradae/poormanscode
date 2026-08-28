@@ -117,10 +117,14 @@ def test_jules_awaiting_user_feedback_is_a_completed_patch(tmp_path: Path, monke
     monkeypatch.setattr(executor, "_client", lambda _: FakeClient(patch, "AWAITING_USER_FEEDBACK"))
     monkeypatch.setenv("JULES_API_KEY", "fake")
 
-    result = executor.run(ExecutionRequest(job, candidate, wt, "change it", 1))
+    progress: list[tuple[str, str]] = []
+    request = ExecutionRequest(job, candidate, wt, "change it", 1)
+    request.on_progress = lambda session_id, state: progress.append((session_id, state))
+    result = executor.run(request)
 
     assert result.ok
     assert result.provider_request_id == "mock"
+    assert progress == [("mock", "AWAITING_USER_FEEDBACK")]
     assert (wt / "x.txt").read_text() == "new\n"
 
 

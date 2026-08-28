@@ -132,6 +132,8 @@ class JulesExecutor:
                 session = r.json()
                 session_name = session.get("name") or f"sessions/{session['id']}"
                 session_id = session_name.split("/")[-1]
+                if request.on_progress:
+                    request.on_progress(session_id, str(session.get("state", "QUEUED")))
                 poll = float(c.extra.get("poll_seconds", 10))
                 deadline = time.monotonic() + float(
                     c.extra.get("timeout_seconds", 3600)
