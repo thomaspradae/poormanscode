@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from pmc.telegram_control import Controller, Store, alias_for, codex_runner
+from pmc.telegram_control import Conversation, Controller, Store, alias_for, codex_runner
 
 
 class FakeTelegram:
