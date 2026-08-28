@@ -37,7 +37,7 @@ while true; do
     healthy_cycles=0
     if [[ "$signature" != "$last_signature" ]]; then
       notify "PMC blocked: $detail\nLuna is investigating."
-      diagnosis="$(codex exec -m gpt-5.6-luna -s workspace-write --approve-for-me \
+      diagnosis="$(codex exec -m gpt-5.6-luna --approve-for-me \
         -C /home/t/football-game \
         "You are the overnight PMC operator. Inspect only this new PMC block: $detail. Read docs/FOOTBALL_WORLD_LAB_V0.md and relevant PMC worktrees/logs. Fix only clear orchestration or code defects in the isolated task worktree; run relevant verification. Do not delete work, force-push, or accept final program output. Return a concise diagnosis and exact next action." 2>&1 || true)"
       printf '%s\n' "$diagnosis" >>"$LOG"
