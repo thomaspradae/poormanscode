@@ -262,11 +262,12 @@ def codex_runner(model: str) -> Callable[[Conversation, str], str]:
             "accept, or resume game work when justified. Preserve work and explain what you did concisely.\n\n"
             f"Telegram message:\n{message}"
         )
-        # resume deliberately preserves the named Codex conversation. Approval policy is the
-        # configuration equivalent of --approve-for-me, which the resume subcommand does not expose.
+        # resume deliberately preserves the named Codex conversation. Its CLI does not expose
+        # --approve-for-me, so use the documented config pair for normal approval requests.
         command = [
             codex_binary, "exec", "resume", "-m", model,
-            "-c", 'approval_policy="on-request_auto_review"',
+            "-c", 'approval_policy="on-request"',
+            "-c", 'approvals_reviewer="auto_review"',
             "-c", 'sandbox_mode="workspace-write"',
             item.thread_id, prompt,
         ]
