@@ -9,10 +9,21 @@ umask 077
 
 read -r -s -p "Telegram bot token: " BOT_TOKEN
 printf "\n"
-read -r -p "Telegram chat ID: " CHAT_ID
 
-if [[ -z "$BOT_TOKEN" || -z "$CHAT_ID" ]]; then
-  echo "Bot token and chat ID are both required." >&2
+if [[ -z "$BOT_TOKEN" ]]; then
+  echo "Bot token is required." >&2
+  exit 1
+fi
+
+UPDATES="$(curl --fail --silent --show-error --max-time 20 \
+  "https://api.telegram.org/bot$BOT_TOKEN/getUpdates")"
+CHAT_ID="$(printf '%s' "$UPDATES" | jq -r '
+  [.result[] | (.message // .edited_message // .channel_post) | select(.chat != null) | .chat.id]
+  | last // empty
+')"
+
+if [[ -z "$CHAT_ID" ]]; then
+  echo "No Telegram chat found. Send /start to the bot, wait a moment, then run this again." >&2
   exit 1
 fi
 
@@ -24,5 +35,4 @@ curl --fail --silent --show-error --max-time 15 \
   --data-urlencode "chat_id=$CHAT_ID" \
   --data-urlencode "text=PMC Telegram notifications configured." >/dev/null
 
-echo "Saved $SECRETS_FILE (mode 600) and sent a test message."
-
+echo "Saved $SECRETS_FILE (mode 600), discovered chat $CHAT_ID, and sent a test message."
