@@ -1,0 +1,14 @@
+[Unit]
+Description=Durable Telegram to Codex operator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/poormans-hpc/poormanscode/scripts/pmc-telegram-control run
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

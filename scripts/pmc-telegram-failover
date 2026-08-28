@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Cold-standby supervisor. Install only on the standby runner.
+#
+# It starts the local control service only after the primary is unreachable for
+# several consecutive checks. A shared lease is still required for strict
+# split-brain prevention; this script deliberately favours availability after a
+# machine outage over pretending that two isolated hosts are a consensus cluster.
+set -euo pipefail
+
+PRIMARY_HOST="${PRIMARY_HOST:-uace-ofi-01}"
+CONTROL_UNIT="${CONTROL_UNIT:-pmc-telegram-control.service}"
+FAILURES_REQUIRED="${FAILURES_REQUIRED:-3}"
+CHECK_SECONDS="${CHECK_SECONDS:-30}"
+
+failures=0
+while true; do
+  if ssh -o BatchMode=yes -o ConnectTimeout=8 "$PRIMARY_HOST" \
+      "systemctl --user is-active --quiet $CONTROL_UNIT" 2>/dev/null; then
+    failures=0
+    # If the primary is healthy, a previously promoted standby steps aside.
+    systemctl --user stop "$CONTROL_UNIT" 2>/dev/null || true
+  else
+    failures=$((failures + 1))
+    if (( failures >= FAILURES_REQUIRED )); then
+      systemctl --user start "$CONTROL_UNIT"
+    fi
+  fi
+  sleep "$CHECK_SECONDS"
+done

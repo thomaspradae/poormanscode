@@ -1,0 +1,16 @@
+[Unit]
+Description=Standby supervisor for the Telegram Codex operator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=PRIMARY_HOST=uace-ofi-01
+Environment=CONTROL_UNIT=pmc-telegram-control.service
+ExecStart=%h/poormans-hpc/poormanscode/scripts/pmc-telegram-failover
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
