@@ -124,9 +124,19 @@ class Scheduler:
                 return Availability(False, "model conformance unknown")
             if conformance["status"] != "AVAILABLE":
                 return Availability(False, f"model {conformance['status'].lower()}")
-        quota_ok, quota_reason = self.db.quota_availability(c.name)
-        if not quota_ok:
-            return Availability(False, quota_reason)
+        provider_evidenced_jules_quota = bool(
+            job
+            and c.executor == "jules"
+            and job.constraints.get("provider_evidenced_jules_quota", False)
+        )
+        # Football Lab Jules tasks intentionally use provider-reported
+        # exhaustion across independent credentials.  The legacy per-candidate
+        # gate is a single shared counter and would reject the task before the
+        # task-scoped attempt check below can apply.
+        if not provider_evidenced_jules_quota:
+            quota_ok, quota_reason = self.db.quota_availability(c.name)
+            if not quota_ok:
+                return Availability(False, quota_reason)
         universe = universe or [c]
         if (
             c.max_concurrency is not None
@@ -153,11 +163,6 @@ class Scheduler:
             [x.name for x in universe if x.quota_group == c.quota_group]
             if c.quota_group
             else [c.name]
-        )
-        provider_evidenced_jules_quota = bool(
-            job
-            and c.executor == "jules"
-            and job.constraints.get("provider_evidenced_jules_quota", False)
         )
         if (
             c.quota_attempts is not None
