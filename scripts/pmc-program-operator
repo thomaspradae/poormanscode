@@ -9,7 +9,10 @@ SECRETS="/home/t/.config/poormans-code/telegram.env"
 STATE_DIR="/home/t/.local/share/poormans-code"
 STATE_FILE="$STATE_DIR/$PROGRAM-operator-state"
 LOG="$STATE_DIR/$PROGRAM-operator.log"
-INTERVAL_SECONDS=3600
+# Football World Lab is intentionally a fail-open experiment.  Check it often
+# enough to catch an executor/session state mismatch before a full hour of
+# quota and wall-clock time is wasted.
+INTERVAL_SECONDS=1800
 
 test -r "$SECRETS" || { echo "Missing $SECRETS. Run pmc-telegram-setup first." >&2; exit 1; }
 # shellcheck disable=SC1090
