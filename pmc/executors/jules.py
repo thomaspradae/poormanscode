@@ -119,6 +119,62 @@ class JulesExecutor:
         match = re.search(r"refs/remotes/origin/(.+)$", head.stdout.strip())
         return match.group(1) if match else "main"
 
+    @staticmethod
+    def _publish_task_branch(request: ExecutionRequest) -> str:
+        """Publish a clean PMC task branch before creating a Jules session.
+
+        Jules executes against GitHub, not the controller's local worktree.  A
+        locally-created dependent task branch therefore has to be visible at
+        origin before it is supplied as ``startingBranch``.  Falling back to
+        the repository default branch creates a valid-looking patch for the
+        wrong tree, which later fails during patch application.
+        """
+        # Existing non-program callers and the adapter's isolated tests may
+        # intentionally use a local-only repository.  Program tasks opt in
+        # once they need a durable multi-session GitHub handoff.
+        if not request.job.constraints.get("jules_require_published_branch", False):
+            return JulesExecutor._starting_branch(request)
+
+        from ..gitops import git
+
+        active = git(request.worktree, "branch", "--show-current", check=False)
+        branch = active.stdout.strip()
+        if not branch:
+            return JulesExecutor._starting_branch(request)
+
+        dirty = git(request.worktree, "status", "--porcelain", check=False)
+        if dirty.stdout.strip():
+            raise RuntimeError(
+                "Jules task branch has uncommitted work; checkpoint it before "
+                "starting another remote session"
+            )
+
+        local = git(request.worktree, "rev-parse", "HEAD", check=False)
+        if local.returncode:
+            raise RuntimeError("could not resolve Jules task branch HEAD")
+        local_head = local.stdout.strip()
+        remote = git(
+            request.worktree,
+            "ls-remote",
+            "--heads",
+            "origin",
+            f"refs/heads/{branch}",
+            check=False,
+        )
+        remote_head = remote.stdout.split()[0] if remote.stdout.strip() else ""
+        if remote_head != local_head:
+            pushed = git(
+                request.worktree,
+                "push",
+                "origin",
+                f"HEAD:refs/heads/{branch}",
+                check=False,
+            )
+            if pushed.returncode:
+                detail = (pushed.stderr or pushed.stdout).strip()
+                raise RuntimeError(f"could not publish Jules task branch {branch}: {detail}")
+        return branch
+
     def run(self, request: ExecutionRequest) -> ExecutionResult:
         c = request.candidate
         if request.attempt_no > 1:
@@ -145,6 +201,7 @@ class JulesExecutor:
             return ExecutionResult(False, error="Jules candidate requires api_key_env")
         try:
             source = self._source_for(request)
+            starting_branch = self._publish_task_branch(request)
             with self._client(c.api_key_env) as client:
                 payload = {
                     "title": f"{request.job.id}: {request.job.request[:80]}",
@@ -152,7 +209,7 @@ class JulesExecutor:
                     "sourceContext": {
                         "source": source,
                         "githubRepoContext": {
-                            "startingBranch": self._starting_branch(request)
+                            "startingBranch": starting_branch
                         },
                     },
                     "requirePlanApproval": False,
