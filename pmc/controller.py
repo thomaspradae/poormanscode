@@ -181,6 +181,13 @@ class Controller:
                 result = git(wt, "cherry-pick", commit, check=False)
                 if result.returncode != 0:
                     git(wt, "cherry-pick", "--abort", check=False)
+                    # Git reports an already-integrated patch as a failed
+                    # cherry-pick when the commit has different ancestry. It
+                    # is safe to continue: abort restored the worktree and
+                    # the dependency's file changes are already present.
+                    if "previous cherry-pick is now empty" in result.stderr or "nothing to commit" in result.stderr:
+                        already_present.append(commit)
+                        continue
                     # A verified checkpoint may have been created from the
                     # original baseline while an earlier dependency added a
                     # narrow follow-up fix. Preserve the current dependency
