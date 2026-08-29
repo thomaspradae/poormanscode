@@ -163,6 +163,21 @@ class JulesExecutor:
         )
         remote_head = remote.stdout.split()[0] if remote.stdout.strip() else ""
         if remote_head != local_head:
+            if remote_head:
+                # Another Jules lane may have checkpointed this task. Adopt a
+                # remote-ahead clean checkpoint before attempting to publish;
+                # otherwise every watchdog retry hits the same non-fast-forward
+                # error forever.
+                git(request.worktree, "fetch", "origin", branch, check=False)
+                remote_ref = f"origin/{branch}"
+                ahead = git(request.worktree, "merge-base", "--is-ancestor", local_head, remote_ref, check=False)
+                if ahead.returncode == 0:
+                    git(request.worktree, "reset", "--hard", remote_ref)
+                    local_head = remote_head
+                else:
+                    behind = git(request.worktree, "merge-base", "--is-ancestor", remote_head, local_head, check=False)
+                    if behind.returncode != 0:
+                        raise RuntimeError(f"Jules task branch diverged locally and remotely: {branch}")
             pushed = git(
                 request.worktree,
                 "push",
