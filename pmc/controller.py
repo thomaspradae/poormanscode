@@ -173,8 +173,6 @@ class Controller:
             Path(lock).unlink(missing_ok=True)
         dependency_commits = self.db.dependency_commits(job.id)
         if dependency_commits:
-            from .gitops import git
-
             already_present: list[str] = []
             for commit in dependency_commits:
                 if (
