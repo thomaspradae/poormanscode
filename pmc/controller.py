@@ -10,6 +10,7 @@ import threading
 import time
 import uuid
 from dataclasses import asdict, replace
+from pathlib import Path
 
 from .accounting import ModelRequestAccounting
 from .capabilities import (
@@ -22,7 +23,7 @@ from .context import build_context_bundle
 from .db import Database
 from .domain import AttemptStatus, ExecutionRequest, ExecutionResult, JobState, Outcome
 from .executors import build_executor
-from .gitops import WorktreeManager
+from .gitops import WorktreeManager, git, resolve_commit
 from .intelligence import advisory_call, allocate_intelligence
 from .prompts import builder_prompt
 from .reporting import Reporter
@@ -146,10 +147,33 @@ class Controller:
     def ensure_worktree(self, job):
         if job.worktree and job.worktree.exists() and job.baseline_commit:
             return job
-        wt, baseline = self.worktrees.create(job.repo, job.id, job.base_branch)
+        # Reconcile an orphan left by an interrupted runner before attempting
+        # creation. This keeps the DB and filesystem lifecycle consistent.
+        expected = self.cfg.worktrees_dir / job.id
+        lock = expected.parent / f".{job.id}.lock"
+        while True:
+            try:
+                fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                os.close(fd)
+                break
+            except FileExistsError:
+                time.sleep(0.1)
+        try:
+            baseline = resolve_commit(job.repo, job.base_branch)
+            if expected.exists() and git(expected, "rev-parse", "--is-inside-work-tree", check=False).returncode == 0:
+                if not git(expected, "status", "--porcelain", check=False).stdout.strip():
+                    job.worktree = expected
+                    job.baseline_commit = baseline
+                    self.db.update_job(job)
+                    return job
+                backup = expected.with_name(f"{job.id}.orphan-{int(time.time())}")
+                expected.rename(backup)
+            wt, baseline = self.worktrees.create(job.repo, job.id, job.base_branch)
+        finally:
+            Path(lock).unlink(missing_ok=True)
         dependency_commits = self.db.dependency_commits(job.id)
         if dependency_commits:
-            from .gitops import git, resolve_commit
+            from .gitops import git
 
             already_present: list[str] = []
             for commit in dependency_commits:
