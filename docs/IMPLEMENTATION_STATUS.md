@@ -111,3 +111,9 @@ audit reports, human acceptance, leases, and Bash/OpenHands/Jules adapters.
 
 Use `pmc efficiency` for the two headline measures: human-accepted success rate and
 median wall-clock time to a human-accepted result.
+# Kanban work mode
+
+PMC now includes an opt-in, single-writer Kanban mode for experimental work.
+It uses a persistent project branch/worktree, checkpoint-first pushes, smoke
+verification, bounded Git failure classification, and a compact task board.
+It deliberately does not replace the existing advanced program/DAG runner.

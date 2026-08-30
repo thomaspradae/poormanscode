@@ -16,6 +16,7 @@ from .config import DEFAULT_CONFIG, load_config
 from .controller import Controller, LeaseBusy
 from .domain import Job, JobState
 from .foreman import propose_plan, validate_plan, validate_program_plan
+from .kanban import Kanban
 
 
 def _attempt_duration(attempt) -> float:
@@ -545,6 +546,94 @@ def cmd_board(args) -> int:
                 else row["state"]
             )
             print(f"  {row['job_id']:<12} {row['task_key']:<24} {display_state}")
+    return 0
+
+
+def _kanban(args) -> Kanban:
+    ctl = _controller(args)
+    return Kanban(ctl.db, ctl.cfg.worktrees_dir)
+
+
+def cmd_kanban_init(args) -> int:
+    board = _kanban(args)
+    project = board.create_project(
+        args.project_id,
+        args.title,
+        Path(args.repo).resolve(),
+        branch=args.branch,
+        verification_mode=args.verification.upper(),
+    )
+    print(json.dumps(project, indent=2))
+    return 0
+
+
+def cmd_kanban_add(args) -> int:
+    task = _kanban(args).add_task(
+        args.project_id, args.task_id, args.title, args.request, args.acceptance or []
+    )
+    print(task["id"])
+    return 0
+
+
+def cmd_kanban_start(args) -> int:
+    task = _kanban(args).start(args.task_id, args.executor)
+    print(f"{task['id']} WORKING executor={args.executor}")
+    return 0
+
+
+def cmd_kanban_checkpoint(args) -> int:
+    commit = _kanban(args).checkpoint(args.task_id, args.message)
+    print(commit)
+    return 0
+
+
+def cmd_kanban_smoke(args) -> int:
+    result = _kanban(args).smoke(args.task_id, args.command)
+    print(f"{result.status}\n{result.detail}")
+    return 0 if result.status != "FATAL" else 2
+
+
+def cmd_kanban_warning(args) -> int:
+    _kanban(args).warning(args.task_id, args.detail)
+    print("WARNING recorded")
+    return 0
+
+
+def cmd_kanban_block(args) -> int:
+    _kanban(args).block(args.task_id, args.reason)
+    print("BLOCKED")
+    return 0
+
+
+def cmd_kanban_done(args) -> int:
+    _kanban(args).finish(args.task_id)
+    print("DONE")
+    return 0
+
+
+def cmd_kanban_next(args) -> int:
+    task = _kanban(args).next_ready(args.project_id)
+    print(json.dumps(task, indent=2) if task else "no schedulable task")
+    return 0
+
+
+def cmd_kanban_board(args) -> int:
+    board = _kanban(args)
+    project = board.project(args.project_id)
+    print(f"{project['title']} [{project['verification_mode']}] branch={project['branch']}")
+    rows = board.board(args.project_id)
+    if not rows:
+        print("  (no tasks)")
+    for task in rows:
+        checkpoint = task["last_checkpoint_commit"] or "-"
+        smoke = task["smoke_status"] or "-"
+        detail = task["blocked_reason"] or ""
+        print(
+            f"  {task['id']:<24} {task['state']:<16} executor={task['executor'] or '-':<8} "
+            f"checkpoint={checkpoint[:12]:<12} smoke={smoke:<7} activity={task['last_activity_at']}"
+        )
+        if detail:
+            print(f"    blocked: {detail[:300]}")
     return 0
 
 
@@ -1404,6 +1493,62 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("board")
     s.add_argument("feature_id", nargs="?")
     s.set_defaults(func=cmd_board)
+
+    s = sub.add_parser("kanban", help="single-writer, checkpoint-first project workflow")
+    kanban_sub = s.add_subparsers(dest="kanban_command", required=True)
+
+    k = kanban_sub.add_parser("init", help="create/adopt a persistent project worktree")
+    k.add_argument("project_id")
+    k.add_argument("--title", required=True)
+    k.add_argument("--repo", required=True)
+    k.add_argument("--branch")
+    k.add_argument("--verification", choices=["smoke", "standard", "strict"], default="smoke")
+    k.set_defaults(func=cmd_kanban_init)
+
+    k = kanban_sub.add_parser("add", help="add a logical task to a project")
+    k.add_argument("project_id")
+    k.add_argument("task_id")
+    k.add_argument("--title", required=True)
+    k.add_argument("--request", required=True)
+    k.add_argument("--acceptance", action="append")
+    k.set_defaults(func=cmd_kanban_add)
+
+    k = kanban_sub.add_parser("start", help="claim the single project writer slot")
+    k.add_argument("task_id")
+    k.add_argument("--executor", default="manual")
+    k.set_defaults(func=cmd_kanban_start)
+
+    k = kanban_sub.add_parser("checkpoint", help="commit and push a meaningful slice")
+    k.add_argument("task_id")
+    k.add_argument("--message", required=True)
+    k.set_defaults(func=cmd_kanban_checkpoint)
+
+    k = kanban_sub.add_parser("smoke", help="run a bounded project smoke command")
+    k.add_argument("task_id")
+    k.add_argument("--command", required=True)
+    k.set_defaults(func=cmd_kanban_smoke)
+
+    k = kanban_sub.add_parser("warning", help="record nonfatal smoke evidence")
+    k.add_argument("task_id")
+    k.add_argument("detail")
+    k.set_defaults(func=cmd_kanban_warning)
+
+    k = kanban_sub.add_parser("block", help="stop a deterministic failure without retrying")
+    k.add_argument("task_id")
+    k.add_argument("reason")
+    k.set_defaults(func=cmd_kanban_block)
+
+    k = kanban_sub.add_parser("done", help="finish a smoke-evidenced task")
+    k.add_argument("task_id")
+    k.set_defaults(func=cmd_kanban_done)
+
+    k = kanban_sub.add_parser("next", help="show next independent logical task")
+    k.add_argument("project_id")
+    k.set_defaults(func=cmd_kanban_next)
+
+    k = kanban_sub.add_parser("board", help="show actual work, checkpoints, and blocks")
+    k.add_argument("project_id")
+    k.set_defaults(func=cmd_kanban_board)
 
     s = sub.add_parser("inspect")
     s.add_argument("job_id")
